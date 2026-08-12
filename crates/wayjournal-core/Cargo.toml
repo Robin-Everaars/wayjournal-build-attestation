@@ -10,6 +10,7 @@ publish = false
 [dependencies]
 blake3.workspace = true
 jiff.workspace = true
+rustix.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

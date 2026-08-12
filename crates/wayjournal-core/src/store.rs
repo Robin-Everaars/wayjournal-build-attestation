@@ -1,0 +1,1196 @@
+use std::{
+    collections::BTreeMap,
+    ffi::OsStr,
+    fs::{self, File, OpenOptions},
+    io::{self, Read},
+    os::unix::{ffi::OsStrExt, fs::OpenOptionsExt},
+    path::{Path, PathBuf},
+    sync::{Arc, RwLock, RwLockWriteGuard},
+};
+
+use rustix::fs::{self as rfs, AtFlags, Dir, FileType, Mode, OFlags};
+use thiserror::Error;
+
+mod transaction;
+
+#[cfg(test)]
+mod race_hooks {
+    use std::cell::RefCell;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Point {
+        RootAnchor,
+        ReservedAnchors,
+        ScanRoot,
+        DynamicStage,
+        RecoveryRoot,
+        RecoveryStage,
+        PublicationTarget,
+    }
+    type Hook = Box<dyn FnMut(Point)>;
+    thread_local! { static HOOK: RefCell<Option<Hook>> = const { RefCell::new(None) }; }
+    pub struct Guard;
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            HOOK.with(|hook| *hook.borrow_mut() = None);
+        }
+    }
+    pub fn install(hook: impl FnMut(Point) + 'static) -> Guard {
+        HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+        Guard
+    }
+    pub fn hit(point: Point) {
+        HOOK.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().as_mut() {
+                hook(point);
+            }
+        });
+    }
+}
+#[cfg(test)]
+use race_hooks::{Point as RacePoint, hit as race};
+
+use crate::{
+    ActorId, BatchError, BatchId, BatchManifest, DomainRegistry, PathClass, Record, RecordId,
+    RevisionEntry, StoreRevisionRef, StoredMember, classify_path, compute_store_revision,
+    decode_batch_manifest, decode_record, validate_batch_ownership,
+};
+
+const LOCAL_DIR: &str = ".wayjournal-local";
+const STAGES_DIR: &str = "stages";
+const RECOVERY_DIR: &str = "recovery";
+const CHECKPOINTS_DIR: &str = "checkpoints";
+/// Maximum bytes supplied for one frozen legacy file.
+pub const MAX_LEGACY_FILE_BYTES: usize = 1024 * 1024;
+const MAX_CANONICAL_ENTRIES: usize = 1_000_000;
+const MAX_TOTAL_CANONICAL_BYTES: u64 = 1024 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy)]
+pub struct LegacyEntry<'a> {
+    path: &'a [u8],
+    bytes: &'a [u8],
+    class: PathClass,
+}
+impl<'a> LegacyEntry<'a> {
+    #[must_use]
+    pub const fn path(self) -> &'a [u8] {
+        self.path
+    }
+    #[must_use]
+    pub const fn bytes(self) -> &'a [u8] {
+        self.bytes
+    }
+    #[must_use]
+    pub const fn class(self) -> PathClass {
+        self.class
+    }
+}
+
+/// Structural validator for the frozen legacy Waytask files.
+pub trait LegacyStoreAdapter: std::fmt::Debug + Send + Sync {
+    /// Validates the complete frozen legacy set without applying consumer folds.
+    /// # Errors
+    /// Returns a stable non-sensitive description when invalid.
+    fn validate(&self, entries: &[LegacyEntry<'_>]) -> Result<(), String>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StoreCorruption {
+    NonRegularPath {
+        path: Vec<u8>,
+    },
+    InvalidCanonicalPath {
+        path: Vec<u8>,
+    },
+    InvalidManifest {
+        path: Vec<u8>,
+        message: String,
+    },
+    InvalidRecord {
+        path: Vec<u8>,
+        message: String,
+    },
+    DuplicateGlobalRecordId {
+        record_id: RecordId,
+        paths: Vec<Vec<u8>>,
+    },
+    GenericOwnership(BatchError),
+    InvalidLegacy {
+        message: String,
+    },
+}
+
+#[derive(Debug, Error)]
+pub enum StoreError {
+    #[error("{operation} failed for {path}: {source}")]
+    Io {
+        operation: &'static str,
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("store lock was poisoned")]
+    LockPoisoned,
+    #[error("invalid store layout at {path}: {message}")]
+    InvalidLayout { path: PathBuf, message: String },
+    #[error("store path is on a different filesystem: {path}")]
+    CrossDeviceLayout { path: PathBuf },
+    #[error("expected store revision {expected:?}, found {actual:?}")]
+    RevisionMismatch {
+        expected: StoreRevisionRef,
+        actual: StoreRevisionRef,
+    },
+    #[error("recovery base changed from {expected:?} to {actual:?}")]
+    RecoveryBaseChanged {
+        expected: StoreRevisionRef,
+        actual: StoreRevisionRef,
+    },
+    #[error("invalid recovery journal {path}: {message}")]
+    InvalidJournal { path: PathBuf, message: String },
+    #[error("immutable publication target conflicts at {path}")]
+    PublicationConflict { path: PathBuf },
+    #[error("injected crash at {point}")]
+    InjectedCrash { point: &'static str },
+    #[error("batch operation failed: {0}")]
+    Batch(#[from] BatchError),
+    #[error("store corruption: {issue:?}")]
+    Corrupt { issue: StoreCorruption },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitOutcome {
+    Published {
+        batch_id: BatchId,
+        revision: StoreRevisionRef,
+    },
+    Replay {
+        batch_id: BatchId,
+        revision: StoreRevisionRef,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct StoreSnapshot {
+    revision: StoreRevisionRef,
+    manifests: Vec<BatchManifest>,
+    records: Vec<Record>,
+    legacy: Vec<OwnedLegacyEntry>,
+}
+#[derive(Debug, Clone)]
+struct OwnedLegacyEntry {
+    path: Vec<u8>,
+    bytes: Vec<u8>,
+    class: PathClass,
+}
+impl StoreSnapshot {
+    #[must_use]
+    pub const fn revision(&self) -> StoreRevisionRef {
+        self.revision
+    }
+    #[must_use]
+    pub fn manifests(&self) -> &[BatchManifest] {
+        &self.manifests
+    }
+    #[must_use]
+    pub fn records(&self) -> &[Record] {
+        &self.records
+    }
+    #[must_use]
+    pub fn legacy_entries(&self) -> Vec<LegacyEntry<'_>> {
+        self.legacy
+            .iter()
+            .map(|entry| LegacyEntry {
+                path: &entry.path,
+                bytes: &entry.bytes,
+                class: entry.class,
+            })
+            .collect()
+    }
+}
+
+/// A validated snapshot held under the retained root-directory inode lock.
+pub struct ExclusiveSnapshot<'a> {
+    snapshot: StoreSnapshot,
+    _file_guard: File,
+    _local_guard: RwLockWriteGuard<'a, ()>,
+}
+impl ExclusiveSnapshot<'_> {
+    #[must_use]
+    pub const fn snapshot(&self) -> &StoreSnapshot {
+        &self.snapshot
+    }
+}
+
+/// Retained directory descriptor. All descendants are opened one component at a time with
+/// `openat(O_NOFOLLOW)` and checked with `fstat`, so renames cannot redirect an operation.
+#[derive(Debug)]
+pub(super) struct Directory {
+    file: File,
+    pub path: PathBuf,
+    device: u64,
+}
+impl Directory {
+    fn from_file(
+        path: PathBuf,
+        file: File,
+        expected_device: Option<u64>,
+    ) -> Result<Self, StoreError> {
+        let stat = rfs::fstat(&file)
+            .map_err(|error| io_error("inspect directory descriptor", &path, error.into()))?;
+        if FileType::from_raw_mode(stat.st_mode) != FileType::Directory {
+            return Err(invalid_layout(
+                &path,
+                "descriptor is not an ordinary directory",
+            ));
+        }
+        let device = stat.st_dev as u64;
+        if expected_device.is_some_and(|expected| expected != device) {
+            return Err(StoreError::CrossDeviceLayout { path });
+        }
+        Ok(Self { file, path, device })
+    }
+    fn open_ambient(path: &Path) -> Result<Self, StoreError> {
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc_flags::DIRECTORY | libc_flags::NOFOLLOW | libc_flags::CLOEXEC)
+            .open(path)
+            .map_err(|source| io_error("open store root", path, source))?;
+        Self::from_file(path.to_owned(), file, None)
+    }
+    pub fn open_dir(&self, name: &OsStr) -> Result<Self, StoreError> {
+        validate_component(name, &self.path)?;
+        let fd = rfs::openat(
+            &self.file,
+            name,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|error| {
+            io_error(
+                "open directory component",
+                &self.path.join(name),
+                error.into(),
+            )
+        })?;
+        Self::from_file(self.path.join(name), File::from(fd), Some(self.device))
+    }
+    pub fn ensure_dir(&self, name: &OsStr) -> Result<(Self, bool), StoreError> {
+        validate_component(name, &self.path)?;
+        let mut created = false;
+        match rfs::mkdirat(&self.file, name, Mode::RWXU) {
+            Ok(()) => created = true,
+            Err(rustix::io::Errno::EXIST) => {
+                if self.kind(name)? != FileType::Directory {
+                    return Err(invalid_layout(
+                        &self.path.join(name),
+                        "reserved path is not an ordinary directory",
+                    ));
+                }
+            }
+            Err(error) => {
+                return Err(io_error(
+                    "create directory component",
+                    &self.path.join(name),
+                    error.into(),
+                ));
+            }
+        }
+        Ok((self.open_dir(name)?, created))
+    }
+    pub fn open_file(&self, name: &OsStr) -> Result<File, StoreError> {
+        validate_component(name, &self.path)?;
+        let fd = rfs::openat(
+            &self.file,
+            name,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|error| {
+            io_error(
+                "open regular file component",
+                &self.path.join(name),
+                error.into(),
+            )
+        })?;
+        let file = File::from(fd);
+        self.require_regular(&file, name)?;
+        Ok(file)
+    }
+    pub fn create_file(&self, name: &OsStr) -> Result<File, StoreError> {
+        validate_component(name, &self.path)?;
+        let fd = rfs::openat(
+            &self.file,
+            name,
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .map_err(|error| {
+            io_error(
+                "create regular file component",
+                &self.path.join(name),
+                error.into(),
+            )
+        })?;
+        Ok(File::from(fd))
+    }
+    pub fn require_regular(&self, file: &File, name: &OsStr) -> Result<u64, StoreError> {
+        let stat = rfs::fstat(file).map_err(|error| {
+            io_error(
+                "inspect regular file descriptor",
+                &self.path.join(name),
+                error.into(),
+            )
+        })?;
+        if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
+            return Err(invalid_layout(
+                &self.path.join(name),
+                "path is not an ordinary regular file",
+            ));
+        }
+        if stat.st_dev as u64 != self.device {
+            return Err(StoreError::CrossDeviceLayout {
+                path: self.path.join(name),
+            });
+        }
+        Ok(stat.st_size.max(0).cast_unsigned())
+    }
+    pub fn for_each_name(
+        &self,
+        limit: usize,
+        mut visit: impl FnMut(&[u8]) -> Result<(), StoreError>,
+    ) -> Result<(), StoreError> {
+        let mut dir = Dir::read_from(&self.file)
+            .map_err(|error| io_error("read directory descriptor", &self.path, error.into()))?;
+        let mut count = 0_usize;
+        while let Some(entry) = dir.read() {
+            let entry = entry
+                .map_err(|error| io_error("read directory entry", &self.path, error.into()))?;
+            let name = entry.file_name().to_bytes();
+            if name == b"." || name == b".." {
+                continue;
+            }
+            count = count
+                .checked_add(1)
+                .ok_or_else(|| invalid_layout(&self.path, "directory entry count overflow"))?;
+            if count > limit {
+                return Err(invalid_layout(
+                    &self.path,
+                    "directory exceeds entry-count limit",
+                ));
+            }
+            visit(name)?;
+        }
+        Ok(())
+    }
+    pub fn bounded_names(&self, limit: usize) -> Result<Vec<Vec<u8>>, StoreError> {
+        let mut names = Vec::new();
+        self.for_each_name(limit, |name| {
+            names.push(name.to_vec());
+            Ok(())
+        })?;
+        names.sort();
+        Ok(names)
+    }
+    pub fn kind(&self, name: &OsStr) -> Result<FileType, StoreError> {
+        validate_component(name, &self.path)?;
+        let stat = rfs::statat(&self.file, name, AtFlags::SYMLINK_NOFOLLOW).map_err(|error| {
+            io_error(
+                "inspect directory entry",
+                &self.path.join(name),
+                error.into(),
+            )
+        })?;
+        if stat.st_dev as u64 != self.device {
+            return Err(StoreError::CrossDeviceLayout {
+                path: self.path.join(name),
+            });
+        }
+        Ok(FileType::from_raw_mode(stat.st_mode))
+    }
+    pub fn sync(&self) -> Result<(), StoreError> {
+        rfs::fsync(&self.file)
+            .map_err(|error| io_error("sync directory descriptor", &self.path, error.into()))
+    }
+    pub fn unlink_file(&self, name: &OsStr) -> Result<(), StoreError> {
+        rfs::unlinkat(&self.file, name, AtFlags::empty())
+            .map_err(|error| io_error("unlink file", &self.path.join(name), error.into()))
+    }
+    pub fn unlink_dir(&self, name: &OsStr) -> Result<(), StoreError> {
+        rfs::unlinkat(&self.file, name, AtFlags::REMOVEDIR)
+            .map_err(|error| io_error("unlink directory", &self.path.join(name), error.into()))
+    }
+    pub fn file(&self) -> &File {
+        &self.file
+    }
+    pub fn lock_file(&self) -> Result<File, StoreError> {
+        let fd = rfs::openat(
+            &self.file,
+            OsStr::new("."),
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|error| {
+            io_error(
+                "open independent root lock descriptor",
+                &self.path,
+                error.into(),
+            )
+        })?;
+        Ok(File::from(fd))
+    }
+}
+
+// Values used only with `OpenOptionsExt`; rustix supplies all descriptor-relative syscalls.
+mod libc_flags {
+    pub const DIRECTORY: i32 = 0o200_000;
+    pub const NOFOLLOW: i32 = 0o400_000;
+    pub const CLOEXEC: i32 = 0o2_000_000;
+}
+fn validate_component(name: &OsStr, path: &Path) -> Result<(), StoreError> {
+    let bytes = name.as_bytes();
+    if bytes.is_empty()
+        || bytes == b"."
+        || bytes == b".."
+        || bytes.contains(&b'/')
+        || bytes.contains(&0)
+    {
+        return Err(invalid_layout(
+            path,
+            "invalid descriptor-relative path component",
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Clone)]
+pub struct Store {
+    pub(super) root: PathBuf,
+    registry: DomainRegistry,
+    legacy: Arc<dyn LegacyStoreAdapter>,
+    local_lock: Arc<RwLock<()>>,
+    pub(super) root_dir: Arc<Directory>,
+    pub(super) events_dir: Arc<Directory>,
+    pub(super) batches_dir: Arc<Directory>,
+    pub(super) journal_dir: Arc<Directory>,
+    pub(super) records_dir: Arc<Directory>,
+    pub(super) journal_batches_dir: Arc<Directory>,
+    pub(super) stages_dir: Arc<Directory>,
+    pub(super) recovery_dir: Arc<Directory>,
+}
+impl Store {
+    /// Opens or initializes a store. Cooperative processes lock the retained store-root inode.
+    /// Names below that inode may be renamed by an attacker without redirecting in-flight work.
+    /// The caller is responsible for binding the ambient root pathname to the intended store;
+    /// replacing that binding creates a distinct store and is outside cooperative serialization.
+    /// # Errors
+    /// Fails closed for symlinks, non-directories, cross-device descendants, or malformed state.
+    pub fn open(
+        root: impl Into<PathBuf>,
+        registry: DomainRegistry,
+        legacy: Arc<dyn LegacyStoreAdapter>,
+    ) -> Result<Self, StoreError> {
+        let requested = root.into();
+        create_root_durable(&requested)?;
+        let root = fs::canonicalize(&requested)
+            .map_err(|source| io_error("canonicalize store root", &requested, source))?;
+        let root_dir = Arc::new(Directory::open_ambient(&root)?);
+        #[cfg(test)]
+        race(RacePoint::RootAnchor);
+        let (events, _) = root_dir.ensure_dir(OsStr::new("events"))?;
+        let (batches, _) = root_dir.ensure_dir(OsStr::new("batches"))?;
+        let (journal, _) = root_dir.ensure_dir(OsStr::new("journal"))?;
+        let (records, _) = journal.ensure_dir(OsStr::new("records"))?;
+        let (journal_batches, _) = journal.ensure_dir(OsStr::new("batches"))?;
+        let (local, _) = root_dir.ensure_dir(OsStr::new(LOCAL_DIR))?;
+        let (stages, _) = local.ensure_dir(OsStr::new(STAGES_DIR))?;
+        let (recovery, _) = local.ensure_dir(OsStr::new(RECOVERY_DIR))?;
+        let (checkpoints, _) = local.ensure_dir(OsStr::new(CHECKPOINTS_DIR))?;
+        #[cfg(test)]
+        race(RacePoint::ReservedAnchors);
+        for directory in [&records, &journal_batches, &stages, &recovery, &checkpoints] {
+            directory.sync()?;
+        }
+        journal.sync()?;
+        local.sync()?;
+        root_dir.sync()?;
+        Ok(Self {
+            root,
+            registry,
+            legacy,
+            local_lock: Arc::new(RwLock::new(())),
+            root_dir,
+            events_dir: Arc::new(events),
+            batches_dir: Arc::new(batches),
+            journal_dir: Arc::new(journal),
+            records_dir: Arc::new(records),
+            journal_batches_dir: Arc::new(journal_batches),
+            stages_dir: Arc::new(stages),
+            recovery_dir: Arc::new(recovery),
+        })
+    }
+    /// Recovers local residue and returns a validated snapshot.
+    /// # Errors
+    /// Returns layout, I/O, recovery, codec, or ownership failures.
+    pub fn read(&self) -> Result<StoreSnapshot, StoreError> {
+        loop {
+            {
+                let _local = self
+                    .local_lock
+                    .read()
+                    .map_err(|_| StoreError::LockPoisoned)?;
+                let lock = self.root_dir.lock_file()?;
+                lock.lock_shared()
+                    .map_err(|source| io_error("acquire shared root lock", &self.root, source))?;
+                if !self.has_residue()? {
+                    return scan_visible(self);
+                }
+            }
+            transaction::recover(self)?;
+        }
+    }
+    /// Returns a validated snapshot while holding the exclusive retained-root lock.
+    /// # Errors
+    /// Returns locking, recovery, or scan failures.
+    pub fn exclusive_snapshot(&self) -> Result<ExclusiveSnapshot<'_>, StoreError> {
+        transaction::exclusive_snapshot(self)
+    }
+    /// Publishes one prepared generic batch at exactly `expected`.
+    /// # Errors
+    /// Returns stale revision, collision, recovery, validation, or I/O failures.
+    pub fn append(
+        &self,
+        prepared: &crate::PreparedBatch,
+        expected: StoreRevisionRef,
+    ) -> Result<CommitOutcome, StoreError> {
+        transaction::append(self, prepared, expected)
+    }
+    fn has_residue(&self) -> Result<bool, StoreError> {
+        fn nonempty(directory: &Directory) -> Result<bool, StoreError> {
+            let mut found = false;
+            directory.for_each_name(MAX_CANONICAL_ENTRIES, |_| {
+                found = true;
+                Ok(())
+            })?;
+            Ok(found)
+        }
+        Ok(nonempty(&self.recovery_dir)? || nonempty(&self.stages_dir)?)
+    }
+}
+fn create_root_durable(path: &Path) -> Result<(), StoreError> {
+    let absolute = if path.is_absolute() {
+        path.to_owned()
+    } else {
+        std::env::current_dir()
+            .map_err(|source| io_error("resolve current directory", path, source))?
+            .join(path)
+    };
+    let mut existing = absolute.as_path();
+    let mut missing = Vec::new();
+    while fs::symlink_metadata(existing).is_err() {
+        let name = existing
+            .file_name()
+            .ok_or_else(|| invalid_layout(path, "store root has no existing ancestor"))?;
+        missing.push(name.to_os_string());
+        existing = existing
+            .parent()
+            .ok_or_else(|| invalid_layout(path, "store root escaped filesystem root"))?;
+    }
+    let mut parent = Directory::open_ambient(existing)?;
+    for name in missing.iter().rev() {
+        let (child, created) = parent.ensure_dir(name)?;
+        if !created {
+            return Err(invalid_layout(
+                &child.path,
+                "store root component raced with creation",
+            ));
+        }
+        child.sync()?;
+        parent.sync()?;
+        parent = child;
+    }
+    if missing.is_empty() {
+        parent.sync()?;
+    }
+    Ok(())
+}
+pub(super) fn invalid_layout(path: &Path, message: &str) -> StoreError {
+    StoreError::InvalidLayout {
+        path: path.to_owned(),
+        message: message.to_owned(),
+    }
+}
+pub(super) fn io_error(operation: &'static str, path: &Path, source: io::Error) -> StoreError {
+    StoreError::Io {
+        operation,
+        path: path.to_owned(),
+        source,
+    }
+}
+
+#[derive(Clone)]
+pub(super) struct RawFile {
+    pub path: Vec<u8>,
+    pub bytes: Vec<u8>,
+}
+#[derive(Clone, Copy)]
+struct ScanLimits {
+    entries: usize,
+    bytes: u64,
+}
+const DEFAULT_SCAN_LIMITS: ScanLimits = ScanLimits {
+    entries: MAX_CANONICAL_ENTRIES,
+    bytes: MAX_TOTAL_CANONICAL_BYTES,
+};
+#[cfg(test)]
+thread_local! { static TEST_SCAN_LIMITS: std::cell::Cell<Option<ScanLimits>> = const { std::cell::Cell::new(None) }; }
+#[cfg(test)]
+fn active_scan_limits() -> ScanLimits {
+    TEST_SCAN_LIMITS
+        .with(std::cell::Cell::get)
+        .unwrap_or(DEFAULT_SCAN_LIMITS)
+}
+#[cfg(not(test))]
+const fn active_scan_limits() -> ScanLimits {
+    DEFAULT_SCAN_LIMITS
+}
+struct ScanBudget {
+    limits: ScanLimits,
+    entries: usize,
+    bytes: u64,
+}
+impl ScanBudget {
+    fn entry(&mut self, path: &Path) -> Result<(), StoreError> {
+        self.entries = self
+            .entries
+            .checked_add(1)
+            .ok_or_else(|| invalid_layout(path, "canonical entry count overflow"))?;
+        if self.entries > self.limits.entries {
+            return Err(invalid_layout(
+                path,
+                "canonical store exceeds entry-count limit",
+            ));
+        }
+        Ok(())
+    }
+    fn reserve_bytes(&mut self, length: u64, path: &Path) -> Result<(), StoreError> {
+        let remaining = self.limits.bytes.saturating_sub(self.bytes);
+        if length > remaining {
+            return Err(invalid_layout(
+                path,
+                "canonical store exceeds aggregate-byte limit",
+            ));
+        }
+        self.bytes += length;
+        Ok(())
+    }
+}
+pub(super) fn collect_visible(store: &Store) -> Result<(Vec<RawFile>, Vec<Vec<u8>>), StoreError> {
+    let (files, nonregular, _) = collect_visible_inventory(store, active_scan_limits())?;
+    Ok((files, nonregular))
+}
+type VisibleInventory = (
+    Vec<RawFile>,
+    Vec<Vec<u8>>,
+    std::collections::BTreeSet<Vec<u8>>,
+);
+pub(super) fn visible_inventory(store: &Store) -> Result<VisibleInventory, StoreError> {
+    collect_visible_inventory(store, active_scan_limits())
+}
+#[cfg(test)]
+fn collect_visible_with_limits(
+    store: &Store,
+    limits: ScanLimits,
+) -> Result<(Vec<RawFile>, Vec<Vec<u8>>), StoreError> {
+    let (files, nonregular, _) = collect_visible_inventory(store, limits)?;
+    Ok((files, nonregular))
+}
+fn collect_visible_inventory(
+    store: &Store,
+    limits: ScanLimits,
+) -> Result<VisibleInventory, StoreError> {
+    #[cfg(test)]
+    race(RacePoint::ScanRoot);
+    let mut files = Vec::new();
+    let mut nonregular = Vec::new();
+    let mut inventory = std::collections::BTreeSet::new();
+    let mut budget = ScanBudget {
+        limits,
+        entries: 0,
+        bytes: 0,
+    };
+    for (directory, prefix) in [
+        (&*store.batches_dir, b"batches".as_slice()),
+        (&*store.events_dir, b"events".as_slice()),
+        (&*store.journal_dir, b"journal".as_slice()),
+    ] {
+        collect_directory(
+            directory,
+            prefix,
+            &mut files,
+            &mut nonregular,
+            &mut inventory,
+            &mut budget,
+        )?;
+    }
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    nonregular.sort();
+    Ok((files, nonregular, inventory))
+}
+pub(super) fn enforce_limits<'a>(
+    files: impl IntoIterator<Item = (&'a [u8], usize)>,
+    nonregular: impl IntoIterator<Item = &'a [u8]>,
+    existing: impl IntoIterator<Item = &'a Vec<u8>>,
+) -> Result<(), StoreError> {
+    let files = files.into_iter().collect::<Vec<_>>();
+    let mut entries = existing
+        .into_iter()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    for (path, _) in &files {
+        add_entry_and_canonical_parents(&mut entries, path);
+    }
+    for path in nonregular {
+        add_entry_and_canonical_parents(&mut entries, path);
+    }
+    let limits = active_scan_limits();
+    if entries.len() > limits.entries {
+        return Err(invalid_layout(
+            Path::new("."),
+            "canonical store exceeds entry-count limit",
+        ));
+    }
+    let total = files.iter().try_fold(0_u64, |total, (_, length)| {
+        total.checked_add(u64::try_from(*length).ok()?)
+    });
+    if total.is_none_or(|total| total > limits.bytes) {
+        return Err(invalid_layout(
+            Path::new("."),
+            "canonical store exceeds aggregate-byte limit",
+        ));
+    }
+    Ok(())
+}
+fn add_entry_and_canonical_parents(entries: &mut std::collections::BTreeSet<Vec<u8>>, path: &[u8]) {
+    entries.insert(path.to_vec());
+    let mut end = path.len();
+    while let Some(slash) = path[..end].iter().rposition(|byte| *byte == b'/') {
+        let parent = &path[..slash];
+        if parent == b"events" || parent == b"batches" || parent == b"journal" {
+            break;
+        }
+        entries.insert(parent.to_vec());
+        end = slash;
+    }
+}
+fn collect_directory(
+    directory: &Directory,
+    prefix: &[u8],
+    files: &mut Vec<RawFile>,
+    nonregular: &mut Vec<Vec<u8>>,
+    inventory: &mut std::collections::BTreeSet<Vec<u8>>,
+    budget: &mut ScanBudget,
+) -> Result<(), StoreError> {
+    directory.for_each_name(
+        budget.limits.entries.saturating_sub(budget.entries),
+        |name| {
+            budget.entry(&directory.path)?;
+            let component = OsStr::from_bytes(name);
+            let mut relative = prefix.to_vec();
+            relative.push(b'/');
+            relative.extend(name);
+            inventory.insert(relative.clone());
+            match directory.kind(component)? {
+                FileType::Directory if valid_canonical_directory(&relative) => {
+                    let child = directory.open_dir(component)?;
+                    collect_directory(&child, &relative, files, nonregular, inventory, budget)?;
+                }
+                FileType::Directory => files.push(RawFile {
+                    path: relative,
+                    bytes: Vec::new(),
+                }),
+                FileType::RegularFile => {
+                    let limit = match classify_path(&relative) {
+                        PathClass::JournalRecord => crate::MAX_RECORD_BYTES,
+                        PathClass::JournalBatch => crate::MAX_BATCH_BYTES,
+                        PathClass::LegacyEvent | PathClass::LegacyBatch => MAX_LEGACY_FILE_BYTES,
+                        PathClass::InvalidReserved | PathClass::NonCanonical => 0,
+                    };
+                    let file = directory.open_file(component)?;
+                    let length = directory.require_regular(&file, component)?;
+                    if length > limit as u64 {
+                        return Err(invalid_layout(
+                            &directory.path.join(component),
+                            "canonical file exceeds its byte limit",
+                        ));
+                    }
+                    budget.reserve_bytes(length, &directory.path.join(component))?;
+                    let bytes = read_file_bounded(
+                        file.try_clone().map_err(|source| {
+                            io_error(
+                                "clone visible file descriptor",
+                                &directory.path.join(component),
+                                source,
+                            )
+                        })?,
+                        limit,
+                        &directory.path.join(component),
+                    )?;
+                    let stable_length = directory.require_regular(&file, component)?;
+                    if stable_length != length || stable_length != bytes.len() as u64 {
+                        return Err(invalid_layout(
+                            &directory.path.join(component),
+                            "canonical file changed while being scanned",
+                        ));
+                    }
+                    files.push(RawFile {
+                        path: relative,
+                        bytes,
+                    });
+                }
+                _ => nonregular.push(relative),
+            }
+            Ok(())
+        },
+    )
+}
+fn valid_canonical_directory(path: &[u8]) -> bool {
+    let Ok(path) = std::str::from_utf8(path) else {
+        return false;
+    };
+    let parts = path.split('/').collect::<Vec<_>>();
+    match parts.as_slice() {
+        ["events", entity] => uuid::Uuid::parse_str(entity).is_ok_and(|id| {
+            entity == &id.hyphenated().to_string()
+                && !id.is_nil()
+                && id.get_variant() == uuid::Variant::RFC4122
+                && [4, 5, 7].contains(&id.get_version_num())
+        }),
+        ["journal", "records" | "batches"] => true,
+        ["journal", "records", domain] => domain.parse::<crate::DomainId>().is_ok(),
+        ["journal", "records", domain, entity] => {
+            domain.parse::<crate::DomainId>().is_ok() && entity.parse::<crate::EntityId>().is_ok()
+        }
+        _ => false,
+    }
+}
+pub(super) fn read_file_bounded(
+    mut file: File,
+    limit: usize,
+    path: &Path,
+) -> Result<Vec<u8>, StoreError> {
+    let mut bytes = Vec::new();
+    (&mut file)
+        .take((limit as u64).saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|source| io_error("read descriptor", path, source))?;
+    if bytes.len() > limit {
+        return Err(invalid_layout(path, "file exceeds byte limit"));
+    }
+    Ok(bytes)
+}
+pub(super) fn scan_visible(store: &Store) -> Result<StoreSnapshot, StoreError> {
+    let (files, nonregular) = collect_visible(store)?;
+    scan_collected(store, &files, nonregular)
+}
+enum DecodedFile {
+    Manifest(BatchManifest),
+    Record(Record),
+    Legacy(OwnedLegacyEntry),
+}
+
+fn decode_visible_file(
+    file: &RawFile,
+    registry: &DomainRegistry,
+) -> Result<DecodedFile, StoreError> {
+    match classify_path(&file.path) {
+        PathClass::JournalBatch => {
+            let manifest =
+                decode_batch_manifest(&file.bytes).map_err(|error| StoreError::Corrupt {
+                    issue: StoreCorruption::InvalidManifest {
+                        path: file.path.clone(),
+                        message: error.to_string(),
+                    },
+                })?;
+            if manifest.canonical_path().as_bytes() != file.path {
+                return Err(invalid_canonical_file(file));
+            }
+            Ok(DecodedFile::Manifest(manifest))
+        }
+        PathClass::JournalRecord => {
+            let record =
+                decode_record(&file.bytes, registry).map_err(|error| StoreError::Corrupt {
+                    issue: StoreCorruption::InvalidRecord {
+                        path: file.path.clone(),
+                        message: error.to_string(),
+                    },
+                })?;
+            if record.canonical_path().as_bytes() != file.path {
+                return Err(invalid_canonical_file(file));
+            }
+            Ok(DecodedFile::Record(record))
+        }
+        class @ (PathClass::LegacyBatch | PathClass::LegacyEvent) => {
+            Ok(DecodedFile::Legacy(OwnedLegacyEntry {
+                path: file.path.clone(),
+                bytes: file.bytes.clone(),
+                class,
+            }))
+        }
+        PathClass::InvalidReserved | PathClass::NonCanonical => Err(invalid_canonical_file(file)),
+    }
+}
+
+fn invalid_canonical_file(file: &RawFile) -> StoreError {
+    StoreError::Corrupt {
+        issue: StoreCorruption::InvalidCanonicalPath {
+            path: file.path.clone(),
+        },
+    }
+}
+
+fn validate_global_idempotency(manifests: &[BatchManifest]) -> Result<(), StoreError> {
+    let mut owners = BTreeMap::<(ActorId, String), Vec<BatchId>>::new();
+    for manifest in manifests {
+        owners
+            .entry((
+                manifest.actor().clone(),
+                manifest.idempotency_key_digest().to_string(),
+            ))
+            .or_default()
+            .push(manifest.batch_id());
+    }
+    if let Some((_, batch_ids)) = owners
+        .into_iter()
+        .find(|(_, batch_ids)| batch_ids.len() > 1)
+    {
+        return Err(StoreError::Corrupt {
+            issue: StoreCorruption::GenericOwnership(BatchError::DuplicateIdempotencyOwnership {
+                batch_ids,
+            }),
+        });
+    }
+    Ok(())
+}
+
+pub(super) fn scan_collected(
+    store: &Store,
+    files: &[RawFile],
+    nonregular: Vec<Vec<u8>>,
+) -> Result<StoreSnapshot, StoreError> {
+    if let Some(path) = nonregular.into_iter().next() {
+        return Err(StoreError::Corrupt {
+            issue: StoreCorruption::NonRegularPath { path },
+        });
+    }
+    let mut manifests = Vec::new();
+    let mut records_by_path = BTreeMap::<Vec<u8>, (Record, Vec<u8>)>::new();
+    let mut ids = BTreeMap::<RecordId, Vec<Vec<u8>>>::new();
+    let mut legacy = Vec::new();
+    for file in files {
+        match decode_visible_file(file, &store.registry)? {
+            DecodedFile::Manifest(manifest) => manifests.push(manifest),
+            DecodedFile::Record(record) => {
+                ids.entry(record.record_id)
+                    .or_default()
+                    .push(file.path.clone());
+                records_by_path.insert(file.path.clone(), (record, file.bytes.clone()));
+            }
+            DecodedFile::Legacy(entry) => legacy.push(entry),
+        }
+    }
+    if let Some((record_id, mut paths)) = ids.into_iter().find(|(_, paths)| paths.len() > 1) {
+        paths.sort();
+        return Err(StoreError::Corrupt {
+            issue: StoreCorruption::DuplicateGlobalRecordId { record_id, paths },
+        });
+    }
+    manifests.sort_by_key(BatchManifest::batch_id);
+    validate_global_idempotency(&manifests)?;
+    let stored = records_by_path
+        .iter()
+        .map(|(path, (_, bytes))| StoredMember::new(path, bytes))
+        .collect::<Vec<_>>();
+    let refs = manifests.iter().collect::<Vec<_>>();
+    validate_batch_ownership(&stored, &refs, &store.registry).map_err(|error| {
+        StoreError::Corrupt {
+            issue: StoreCorruption::GenericOwnership(error),
+        }
+    })?;
+    let borrowed = legacy
+        .iter()
+        .map(|entry| LegacyEntry {
+            path: &entry.path,
+            bytes: &entry.bytes,
+            class: entry.class,
+        })
+        .collect::<Vec<_>>();
+    store
+        .legacy
+        .validate(&borrowed)
+        .map_err(|message| StoreError::Corrupt {
+            issue: StoreCorruption::InvalidLegacy { message },
+        })?;
+    let revision = compute_store_revision(
+        files
+            .iter()
+            .map(|file| RevisionEntry::regular(file.path.clone(), file.bytes.clone())),
+    )
+    .map_err(|error| StoreError::Corrupt {
+        issue: StoreCorruption::InvalidCanonicalPath {
+            path: error.to_string().into_bytes(),
+        },
+    })?;
+    Ok(StoreSnapshot {
+        revision,
+        manifests,
+        records: records_by_path
+            .into_values()
+            .map(|(record, _)| record)
+            .collect(),
+        legacy,
+    })
+}
+
+#[cfg(test)]
+mod hostile_tests {
+    use super::{
+        LegacyEntry, LegacyStoreAdapter, ScanLimits, Store, StoreError,
+        collect_visible_with_limits, race_hooks,
+    };
+    use crate::DomainRegistry;
+    use std::{
+        fs,
+        os::unix::fs::symlink,
+        path::{Path, PathBuf},
+        sync::Arc,
+    };
+
+    #[derive(Debug)]
+    struct AcceptLegacy;
+    impl LegacyStoreAdapter for AcceptLegacy {
+        fn validate(&self, _: &[LegacyEntry<'_>]) -> Result<(), String> {
+            Ok(())
+        }
+    }
+    fn root(label: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "wayjournal-hostile-{label}-{}",
+            uuid::Uuid::now_v7()
+        ));
+        fs::create_dir(&path).unwrap();
+        path
+    }
+    fn open(path: &Path) -> Store {
+        Store::open(
+            path,
+            DomainRegistry::new(&[]).unwrap(),
+            Arc::new(AcceptLegacy),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn traversal_budgets_count_nonregular_before_collection_and_bytes_before_allocation() {
+        let count_root = root("count-budget");
+        let store = open(&count_root);
+        let outside = count_root.join("outside");
+        fs::write(&outside, b"x").unwrap();
+        symlink(&outside, count_root.join("events/one")).unwrap();
+        symlink(&outside, count_root.join("events/two")).unwrap();
+        assert!(matches!(
+            collect_visible_with_limits(
+                &store,
+                ScanLimits {
+                    entries: 1,
+                    bytes: 100
+                }
+            ),
+            Err(StoreError::InvalidLayout { .. })
+        ));
+        fs::remove_dir_all(count_root).unwrap();
+
+        let byte_root = root("byte-budget");
+        let store = open(&byte_root);
+        fs::write(
+            byte_root.join("batches/01913f1d-8e2a-7c30-8f4a-426614174099.json"),
+            b"four",
+        )
+        .unwrap();
+        assert!(matches!(
+            collect_visible_with_limits(
+                &store,
+                ScanLimits {
+                    entries: 10,
+                    bytes: 3
+                }
+            ),
+            Err(StoreError::InvalidLayout { .. })
+        ));
+        fs::remove_dir_all(byte_root).unwrap();
+    }
+
+    #[test]
+    fn root_and_reserved_substitution_hooks_cannot_redirect_descriptors() {
+        let root_path = root("root-race");
+        let moved = root_path.with_extension("retained");
+        let hook_root = root_path.clone();
+        let hook_moved = moved.clone();
+        let guard = race_hooks::install(move |point| {
+            if point == race_hooks::Point::RootAnchor {
+                fs::rename(&hook_root, &hook_moved).unwrap();
+                fs::create_dir(&hook_root).unwrap();
+                fs::write(hook_root.join("hostile"), b"outside").unwrap();
+            }
+        });
+        let store = open(&root_path);
+        store.read().unwrap();
+        assert!(moved.join("journal/records").is_dir());
+        drop(guard);
+        drop(store);
+        fs::remove_dir_all(&root_path).unwrap();
+        fs::remove_dir_all(&moved).unwrap();
+
+        let root_path = root("reserved-race");
+        let hook_root = root_path.clone();
+        let guard = race_hooks::install(move |point| {
+            if point == race_hooks::Point::ReservedAnchors {
+                let journal = hook_root.join("journal");
+                let retained = hook_root.join("retained-journal");
+                fs::rename(&journal, &retained).unwrap();
+                fs::create_dir(&journal).unwrap();
+                fs::write(journal.join("hostile"), b"outside").unwrap();
+            }
+        });
+        let store = open(&root_path);
+        store.read().unwrap();
+        assert!(root_path.join("retained-journal/records").is_dir());
+        drop(guard);
+        drop(store);
+        fs::remove_dir_all(root_path).unwrap();
+
+        let root_path = root("scan-race");
+        let store = open(&root_path);
+        let journal = root_path.join("journal");
+        let retained = root_path.join("retained-scan-journal");
+        let outside = root_path.join("outside-scan");
+        fs::create_dir(&outside).unwrap();
+        let guard = race_hooks::install(move |point| {
+            if point == race_hooks::Point::ScanRoot && journal.exists() {
+                fs::rename(&journal, &retained).unwrap();
+                symlink(&outside, &journal).unwrap();
+            }
+        });
+        store.read().unwrap();
+        assert!(
+            root_path
+                .join("outside-scan")
+                .read_dir()
+                .unwrap()
+                .next()
+                .is_none()
+        );
+        drop(guard);
+        drop(store);
+        fs::remove_dir_all(root_path).unwrap();
+    }
+}

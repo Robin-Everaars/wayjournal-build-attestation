@@ -8,6 +8,7 @@ mod json;
 mod layout;
 mod record;
 mod revision;
+mod store;
 
 pub use artifacts::{CAPABILITY_MANIFEST, CapabilityManifest, generated_schemas};
 pub use batch::{
@@ -30,4 +31,8 @@ pub use revision::{
     LEGACY_REVISION_ALGORITHM_V1, REVISION_ALGORITHM_V1, RevisionAlgorithm, RevisionAlgorithmError,
     RevisionEntry, RevisionError, StoreRevisionParseError, StoreRevisionRef,
     compute_store_revision,
+};
+pub use store::{
+    CommitOutcome, ExclusiveSnapshot, LegacyEntry, LegacyStoreAdapter, MAX_LEGACY_FILE_BYTES,
+    Store, StoreCorruption, StoreError, StoreSnapshot,
 };
