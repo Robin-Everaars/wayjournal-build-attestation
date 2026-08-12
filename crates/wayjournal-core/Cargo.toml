@@ -1,0 +1,11 @@
+[package]
+name = "wayjournal-core"
+description = "Domain-neutral foundations for Wayjournal"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish = false
+
+[lints]
+workspace = true

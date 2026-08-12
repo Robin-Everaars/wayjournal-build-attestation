@@ -1,0 +1,7 @@
+self-hosted-runner:
+  labels:
+    - nix
+paths:
+  .forgejo/workflows/**/*.{yml,yaml}:
+    ignore:
+      - 'specifying action "https://code\.forgejo\.org/.+" in invalid format'

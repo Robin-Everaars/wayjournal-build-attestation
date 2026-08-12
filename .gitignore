@@ -1,0 +1,7 @@
+/.direnv/
+/.pi/
+/.pi-subagents/
+/result
+/result-*
+/target/
+*.profraw
