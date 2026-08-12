@@ -2,7 +2,11 @@
 
 mod artifacts;
 mod batch;
+mod builtin;
+mod causal;
+mod domains;
 mod hash;
+mod identity;
 mod ids;
 mod json;
 mod layout;
@@ -16,10 +20,24 @@ pub use batch::{
     PreparedBatch, PreparedRecord, RecordRef, StoredMember, classify_idempotency,
     decode_batch_manifest, prepare_batch, validate_batch_members, validate_batch_ownership,
 };
+pub use builtin::{wayjournal_domain_registry, wayjournal_domain_registry_with};
+pub use causal::{
+    CausalError, CausalGraph, CausalNode, MAX_CAUSAL_EDGES, MAX_CAUSAL_OPERATIONS,
+    MAX_REACHABILITY_STEPS,
+};
+pub use domains::{
+    AdvisoryProfile, CATALOG_SCHEMA_V1, CatalogEntry, CatalogRelation, DomainOperation, FoldError,
+    MvRegister, OperationError, PROFILE_SCHEMA_V1, RemoteLocator, fold_catalog, fold_profile,
+};
 pub use hash::{Digest, DigestError};
+pub use identity::{
+    ForkProvenance, GenesisError, IDENTITY_SCHEMA_V1, IdentityRelation, LogicalStoreId,
+    QualifiedEntityRef, StoreIdentity, classify_logical_identity, genesis_fingerprint,
+    validate_store_identity,
+};
 pub use ids::{
     ActorId, BatchId, DomainId, EntityId, IdentifierError, KindId, RecordId, RecordSchemaId,
-    RecordTimestamp,
+    RecordTimestamp, StoreUuid,
 };
 pub use json::JSON_CODEC_V1;
 pub use layout::{CanonicalPath, PathClass, PathError, classify_path};

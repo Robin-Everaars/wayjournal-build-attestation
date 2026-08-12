@@ -1,0 +1,6 @@
+{
+  "kind": "profile.display_name.set",
+  "payload": {
+    "value": "Robin"
+  }
+}

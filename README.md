@@ -4,10 +4,12 @@ Wayjournal is a generic, federated substrate for immutable journals stored in
 ordinary Git repositories. It is intended to provide domain-neutral journal
 primitives that independent applications can build on.
 
-The wire slice and an experimental Linux filesystem-store slice are implemented.
-They provide strict canonical JSON, closed generic record and batch envelopes,
-typed identifiers, canonical path classification, deterministic revisions, and
-checked protocol artifacts. The local store uses descriptor-relative publication
+The wire slice, an experimental Linux filesystem-store slice, and the first
+identity/profile/catalog domain slice are implemented. They provide strict canonical
+JSON, closed generic record and batch envelopes, typed immutable logical store identity,
+deterministic causal folds for advisory profiles and catalogs, canonical path
+classification, deterministic revisions, and checked protocol artifacts. The local
+store uses descriptor-relative publication
 and explicit durability barriers; recovery is tested at those modeled barriers,
 not against arbitrary device, kernel, or filesystem failures. Git federation is
 not yet implemented.
@@ -27,8 +29,12 @@ not yet implemented.
   scans and publication reject symlinks/cross-device descendants and apply count/byte
   bounds, no-clobber staging, fsync barriers, and startup recovery. Publication
   currently requires Linux procfs at `/proc/self/fd` to link retained file inodes.
-- Git sync, profiles, catalogs, trust, proofs, projections, and consumer
-  semantics remain outside this milestone.
+- Git sync, admission, trust, proofs, projections, and consumer semantics remain
+  outside this milestone. Shared profile data is explicitly advisory, while catalog
+  aliases and locators never become identity or credentials.
+- `Store::open` is the secure S3 default and requires a sealed built-in registry from
+  `wayjournal_domain_registry[_with]`. Existing S1/S2 callers must migrate explicitly
+  to `Store::open_legacy_s1_s2`; that compatibility API refuses S3 built-in records.
 
 ## Repository layout
 

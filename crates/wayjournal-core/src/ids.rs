@@ -94,6 +94,7 @@ macro_rules! uuid_id {
 
 uuid_id!(RecordId, "record id", [7]);
 uuid_id!(BatchId, "batch id", [7]);
+uuid_id!(StoreUuid, "store uuid", [7]);
 uuid_id!(EntityId, "entity id", [1, 3, 4, 5, 6, 7, 8]);
 
 fn valid_segment(input: &str, max: usize) -> bool {

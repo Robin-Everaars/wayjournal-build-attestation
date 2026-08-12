@@ -67,14 +67,49 @@ pub enum RegistryError {
 #[derive(Debug, Clone, Copy)]
 pub struct DomainRegistry {
     registrations: &'static [DomainRegistration],
+    sealed_builtins: bool,
 }
 
 impl DomainRegistry {
+    pub(crate) fn with_builtins(
+        builtins: &'static [DomainRegistration],
+        additional: &'static [DomainRegistration],
+    ) -> Result<Self, RegistryError> {
+        for registration in additional {
+            if matches!(
+                registration.domain,
+                "wayjournal.identity" | "wayjournal.profile" | "wayjournal.catalog"
+            ) {
+                return Err(RegistryError::InvalidRegistration(
+                    registration.domain,
+                    "reserved built-in domain cannot be extended or overridden".to_owned(),
+                ));
+            }
+        }
+        let registrations = Box::leak(
+            builtins
+                .iter()
+                .chain(additional)
+                .copied()
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        );
+        let mut registry = Self::validate_and_collect(registrations)?;
+        registry.sealed_builtins = true;
+        Ok(registry)
+    }
+
     /// Constructs a registry from linked, static domain declarations.
     ///
     /// # Errors
     /// Returns [`RegistryError`] if declarations are invalid or ambiguous.
     pub fn new(registrations: &'static [DomainRegistration]) -> Result<Self, RegistryError> {
+        Self::validate_and_collect(registrations)
+    }
+
+    fn validate_and_collect(
+        registrations: &'static [DomainRegistration],
+    ) -> Result<Self, RegistryError> {
         let mut pairs = BTreeSet::new();
         for registration in registrations {
             registration.domain.parse::<DomainId>().map_err(|error| {
@@ -110,7 +145,20 @@ impl DomainRegistry {
                 }
             }
         }
-        Ok(Self { registrations })
+        Ok(Self {
+            registrations,
+            sealed_builtins: false,
+        })
+    }
+
+    pub(crate) const fn has_sealed_builtins(&self) -> bool {
+        self.sealed_builtins
+    }
+
+    pub(crate) fn supports(&self, domain: &str, schema: &str) -> bool {
+        self.registrations
+            .iter()
+            .any(|registration| registration.domain == domain && registration.schema == schema)
     }
 
     fn validate(

@@ -1,0 +1,17 @@
+{
+  "actor": "human:robin",
+  "batch_id": "01913f1d-8e2a-7c30-8f4a-426614174012",
+  "domain": "wayjournal.identity",
+  "entity_id": "01913f1d-8e2a-7c30-8f4a-426614174010",
+  "kind": "store.genesis",
+  "occurred_at": "2026-08-12T13:00:00Z",
+  "parents": [],
+  "payload": {
+    "store_kind": "wayjournal.personal",
+    "store_uuid": "01913f1d-8e2a-7c30-8f4a-426614174010"
+  },
+  "record_id": "01913f1d-8e2a-7c30-8f4a-426614174011",
+  "record_schema": "wayjournal.identity/v1",
+  "recorded_at": "2026-08-12T13:00:01Z",
+  "schema": "wayjournal.record/v1"
+}

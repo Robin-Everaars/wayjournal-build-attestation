@@ -51,9 +51,10 @@ mod race_hooks {
 use race_hooks::{Point as RacePoint, hit as race};
 
 use crate::{
-    ActorId, BatchError, BatchId, BatchManifest, DomainRegistry, PathClass, Record, RecordId,
-    RevisionEntry, StoreRevisionRef, StoredMember, classify_path, compute_store_revision,
-    decode_batch_manifest, decode_record, validate_batch_ownership,
+    ActorId, BatchError, BatchId, BatchManifest, DomainRegistry, GenesisError, PathClass, Record,
+    RecordId, RevisionEntry, StoreIdentity, StoreRevisionRef, StoredMember, classify_path,
+    compute_store_revision, decode_batch_manifest, decode_record, validate_batch_ownership,
+    validate_store_identity,
 };
 
 const LOCAL_DIR: &str = ".wayjournal-local";
@@ -115,6 +116,12 @@ pub enum StoreCorruption {
         paths: Vec<Vec<u8>>,
     },
     GenericOwnership(BatchError),
+    InvalidGenesis(GenesisError),
+    InvalidDomainFold {
+        domain: String,
+        entity: String,
+        message: String,
+    },
     InvalidLegacy {
         message: String,
     },
@@ -174,6 +181,7 @@ pub struct StoreSnapshot {
     revision: StoreRevisionRef,
     manifests: Vec<BatchManifest>,
     records: Vec<Record>,
+    identity: Option<StoreIdentity>,
     legacy: Vec<OwnedLegacyEntry>,
 }
 #[derive(Debug, Clone)]
@@ -194,6 +202,10 @@ impl StoreSnapshot {
     #[must_use]
     pub fn records(&self) -> &[Record] {
         &self.records
+    }
+    #[must_use]
+    pub const fn identity(&self) -> Option<&StoreIdentity> {
+        self.identity.as_ref()
     }
     #[must_use]
     pub fn legacy_entries(&self) -> Vec<LegacyEntry<'_>> {
@@ -476,6 +488,7 @@ pub struct Store {
     pub(super) journal_batches_dir: Arc<Directory>,
     pub(super) stages_dir: Arc<Directory>,
     pub(super) recovery_dir: Arc<Directory>,
+    strict_domains: bool,
 }
 impl Store {
     /// Opens or initializes a store. Cooperative processes lock the retained store-root inode.
@@ -489,10 +502,52 @@ impl Store {
         registry: DomainRegistry,
         legacy: Arc<dyn LegacyStoreAdapter>,
     ) -> Result<Self, StoreError> {
-        let requested = root.into();
-        create_root_durable(&requested)?;
-        let root = fs::canonicalize(&requested)
-            .map_err(|source| io_error("canonicalize store root", &requested, source))?;
+        Self::open_strict(root, registry, legacy)
+    }
+
+    /// Opens an S1/S2 compatibility store. It refuses any S3 built-in domain data.
+    /// # Errors
+    /// Fails for invalid layout or if S3 data is visible.
+    pub fn open_legacy_s1_s2(
+        root: impl Into<PathBuf>,
+        registry: DomainRegistry,
+        legacy: Arc<dyn LegacyStoreAdapter>,
+    ) -> Result<Self, StoreError> {
+        let store = Self::open_mode(&root.into(), registry, legacy, false)?;
+        store.read()?;
+        Ok(store)
+    }
+
+    /// Opens an S3 strict store with mandatory sealed identity/profile/catalog invariants.
+    /// # Errors
+    /// Fails when built-ins are absent or for the same reasons as [`Store::open`].
+    pub fn open_strict(
+        root: impl Into<PathBuf>,
+        registry: DomainRegistry,
+        legacy: Arc<dyn LegacyStoreAdapter>,
+    ) -> Result<Self, StoreError> {
+        if !registry.has_sealed_builtins()
+            || !registry.supports("wayjournal.identity", crate::IDENTITY_SCHEMA_V1)
+            || !registry.supports("wayjournal.profile", crate::PROFILE_SCHEMA_V1)
+            || !registry.supports("wayjournal.catalog", crate::CATALOG_SCHEMA_V1)
+        {
+            return Err(invalid_layout(
+                Path::new("."),
+                "strict store requires sealed identity/profile/catalog v1 built-ins",
+            ));
+        }
+        Self::open_mode(&root.into(), registry, legacy, true)
+    }
+
+    fn open_mode(
+        requested: &Path,
+        registry: DomainRegistry,
+        legacy: Arc<dyn LegacyStoreAdapter>,
+        strict_domains: bool,
+    ) -> Result<Self, StoreError> {
+        create_root_durable(requested)?;
+        let root = fs::canonicalize(requested)
+            .map_err(|source| io_error("canonicalize store root", requested, source))?;
         let root_dir = Arc::new(Directory::open_ambient(&root)?);
         #[cfg(test)]
         race(RacePoint::RootAnchor);
@@ -526,6 +581,7 @@ impl Store {
             journal_batches_dir: Arc::new(journal_batches),
             stages_dir: Arc::new(stages),
             recovery_dir: Arc::new(recovery),
+            strict_domains,
         })
     }
     /// Recovers local residue and returns a validated snapshot.
@@ -948,6 +1004,48 @@ fn invalid_canonical_file(file: &RawFile) -> StoreError {
     }
 }
 
+fn validate_builtin_folds<'a>(
+    records: impl IntoIterator<Item = &'a Record>,
+) -> Result<(), StoreError> {
+    let mut grouped = BTreeMap::<(String, String), Vec<crate::DomainOperation>>::new();
+    for record in records {
+        if !matches!(
+            record.domain.as_str(),
+            "wayjournal.profile" | "wayjournal.catalog"
+        ) {
+            continue;
+        }
+        let operation = crate::DomainOperation::try_from(record.clone()).map_err(|error| {
+            StoreError::Corrupt {
+                issue: StoreCorruption::InvalidDomainFold {
+                    domain: record.domain.to_string(),
+                    entity: record.entity_id.to_string(),
+                    message: error.to_string(),
+                },
+            }
+        })?;
+        grouped
+            .entry((record.domain.to_string(), record.entity_id.to_string()))
+            .or_default()
+            .push(operation);
+    }
+    for ((domain, entity), operations) in grouped {
+        let result = if domain == "wayjournal.profile" {
+            crate::fold_profile(&operations).map(|_| ())
+        } else {
+            crate::fold_catalog(&operations).map(|_| ())
+        };
+        result.map_err(|error| StoreError::Corrupt {
+            issue: StoreCorruption::InvalidDomainFold {
+                domain,
+                entity,
+                message: error.to_string(),
+            },
+        })?;
+    }
+    Ok(())
+}
+
 fn validate_global_idempotency(manifests: &[BatchManifest]) -> Result<(), StoreError> {
     let mut owners = BTreeMap::<(ActorId, String), Vec<BatchId>>::new();
     for manifest in manifests {
@@ -972,6 +1070,7 @@ fn validate_global_idempotency(manifests: &[BatchManifest]) -> Result<(), StoreE
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 pub(super) fn scan_collected(
     store: &Store,
     files: &[RawFile],
@@ -1004,6 +1103,8 @@ pub(super) fn scan_collected(
             issue: StoreCorruption::DuplicateGlobalRecordId { record_id, paths },
         });
     }
+    // Canonical manifest-path order defines publication order; UUIDv7 provides the
+    // immutable sortable batch identity used by the first-batch genesis invariant.
     manifests.sort_by_key(BatchManifest::batch_id);
     validate_global_idempotency(&manifests)?;
     let stored = records_by_path
@@ -1016,6 +1117,34 @@ pub(super) fn scan_collected(
             issue: StoreCorruption::GenericOwnership(error),
         }
     })?;
+    if !store.strict_domains
+        && records_by_path.values().any(|(record, _)| {
+            matches!(
+                record.domain.as_str(),
+                "wayjournal.identity" | "wayjournal.profile" | "wayjournal.catalog"
+            )
+        })
+    {
+        return Err(StoreError::Corrupt {
+            issue: StoreCorruption::InvalidDomainFold {
+                domain: "wayjournal.reserved".to_owned(),
+                entity: "legacy-s1-s2".to_owned(),
+                message: "S3 built-in data cannot be opened in legacy mode".to_owned(),
+            },
+        });
+    }
+    let identity = if store.strict_domains {
+        let identity =
+            validate_store_identity(&manifests, &stored, &store.registry).map_err(|error| {
+                StoreError::Corrupt {
+                    issue: StoreCorruption::InvalidGenesis(error),
+                }
+            })?;
+        validate_builtin_folds(records_by_path.values().map(|(record, _)| record))?;
+        identity
+    } else {
+        None
+    };
     let borrowed = legacy
         .iter()
         .map(|entry| LegacyEntry {
@@ -1047,6 +1176,7 @@ pub(super) fn scan_collected(
             .into_values()
             .map(|(record, _)| record)
             .collect(),
+        identity,
         legacy,
     })
 }
@@ -1081,7 +1211,7 @@ mod hostile_tests {
         path
     }
     fn open(path: &Path) -> Store {
-        Store::open(
+        Store::open_legacy_s1_s2(
             path,
             DomainRegistry::new(&[]).unwrap(),
             Arc::new(AcceptLegacy),

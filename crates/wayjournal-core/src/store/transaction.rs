@@ -422,7 +422,25 @@ fn recover_one(store: &Store, batch_id: BatchId, barrier: Barrier<'_>) -> Result
         manifest,
         bytes: manifest_bytes,
     };
-    validate_recovery_base(store, &journal, &staged_manifest, &staged)?;
+    if let Err(error) = validate_recovery_base(store, &journal, &staged_manifest, &staged) {
+        if matches!(
+            error,
+            StoreError::Corrupt {
+                issue: crate::StoreCorruption::InvalidDomainFold { .. }
+            }
+        ) {
+            store.recovery_dir.unlink_file(OsStr::new(&journal_name))?;
+            store.recovery_dir.sync()?;
+            let mut cleanup_entries = 1;
+            remove_tree(
+                &store.stages_dir,
+                OsStr::new(&stage_name),
+                &mut cleanup_entries,
+            )?;
+            store.stages_dir.sync()?;
+        }
+        return Err(error);
+    }
 
     for record in &staged {
         let (parent, name) = record_target_parent(store, &record.target, true)?;
@@ -845,11 +863,12 @@ fn invalid_journal(path: &Path, message: &str) -> StoreError {
 mod tests {
     use super::{
         CrashPoint, MAX_JOURNAL_BYTES, MAX_LOCAL_DEPTH, MAX_LOCAL_ENTRIES, append_inner,
-        link_fd_no_clobber,
+        link_fd_no_clobber, recover_one, stage_batch,
     };
     use crate::{
         ActorId, DomainRegistration, DomainRegistry, KindId, LegacyEntry, LegacyStoreAdapter,
-        MAX_BATCH_BYTES, MAX_RECORD_BYTES, Record, RecordTimestamp, Store, prepare_batch,
+        MAX_BATCH_BYTES, MAX_RECORD_BYTES, Record, RecordTimestamp, Store, StoreError,
+        prepare_batch,
     };
     use serde_json::{Value, json};
     use std::{
@@ -919,7 +938,7 @@ mod tests {
             std::env::temp_dir().join(format!("wayjournal-{label}-{}", uuid::Uuid::now_v7()));
         fs::create_dir(&root).unwrap();
         let registry = DomainRegistry::new(DOMAINS).unwrap();
-        let store = Store::open(&root, registry, Arc::new(NoLegacy)).unwrap();
+        let store = Store::open_legacy_s1_s2(&root, registry, Arc::new(NoLegacy)).unwrap();
         (root, registry, store)
     }
     fn interrupted(
@@ -947,6 +966,233 @@ mod tests {
         );
         (root, registry, store, batch)
     }
+    fn s3_record(domain: &str, kind: &str, id: &str, parents: &[&str], payload: Value) -> Record {
+        Record {
+            record_schema: format!("{domain}/v1").parse().unwrap(),
+            domain: domain.parse().unwrap(),
+            kind: kind.parse().unwrap(),
+            record_id: id.parse().unwrap(),
+            entity_id: "01913f1d-8e2a-7c30-8f4a-426614174010".parse().unwrap(),
+            batch_id: "01913f1d-8e2a-7c30-8f4a-426614174099".parse().unwrap(),
+            actor: ActorId::parse("test:recovery").unwrap(),
+            occurred_at: "2026-08-12T13:00:00Z".parse().unwrap(),
+            recorded_at: "2026-08-12T13:00:01Z".parse().unwrap(),
+            parents: parents.iter().map(|id| id.parse().unwrap()).collect(),
+            payload,
+        }
+    }
+    fn strict_fixture(label: &str) -> (std::path::PathBuf, DomainRegistry, Store) {
+        let root = std::env::temp_dir().join(format!(
+            "wayjournal-strict-{label}-{}",
+            uuid::Uuid::now_v7()
+        ));
+        fs::create_dir(&root).unwrap();
+        let registry = crate::wayjournal_domain_registry().unwrap();
+        let store = Store::open(&root, registry, Arc::new(NoLegacy)).unwrap();
+        let genesis = Record {
+            record_schema: "wayjournal.identity/v1".parse().unwrap(),
+            domain: "wayjournal.identity".parse().unwrap(),
+            kind: "store.genesis".parse().unwrap(),
+            record_id: "01913f1d-8e2a-7c30-8f4a-426614174011".parse().unwrap(),
+            entity_id: "01913f1d-8e2a-7c30-8f4a-426614174010".parse().unwrap(),
+            batch_id: "01913f1d-8e2a-7c30-8f4a-426614174012".parse().unwrap(),
+            actor: ActorId::parse("test:recovery").unwrap(),
+            occurred_at: "2026-08-12T13:00:00Z".parse().unwrap(),
+            recorded_at: "2026-08-12T13:00:01Z".parse().unwrap(),
+            parents: vec![],
+            payload: json!({"store_kind":"wayjournal.personal","store_uuid":"01913f1d-8e2a-7c30-8f4a-426614174010"}),
+        };
+        let batch = prepare_batch(&[genesis], &format!("{label}-genesis"), &registry).unwrap();
+        store
+            .append(&batch, store.read().unwrap().revision())
+            .unwrap();
+        (root, registry, store)
+    }
+    #[allow(clippy::too_many_lines)]
+    fn recovery_hostiles() -> Vec<(&'static str, Vec<Record>)> {
+        let a = "01913f1d-8e2a-7c30-8f4a-426614174041";
+        let b = "01913f1d-8e2a-7c30-8f4a-426614174042";
+        let c = "01913f1d-8e2a-7c30-8f4a-426614174043";
+        let target = json!({"genesis_fingerprint":"3c4835897266c2b72f1ad9528309c6002f388071b0e9c780827bedbfaa35ce15","store_uuid":"01913f1d-8e2a-7c30-8f4a-426614174010"});
+        let other = json!({"genesis_fingerprint":"3c4835897266c2b72f1ad9528309c6002f388071b0e9c780827bedbfaa35ce15","store_uuid":"01913f1d-8e2a-7c30-8f4a-426614174020"});
+        vec![
+            (
+                "dangling",
+                vec![s3_record(
+                    "wayjournal.profile",
+                    "profile.display_name.set",
+                    a,
+                    &[b],
+                    json!({"value":"x"}),
+                )],
+            ),
+            (
+                "cycle",
+                vec![
+                    s3_record(
+                        "wayjournal.profile",
+                        "profile.display_name.set",
+                        a,
+                        &[b],
+                        json!({"value":"a"}),
+                    ),
+                    s3_record(
+                        "wayjournal.profile",
+                        "profile.display_name.set",
+                        b,
+                        &[a],
+                        json!({"value":"b"}),
+                    ),
+                ],
+            ),
+            (
+                "wrong-domain",
+                vec![
+                    s3_record(
+                        "wayjournal.catalog",
+                        "catalog.name.set",
+                        a,
+                        &[],
+                        json!({"target":target,"value":"a"}),
+                    ),
+                    s3_record(
+                        "wayjournal.profile",
+                        "profile.display_name.set",
+                        b,
+                        &[a],
+                        json!({"value":"b"}),
+                    ),
+                ],
+            ),
+            (
+                "fake-resolution",
+                vec![
+                    s3_record(
+                        "wayjournal.profile",
+                        "profile.display_name.set",
+                        a,
+                        &[],
+                        json!({"value":"a"}),
+                    ),
+                    s3_record(
+                        "wayjournal.profile",
+                        "profile.display_name.resolve",
+                        b,
+                        &[a],
+                        json!({"candidates":[a,c],"value":"a"}),
+                    ),
+                ],
+            ),
+            (
+                "partial-resolution",
+                vec![
+                    s3_record(
+                        "wayjournal.profile",
+                        "profile.display_name.set",
+                        a,
+                        &[],
+                        json!({"value":"a"}),
+                    ),
+                    s3_record(
+                        "wayjournal.profile",
+                        "profile.display_name.set",
+                        b,
+                        &[],
+                        json!({"value":"b"}),
+                    ),
+                    s3_record(
+                        "wayjournal.profile",
+                        "profile.display_name.resolve",
+                        c,
+                        &[a, b],
+                        json!({"candidates":[a],"value":"a"}),
+                    ),
+                ],
+            ),
+            (
+                "fake-remove",
+                vec![
+                    s3_record(
+                        "wayjournal.profile",
+                        "profile.alias.add",
+                        a,
+                        &[],
+                        json!({"key":"me","value":"test:a"}),
+                    ),
+                    s3_record(
+                        "wayjournal.profile",
+                        "profile.alias.remove",
+                        b,
+                        &[a],
+                        json!({"adds":[a,c],"key":"me"}),
+                    ),
+                ],
+            ),
+            (
+                "mixed-target",
+                vec![
+                    s3_record(
+                        "wayjournal.catalog",
+                        "catalog.name.set",
+                        a,
+                        &[],
+                        json!({"target":target,"value":"a"}),
+                    ),
+                    s3_record(
+                        "wayjournal.catalog",
+                        "catalog.enabled.set",
+                        b,
+                        &[],
+                        json!({"target":other,"value":true}),
+                    ),
+                ],
+            ),
+        ]
+    }
+    #[test]
+    fn post_journal_published_recovery_rejects_all_semantic_hostiles_and_cleans_residue() {
+        for (label, records) in recovery_hostiles() {
+            let (root, registry, store) = strict_fixture(label);
+            let prepared = prepare_batch(&records, label, &registry).unwrap();
+            stage_batch(
+                &store,
+                &prepared,
+                store.read().unwrap().revision(),
+                &mut |_| Ok(()),
+            )
+            .unwrap();
+            assert!(
+                matches!(
+                    recover_one(&store, prepared.manifest().batch_id(), &mut |_| Ok(())),
+                    Err(StoreError::Corrupt {
+                        issue: crate::StoreCorruption::InvalidDomainFold { .. }
+                    })
+                ),
+                "{label}"
+            );
+            assert!(
+                fs::read_dir(root.join("journal/batches")).unwrap().count() == 1,
+                "{label}"
+            );
+            assert!(
+                fs::read_dir(root.join(".wayjournal-local/recovery"))
+                    .unwrap()
+                    .next()
+                    .is_none(),
+                "{label}"
+            );
+            assert!(
+                fs::read_dir(root.join(".wayjournal-local/stages"))
+                    .unwrap()
+                    .next()
+                    .is_none(),
+                "{label}"
+            );
+            assert_eq!(store.read().unwrap().records().len(), 1, "{label}");
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
     #[test]
     fn collision_reader_is_descriptor_relative_and_expected_plus_one_bounded() {
         let (root, _, store) = fixture_store("collision-bound");

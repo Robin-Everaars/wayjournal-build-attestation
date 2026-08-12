@@ -110,6 +110,37 @@ pub struct PreparedBatch {
     records: Vec<PreparedRecord>,
 }
 
+#[cfg(test)]
+impl BatchManifest {
+    pub(crate) fn replace_only_member_for_test(
+        &mut self,
+        record: &Record,
+        registry: &DomainRegistry,
+        keep_manifest_path: bool,
+    ) -> PreparedRecord {
+        assert_eq!(self.members.len(), 1);
+        let bytes = encode_record(record, registry).expect("test record");
+        let path = record.canonical_path();
+        let reference_path = if keep_manifest_path {
+            self.members[0].path.clone()
+        } else {
+            path.clone()
+        };
+        self.members[0].record_id = record.record_id;
+        self.members[0].record_schema = record.record_schema.clone();
+        self.members[0].content_digest = content_digest(&bytes);
+        self.request_digest = framed_hash(
+            REQUEST_DIGEST_DOMAIN,
+            [(reference_path.as_bytes(), bytes.as_slice())],
+        );
+        PreparedRecord {
+            record: record.clone(),
+            path: reference_path,
+            bytes,
+        }
+    }
+}
+
 impl PreparedBatch {
     #[must_use]
     pub const fn manifest(&self) -> &BatchManifest {

@@ -3,7 +3,7 @@ use std::{env, fs, path::Path};
 use serde_json::{Value, json};
 use wayjournal_core::{
     ActorId, DomainRegistration, DomainRegistry, KindId, Record, encode_record, generated_schemas,
-    prepare_batch,
+    prepare_batch, wayjournal_domain_registry,
 };
 
 const RECORD_A: &str = "01913f1d-8e2a-7c30-8f4a-426614174001";
@@ -47,6 +47,7 @@ fn note(record_id: &str, entity_id: &str, title: &str) -> Record {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn main() {
     let check = env::args().skip(1).any(|argument| argument == "--check");
     let registry = DomainRegistry::new(DOMAINS).expect("registry");
@@ -76,6 +77,67 @@ fn main() {
     artifacts.push((
         "fixtures/wayjournal.batch.v1.json".to_owned(),
         batch.manifest_bytes().to_vec(),
+    ));
+    let genesis = Record {
+        record_schema: "wayjournal.identity/v1".parse().expect("schema"),
+        domain: "wayjournal.identity".parse().expect("domain"),
+        kind: "store.genesis".parse().expect("kind"),
+        record_id: "01913f1d-8e2a-7c30-8f4a-426614174011"
+            .parse()
+            .expect("record"),
+        entity_id: "01913f1d-8e2a-7c30-8f4a-426614174010"
+            .parse()
+            .expect("entity"),
+        batch_id: "01913f1d-8e2a-7c30-8f4a-426614174012"
+            .parse()
+            .expect("batch"),
+        actor: ActorId::parse("human:robin").expect("actor"),
+        occurred_at: "2026-08-12T13:00:00Z".parse().expect("timestamp"),
+        recorded_at: "2026-08-12T13:00:01Z".parse().expect("timestamp"),
+        parents: Vec::new(),
+        payload: json!({
+            "store_kind": "wayjournal.personal",
+            "store_uuid": "01913f1d-8e2a-7c30-8f4a-426614174010"
+        }),
+    };
+    artifacts.push((
+        "fixtures/wayjournal.identity.genesis.v1.json".to_owned(),
+        encode_record(
+            &genesis,
+            &wayjournal_domain_registry().expect("built-in registry"),
+        )
+        .expect("genesis"),
+    ));
+    artifacts.push((
+        "fixtures/wayjournal.profile.v1.json".to_owned(),
+        serde_json::to_vec_pretty(&json!({
+            "kind": "profile.display_name.set",
+            "payload": {"value": "Robin"}
+        }))
+        .map(|mut bytes| {
+            bytes.push(b'\n');
+            bytes
+        })
+        .expect("profile fixture"),
+    ));
+    artifacts.push((
+        "fixtures/wayjournal.catalog.v1.json".to_owned(),
+        serde_json::to_vec_pretty(&json!({
+            "kind": "catalog.remote.add",
+            "payload": {
+                "key": "origin",
+                "target": {
+                    "genesis_fingerprint": "3c4835897266c2b72f1ad9528309c6002f388071b0e9c780827bedbfaa35ce15",
+                    "store_uuid": "01913f1d-8e2a-7c30-8f4a-426614174010"
+                },
+                "value": {
+                    "locator": "ssh://example/repo",
+                    "requires_identity_validation": true
+                }
+            }
+        }))
+        .map(|mut bytes| { bytes.push(b'\n'); bytes })
+        .expect("catalog fixture"),
     ));
 
     let mut drift = false;

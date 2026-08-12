@@ -1,8 +1,11 @@
-use crate::{BATCH_SCHEMA_V1, JSON_CODEC_V1, RECORD_SCHEMA_V1, REVISION_ALGORITHM_V1};
+use crate::{
+    BATCH_SCHEMA_V1, CATALOG_SCHEMA_V1, IDENTITY_SCHEMA_V1, JSON_CODEC_V1, PROFILE_SCHEMA_V1,
+    RECORD_SCHEMA_V1, REVISION_ALGORITHM_V1,
+};
 
 pub struct CapabilityManifest {
     pub schema: &'static str,
-    pub capabilities: [&'static str; 7],
+    pub capabilities: [&'static str; 10],
 }
 
 pub const CAPABILITY_MANIFEST: CapabilityManifest = CapabilityManifest {
@@ -13,6 +16,9 @@ pub const CAPABILITY_MANIFEST: CapabilityManifest = CapabilityManifest {
         BATCH_SCHEMA_V1,
         "wayjournal.layout/v1",
         REVISION_ALGORITHM_V1,
+        IDENTITY_SCHEMA_V1,
+        PROFILE_SCHEMA_V1,
+        CATALOG_SCHEMA_V1,
         "waytask.layout/v1",
         "waytask.store/blake3-framed-v1",
     ],
@@ -38,7 +44,7 @@ const RECORD_SCHEMA: &str = r##"{
     "actor": {"type": "string", "maxLength": 129, "pattern": "^[a-z][a-z0-9_-]{0,31}:[^\\s\\p{Cc}]{1,96}$"},
     "batch_id": {"type": "string", "format": "uuid", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"},
     "domain": {"type": "string", "maxLength": 128, "pattern": "^[a-z][a-z0-9_-]{0,62}(\\.[a-z][a-z0-9_-]{0,62})+$"},
-    "entity_id": {"type": "string", "format": "uuid", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"},
+    "entity_id": {"type": "string", "format": "uuid", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1345678][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"},
     "kind": {"type": "string", "maxLength": 128, "pattern": "^[a-z][a-z0-9_-]{0,62}(\\.[a-z][a-z0-9_-]{0,62})+$"},
     "occurred_at": {"type": "string", "format": "date-time", "maxLength": 33, "pattern": "^(?:[0-9]{4}|[+-][0-9]{6})-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]{0,8}[1-9])?Z$"},
     "parents": {"type": "array", "items": {"type": "string", "format": "uuid", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"}, "uniqueItems": true, "x-wayjournal-sorted": true},
@@ -86,10 +92,17 @@ const BATCH_SCHEMA: &str = r#"{
 }
 "#;
 
+const IDENTITY_SCHEMA: &str = include_str!("schemas/wayjournal.identity.v1.json");
+const PROFILE_SCHEMA: &str = include_str!("schemas/wayjournal.profile.v1.json");
+const CATALOG_SCHEMA: &str = include_str!("schemas/wayjournal.catalog.v1.json");
+
 #[must_use]
-pub fn generated_schemas() -> [(&'static str, &'static str); 2] {
+pub fn generated_schemas() -> [(&'static str, &'static str); 5] {
     [
         ("wayjournal.record.v1.json", RECORD_SCHEMA),
         ("wayjournal.batch.v1.json", BATCH_SCHEMA),
+        ("wayjournal.identity.v1.json", IDENTITY_SCHEMA),
+        ("wayjournal.profile.v1.json", PROFILE_SCHEMA),
+        ("wayjournal.catalog.v1.json", CATALOG_SCHEMA),
     ]
 }

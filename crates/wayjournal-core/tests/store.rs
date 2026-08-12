@@ -60,7 +60,7 @@ impl LegacyStoreAdapter for FixtureLegacy {
 }
 
 fn store(root: &Path) -> Result<Store, StoreError> {
-    Store::open(root, registry(), Arc::new(FixtureLegacy))
+    Store::open_legacy_s1_s2(root, registry(), Arc::new(FixtureLegacy))
 }
 
 fn write(root: &Path, relative: &str, bytes: &[u8]) {

@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://wayjournal.dev/schemas/wayjournal.identity.v1.json",
+  "title": "wayjournal.identity/v1",
+  "$defs": {
+    "digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "storeUuid": {"type": "string", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"},
+    "logicalStoreId": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["genesis_fingerprint", "store_uuid"],
+      "properties": {
+        "genesis_fingerprint": {"$ref": "#/$defs/digest"},
+        "store_uuid": {"$ref": "#/$defs/storeUuid"}
+      }
+    },
+    "revision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["algorithm", "digest"],
+      "properties": {
+        "algorithm": {"enum": ["wayjournal.store/blake3-framed-v1", "waytask.store/blake3-framed-v1"]},
+        "digest": {"$ref": "#/$defs/digest"}
+      }
+    }
+  },
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["kind", "payload"],
+  "properties": {
+    "kind": {"const": "store.genesis"},
+    "payload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["store_kind", "store_uuid"],
+      "properties": {
+        "forked_from": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["parent", "parent_revision"],
+          "properties": {
+            "parent": {"$ref": "#/$defs/logicalStoreId"},
+            "parent_revision": {"$ref": "#/$defs/revision"}
+          }
+        },
+        "store_kind": {"type": "string", "maxLength": 128, "pattern": "^[a-z][a-z0-9_-]{0,62}(\\.[a-z][a-z0-9_-]{0,62})+$"},
+        "store_uuid": {"$ref": "#/$defs/storeUuid"}
+      }
+    }
+  }
+}

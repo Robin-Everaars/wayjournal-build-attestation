@@ -1,0 +1,14 @@
+{
+  "kind": "catalog.remote.add",
+  "payload": {
+    "key": "origin",
+    "target": {
+      "genesis_fingerprint": "3c4835897266c2b72f1ad9528309c6002f388071b0e9c780827bedbfaa35ce15",
+      "store_uuid": "01913f1d-8e2a-7c30-8f4a-426614174010"
+    },
+    "value": {
+      "locator": "ssh://example/repo",
+      "requires_identity_validation": true
+    }
+  }
+}
