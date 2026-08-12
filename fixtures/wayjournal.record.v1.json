@@ -1,0 +1,16 @@
+{
+  "actor": "human:robin",
+  "batch_id": "01913f1d-8e2a-7c30-8f4a-426614174099",
+  "domain": "example.notes",
+  "entity_id": "123e4567-e89b-42d3-a456-426614174000",
+  "kind": "note.created",
+  "occurred_at": "2026-08-12T13:00:00Z",
+  "parents": [],
+  "payload": {
+    "title": "First note"
+  },
+  "record_id": "01913f1d-8e2a-7c30-8f4a-426614174001",
+  "record_schema": "example.notes/v1",
+  "recorded_at": "2026-08-12T13:00:01Z",
+  "schema": "wayjournal.record/v1"
+}

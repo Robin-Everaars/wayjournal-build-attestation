@@ -4,8 +4,10 @@ Wayjournal is a generic, federated substrate for immutable journals stored in
 ordinary Git repositories. It is intended to provide domain-neutral journal
 primitives that independent applications can build on.
 
-The project is in its bootstrap phase. It does not yet implement journal
-storage, federation, or application behavior.
+The first wire-format slice is implemented. It provides strict canonical JSON,
+closed generic record and batch envelopes, typed identifiers, canonical path
+classification, deterministic revisions, and checked protocol artifacts. It
+does not yet publish records to disk or implement Git federation.
 
 ## Product boundaries
 
@@ -17,12 +19,13 @@ storage, federation, or application behavior.
   design.
 - Domain-specific policy and user experiences belong in consumers, not in this
   repository.
-- This milestone contains only the workspace, toolchain, packaging, checks,
-  and version command. It adds no journal behavior.
+- This milestone is structural only: no disk publication/recovery, Git sync,
+  profiles, catalogs, trust, proofs, projections, or consumer semantics.
 
 ## Repository layout
 
-- `crates/wayjournal-core`: domain-neutral library foundations
+- `crates/wayjournal-core`: domain-neutral wire and layout primitives
+- `schemas` and `fixtures`: checked schemas and canonical wire goldens
 - `crates/wayjournal-cli`: the `wayjournal` executable
 - `.forgejo/workflows/check.yml`: the reproducible Codeberg check
 - `flake.nix`: packages, applications, checks, formatter, and development shell

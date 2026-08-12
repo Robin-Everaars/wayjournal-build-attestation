@@ -56,7 +56,14 @@
           };
           rustToolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
           craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
-          src = craneLib.cleanCargoSource ./.;
+          src = pkgs.lib.cleanSourceWith {
+            src = ./.;
+            filter =
+              path: type:
+              (craneLib.filterCargoSources path type)
+              || pkgs.lib.hasInfix "/schemas/" (toString path)
+              || pkgs.lib.hasInfix "/fixtures/" (toString path);
+          };
           commonArgs = {
             pname = "wayjournal";
             version = "0.1.0";
@@ -113,6 +120,18 @@
               commonArgs
               // {
                 inherit cargoArtifacts;
+              }
+            );
+            wire-artifacts = craneLib.mkCargoDerivation (
+              commonArgs
+              // {
+                inherit cargoArtifacts;
+                pname = "wayjournal-wire-artifacts";
+                buildPhaseCargoCommand = "cargo run --package wayjournal-core --example generate-artifacts -- --check";
+                installPhaseCommand = ''
+                  mkdir -p "$out"
+                  touch "$out/passed"
+                '';
               }
             );
             deny = craneLib.cargoDeny (

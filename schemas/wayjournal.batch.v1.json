@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://wayjournal.dev/schemas/wayjournal.batch.v1.json",
+  "title": "wayjournal.batch/v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["actor", "batch_id", "idempotency_key_digest", "members", "request_digest", "schema"],
+  "properties": {
+    "actor": {"type": "string", "maxLength": 129, "pattern": "^[a-z][a-z0-9_-]{0,31}:[^\\s\\p{Cc}]{1,96}$"},
+    "batch_id": {"type": "string", "format": "uuid", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"},
+    "idempotency_key_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "members": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "x-wayjournal-sorted-by": "path",
+      "x-wayjournal-path-domain-maxLength": 128,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["content_digest", "path", "record_id", "record_schema"],
+        "properties": {
+          "content_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+          "path": {"type": "string", "maxLength": 240, "pattern": "^journal/records/(?=.{3,128}/)[a-z][a-z0-9_-]{0,62}(\\.[a-z][a-z0-9_-]{0,62})+/[0-9a-f]{8}-[0-9a-f]{4}-[1345678][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}/[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\\.json$"},
+          "record_id": {"type": "string", "format": "uuid", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"},
+          "record_schema": {"type": "string", "maxLength": 128, "pattern": "^[a-z][a-z0-9_-]{0,62}(\\.[a-z][a-z0-9_-]{0,62})+/[a-z][a-z0-9_-]{0,62}$", "x-wayjournal-matches-path-domain": true}
+        }
+      }
+    },
+    "request_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "schema": {"const": "wayjournal.batch/v1"}
+  }
+}

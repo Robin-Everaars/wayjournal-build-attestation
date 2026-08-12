@@ -1,0 +1,21 @@
+{
+  "actor": "human:robin",
+  "batch_id": "01913f1d-8e2a-7c30-8f4a-426614174099",
+  "idempotency_key_digest": "d6c4a90c21434312d0f18d97c404b10ee920fd734b07626797dadcd4c9bf10d9",
+  "members": [
+    {
+      "content_digest": "5d567d7c343072ec77e6daf0fad3e102588b39616973ddfc7d9184cbc1c9b7df",
+      "path": "journal/records/example.notes/123e4567-e89b-42d3-a456-426614174000/01913f1d-8e2a-7c30-8f4a-426614174001.json",
+      "record_id": "01913f1d-8e2a-7c30-8f4a-426614174001",
+      "record_schema": "example.notes/v1"
+    },
+    {
+      "content_digest": "96c34c1a9caddcab7ecded9f6d7785dbaf5d438519a9a9c6be1500ea059d38e7",
+      "path": "journal/records/example.notes/123e4567-e89b-42d3-a456-426614174001/01913f1d-8e2a-7c30-8f4a-426614174002.json",
+      "record_id": "01913f1d-8e2a-7c30-8f4a-426614174002",
+      "record_schema": "example.notes/v1"
+    }
+  ],
+  "request_digest": "94fd055c016454a93bb8ababa843f5b8f8f2123acb12de69da7b55a00c275119",
+  "schema": "wayjournal.batch/v1"
+}
