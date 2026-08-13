@@ -5,6 +5,7 @@ mod batch;
 mod builtin;
 mod causal;
 mod domains;
+mod federation;
 mod hash;
 mod identity;
 mod ids;
@@ -28,6 +29,11 @@ pub use causal::{
 pub use domains::{
     AdvisoryProfile, CATALOG_SCHEMA_V1, CatalogEntry, CatalogRelation, DomainOperation, FoldError,
     MvRegister, OperationError, PROFILE_SCHEMA_V1, RemoteLocator, fold_catalog, fold_profile,
+};
+pub use federation::{
+    AdmissionCheckpoint, ApprovalError, ApprovedRef, ApprovedRemote, ApprovedRemoteLocator,
+    CheckpointError, GitAdmissionError, GitAdmissionOutcome, GitCommandError, GitObjectFormat,
+    GitOid, GitOidError, GitSyncRequest, LocalTrustBinding,
 };
 pub use hash::{Digest, DigestError};
 pub use identity::{

@@ -15,12 +15,13 @@ jiff = "0.2.20"
 jsonschema = "0.37.4"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
-rustix = { version = "1.1.4", features = ["fs"] }
+rustix = { version = "1.1.4", features = ["fs", "process"] }
 thiserror = "2.0.18"
+url = "2.5.8"
 uuid = { version = "1.22.0", features = ["v7"] }
 
 [workspace.lints.rust]
-unsafe_code = "forbid"
+unsafe_code = "deny"
 
 [workspace.lints.clippy]
 all = { level = "deny", priority = -1 }

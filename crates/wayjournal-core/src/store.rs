@@ -3,7 +3,10 @@ use std::{
     ffi::OsStr,
     fs::{self, File, OpenOptions},
     io::{self, Read},
-    os::unix::{ffi::OsStrExt, fs::OpenOptionsExt},
+    os::{
+        fd::AsRawFd,
+        unix::{ffi::OsStrExt, fs::OpenOptionsExt},
+    },
     path::{Path, PathBuf},
     sync::{Arc, RwLock, RwLockWriteGuard},
 };
@@ -61,10 +64,11 @@ const LOCAL_DIR: &str = ".wayjournal-local";
 const STAGES_DIR: &str = "stages";
 const RECOVERY_DIR: &str = "recovery";
 const CHECKPOINTS_DIR: &str = "checkpoints";
+const ADMISSION_ATTEMPTS_DIR: &str = "admission-attempts";
 /// Maximum bytes supplied for one frozen legacy file.
 pub const MAX_LEGACY_FILE_BYTES: usize = 1024 * 1024;
-const MAX_CANONICAL_ENTRIES: usize = 1_000_000;
-const MAX_TOTAL_CANONICAL_BYTES: u64 = 1024 * 1024 * 1024;
+pub(crate) const MAX_CANONICAL_ENTRIES: usize = 1_000_000;
+pub(crate) const MAX_TOTAL_CANONICAL_BYTES: u64 = 1024 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy)]
 pub struct LegacyEntry<'a> {
@@ -290,7 +294,16 @@ impl Directory {
         validate_component(name, &self.path)?;
         let mut created = false;
         match rfs::mkdirat(&self.file, name, Mode::RWXU) {
-            Ok(()) => created = true,
+            Ok(()) => {
+                created = true;
+                rfs::chmodat(&self.file, name, Mode::RWXU, AtFlags::empty()).map_err(|error| {
+                    io_error(
+                        "set directory component mode",
+                        &self.path.join(name),
+                        error.into(),
+                    )
+                })?;
+            }
             Err(rustix::io::Errno::EXIST) => {
                 if self.kind(name)? != FileType::Directory {
                     return Err(invalid_layout(
@@ -343,7 +356,15 @@ impl Directory {
                 error.into(),
             )
         })?;
-        Ok(File::from(fd))
+        let file = File::from(fd);
+        rfs::fchmod(&file, Mode::RUSR | Mode::WUSR).map_err(|error| {
+            io_error(
+                "set regular file component mode",
+                &self.path.join(name),
+                error.into(),
+            )
+        })?;
+        Ok(file)
     }
     pub fn require_regular(&self, file: &File, name: &OsStr) -> Result<u64, StoreError> {
         let stat = rfs::fstat(file).map_err(|error| {
@@ -431,8 +452,37 @@ impl Directory {
         rfs::unlinkat(&self.file, name, AtFlags::REMOVEDIR)
             .map_err(|error| io_error("unlink directory", &self.path.join(name), error.into()))
     }
+    pub fn rename_file(&self, old: &OsStr, new: &OsStr) -> Result<(), StoreError> {
+        validate_component(old, &self.path)?;
+        validate_component(new, &self.path)?;
+        rfs::renameat(&self.file, old, &self.file, new)
+            .map_err(|error| io_error("replace local file", &self.path.join(new), error.into()))
+    }
     pub fn file(&self) -> &File {
         &self.file
+    }
+    pub fn proc_path(&self) -> PathBuf {
+        PathBuf::from(format!("/proc/self/fd/{}", self.file.as_raw_fd()))
+    }
+    pub fn entry_is(&self, name: &OsStr, child: &Self) -> Result<bool, StoreError> {
+        validate_component(name, &self.path)?;
+        let entry = rfs::statat(&self.file, name, AtFlags::SYMLINK_NOFOLLOW).map_err(|error| {
+            io_error(
+                "inspect retained directory entry",
+                &self.path.join(name),
+                error.into(),
+            )
+        })?;
+        let retained = rfs::fstat(&child.file).map_err(|error| {
+            io_error(
+                "inspect retained directory descriptor",
+                &child.path,
+                error.into(),
+            )
+        })?;
+        Ok(entry.st_dev == retained.st_dev
+            && entry.st_ino == retained.st_ino
+            && FileType::from_raw_mode(entry.st_mode) == FileType::Directory)
     }
     pub fn lock_file(&self) -> Result<File, StoreError> {
         let fd = rfs::openat(
@@ -488,6 +538,8 @@ pub struct Store {
     pub(super) journal_batches_dir: Arc<Directory>,
     pub(super) stages_dir: Arc<Directory>,
     pub(super) recovery_dir: Arc<Directory>,
+    pub(super) checkpoints_dir: Arc<Directory>,
+    pub(super) admission_attempts_dir: Arc<Directory>,
     strict_domains: bool,
 }
 impl Store {
@@ -560,9 +612,17 @@ impl Store {
         let (stages, _) = local.ensure_dir(OsStr::new(STAGES_DIR))?;
         let (recovery, _) = local.ensure_dir(OsStr::new(RECOVERY_DIR))?;
         let (checkpoints, _) = local.ensure_dir(OsStr::new(CHECKPOINTS_DIR))?;
+        let (admission_attempts, _) = local.ensure_dir(OsStr::new(ADMISSION_ATTEMPTS_DIR))?;
         #[cfg(test)]
         race(RacePoint::ReservedAnchors);
-        for directory in [&records, &journal_batches, &stages, &recovery, &checkpoints] {
+        for directory in [
+            &records,
+            &journal_batches,
+            &stages,
+            &recovery,
+            &checkpoints,
+            &admission_attempts,
+        ] {
             directory.sync()?;
         }
         journal.sync()?;
@@ -581,6 +641,8 @@ impl Store {
             journal_batches_dir: Arc::new(journal_batches),
             stages_dir: Arc::new(stages),
             recovery_dir: Arc::new(recovery),
+            checkpoints_dir: Arc::new(checkpoints),
+            admission_attempts_dir: Arc::new(admission_attempts),
             strict_domains,
         })
     }

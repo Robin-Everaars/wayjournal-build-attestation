@@ -69,6 +69,8 @@
             version = "0.1.0";
             inherit src;
             strictDeps = true;
+            nativeBuildInputs = [ pkgs.git ];
+            WAYJOURNAL_TEST_GIT = "${pkgs.git}/bin/git";
           };
           cargoArtifacts = craneLib.buildDepsOnly commonArgs;
           wayjournal = craneLib.buildPackage (
