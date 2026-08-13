@@ -97,21 +97,16 @@ struct StagedManifest {
 type Barrier<'a> = &'a mut dyn FnMut(CrashPoint) -> io::Result<()>;
 
 pub(super) fn exclusive_snapshot(store: &Store) -> Result<ExclusiveSnapshot<'_>, StoreError> {
-    let local_guard = store
-        .local_lock
-        .write()
-        .map_err(|_| StoreError::LockPoisoned)?;
-    let file_guard = store.root_dir.lock_file()?;
-    file_guard
-        .lock()
-        .map_err(|source| io_error("acquire exclusive root lock", &store.root, source))?;
-    recover_locked(store, &mut |_| Ok(()))?;
-    let snapshot = scan_visible(store)?;
-    Ok(ExclusiveSnapshot {
-        snapshot,
-        _file_guard: file_guard,
-        _local_guard: local_guard,
-    })
+    let guard = store.lock_exclusive_unsnapshotted()?;
+    crate::federation::pending::clean_disposable_locked(store)?;
+    if crate::federation::pending::gate_without_git(store)?
+        != crate::federation::pending::GateAction::Allow
+    {
+        return Err(StoreError::InvalidGitSyncState {
+            message: "disposable pending cleanup did not converge".to_owned(),
+        });
+    }
+    guard.into_recovered_snapshot()
 }
 
 pub(super) fn append(
@@ -127,13 +122,15 @@ fn append_inner(
     expected: StoreRevisionRef,
     barrier: Barrier<'_>,
 ) -> Result<CommitOutcome, StoreError> {
-    let _local = store
-        .local_lock
-        .write()
-        .map_err(|_| StoreError::LockPoisoned)?;
-    let lock = store.root_dir.lock_file()?;
-    lock.lock()
-        .map_err(|source| io_error("acquire exclusive root lock", &store.root, source))?;
+    let _guard = store.lock_exclusive_unsnapshotted()?;
+    crate::federation::pending::clean_disposable_locked(store)?;
+    if crate::federation::pending::gate_without_git(store)?
+        != crate::federation::pending::GateAction::Allow
+    {
+        return Err(StoreError::InvalidGitSyncState {
+            message: "disposable pending cleanup did not converge".to_owned(),
+        });
+    }
     recover_locked(store, barrier)?;
     let snapshot = scan_visible(store)?;
     if snapshot.revision() != expected {
@@ -302,16 +299,10 @@ fn stage_batch(
     hit(barrier, CrashPoint::JournalPublished)
 }
 
-pub(super) fn recover(store: &Store) -> Result<(), StoreError> {
-    let _local = store
-        .local_lock
-        .write()
-        .map_err(|_| StoreError::LockPoisoned)?;
-    let lock = store.root_dir.lock_file()?;
-    lock.lock()
-        .map_err(|source| io_error("acquire exclusive root lock", &store.root, source))?;
+pub(super) fn recover_locked_default(store: &Store) -> Result<(), StoreError> {
     recover_locked(store, &mut |_| Ok(()))
 }
+
 fn recover_locked(store: &Store, barrier: Barrier<'_>) -> Result<(), StoreError> {
     #[cfg(test)]
     race(RacePoint::RecoveryRoot);
@@ -707,7 +698,7 @@ fn record_target_parent(
     };
     Ok((entity, OsString::from(file)))
 }
-fn ensure_synced(parent: &Directory, name: &OsStr) -> Result<Directory, StoreError> {
+pub(crate) fn ensure_synced(parent: &Directory, name: &OsStr) -> Result<Directory, StoreError> {
     let (directory, created) = parent.ensure_dir(name)?;
     if created {
         directory.sync()?;
@@ -784,7 +775,7 @@ fn bounded_regular(
         other => other,
     })
 }
-fn link_fd_no_clobber(
+pub(crate) fn link_fd_no_clobber(
     source: &File,
     target_dir: &Directory,
     target_name: &OsStr,

@@ -14,6 +14,7 @@ use std::{
 use rustix::fs::{self as rfs, AtFlags, Dir, FileType, Mode, OFlags};
 use thiserror::Error;
 
+pub(crate) mod bulk;
 mod transaction;
 
 #[cfg(test)]
@@ -65,6 +66,8 @@ const STAGES_DIR: &str = "stages";
 const RECOVERY_DIR: &str = "recovery";
 const CHECKPOINTS_DIR: &str = "checkpoints";
 const ADMISSION_ATTEMPTS_DIR: &str = "admission-attempts";
+const SYNC_PENDING_DIR: &str = "sync-pending";
+const QUARANTINE_DIR: &str = "quarantine";
 /// Maximum bytes supplied for one frozen legacy file.
 pub const MAX_LEGACY_FILE_BYTES: usize = 1024 * 1024;
 pub(crate) const MAX_CANONICAL_ENTRIES: usize = 1_000_000;
@@ -91,12 +94,90 @@ impl<'a> LegacyEntry<'a> {
     }
 }
 
+/// Memory contract requested from a frozen-legacy validator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LegacyStreamRequirement {
+    /// Compatibility mode may collect entries before calling the frozen validator.
+    CompatibleCollecting,
+    /// Full S4b capacity must be validated with bounded working memory.
+    FullDomainBounded,
+}
+
+/// Typed failure returned by the additive legacy streaming contract.
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum LegacyStreamingError {
+    #[error("the legacy adapter does not support bounded full-domain streaming")]
+    UnsupportedFullDomain,
+    #[error("the legacy entry source failed: {0}")]
+    Source(String),
+    #[error("legacy validation failed: {0}")]
+    Invalid(String),
+}
+
+/// Pull source used by object-safe legacy streaming validators.
+pub trait LegacyEntrySource {
+    /// Returns the next entry. The borrowed entry remains valid until the next call.
+    /// # Errors
+    /// Returns a stable non-sensitive source error.
+    fn next_entry(&mut self) -> Result<Option<LegacyEntry<'_>>, String>;
+}
+
 /// Structural validator for the frozen legacy Waytask files.
 pub trait LegacyStoreAdapter: std::fmt::Debug + Send + Sync {
     /// Validates the complete frozen legacy set without applying consumer folds.
     /// # Errors
     /// Returns a stable non-sensitive description when invalid.
     fn validate(&self, entries: &[LegacyEntry<'_>]) -> Result<(), String>;
+
+    /// Proves that the requested streaming memory contract is implemented.
+    ///
+    /// Existing adapters retain source compatibility. They support collecting compatibility
+    /// validation but must opt in explicitly before S4b can process the full store domain.
+    /// # Errors
+    /// Returns [`LegacyStreamingError::UnsupportedFullDomain`] for the default bounded request.
+    fn require_streaming(
+        &self,
+        requirement: LegacyStreamRequirement,
+    ) -> Result<(), LegacyStreamingError> {
+        match requirement {
+            LegacyStreamRequirement::CompatibleCollecting => Ok(()),
+            LegacyStreamRequirement::FullDomainBounded => {
+                Err(LegacyStreamingError::UnsupportedFullDomain)
+            }
+        }
+    }
+
+    /// Validates frozen legacy entries from an object-safe pull source.
+    ///
+    /// The compatibility default preserves the exact existing `validate` semantics by collecting
+    /// and borrowing the entries. Full-domain bounded adapters override this method.
+    /// # Errors
+    /// Returns a typed capability, source, or validation failure.
+    fn validate_stream(
+        &self,
+        requirement: LegacyStreamRequirement,
+        source: &mut dyn LegacyEntrySource,
+    ) -> Result<(), LegacyStreamingError> {
+        self.require_streaming(requirement)?;
+        let mut owned = Vec::<OwnedLegacyEntry>::new();
+        while let Some(entry) = source.next_entry().map_err(LegacyStreamingError::Source)? {
+            owned.push(OwnedLegacyEntry {
+                path: entry.path.to_vec(),
+                bytes: entry.bytes.to_vec(),
+                class: entry.class,
+            });
+        }
+        let borrowed = owned
+            .iter()
+            .map(|entry| LegacyEntry {
+                path: &entry.path,
+                bytes: &entry.bytes,
+                class: entry.class,
+            })
+            .collect::<Vec<_>>();
+        self.validate(&borrowed)
+            .map_err(LegacyStreamingError::Invalid)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -160,6 +241,15 @@ pub enum StoreError {
     InvalidJournal { path: PathBuf, message: String },
     #[error("immutable publication target conflicts at {path}")]
     PublicationConflict { path: PathBuf },
+    #[error("Git synchronization {operation_id} is pending in phase {phase:?}")]
+    GitSyncPending {
+        operation_id: crate::GitSyncOperationId,
+        phase: crate::GitSyncPendingPhase,
+    },
+    #[error("invalid Git synchronization state: {message}")]
+    InvalidGitSyncState { message: String },
+    #[error("Git synchronization pending state conflicts with ordinary transaction recovery")]
+    ConflictingRecoveryState,
     #[error("injected crash at {point}")]
     InjectedCrash { point: &'static str },
     #[error("batch operation failed: {0}")]
@@ -237,6 +327,32 @@ impl ExclusiveSnapshot<'_> {
     }
 }
 
+/// Exclusive retained-root lock acquired before any canonical filesystem scan.
+pub(super) struct UnsnapshottedExclusive<'a> {
+    store: &'a Store,
+    file_guard: File,
+    local_guard: RwLockWriteGuard<'a, ()>,
+}
+impl<'a> UnsnapshottedExclusive<'a> {
+    pub(super) fn recover_transactions(&self) -> Result<(), StoreError> {
+        transaction::recover_locked_default(self.store)
+    }
+
+    pub(super) fn scan_visible_locked(&self) -> Result<StoreSnapshot, StoreError> {
+        scan_visible(self.store)
+    }
+
+    pub(super) fn into_recovered_snapshot(self) -> Result<ExclusiveSnapshot<'a>, StoreError> {
+        self.recover_transactions()?;
+        let snapshot = self.scan_visible_locked()?;
+        Ok(ExclusiveSnapshot {
+            snapshot,
+            _file_guard: self.file_guard,
+            _local_guard: self.local_guard,
+        })
+    }
+}
+
 /// Retained directory descriptor. All descendants are opened one component at a time with
 /// `openat(O_NOFOLLOW)` and checked with `fstat`, so renames cannot redirect an operation.
 #[derive(Debug)]
@@ -265,7 +381,7 @@ impl Directory {
         }
         Ok(Self { file, path, device })
     }
-    fn open_ambient(path: &Path) -> Result<Self, StoreError> {
+    pub(crate) fn open_ambient(path: &Path) -> Result<Self, StoreError> {
         let file = OpenOptions::new()
             .read(true)
             .custom_flags(libc_flags::DIRECTORY | libc_flags::NOFOLLOW | libc_flags::CLOEXEC)
@@ -424,6 +540,23 @@ impl Directory {
         names.sort();
         Ok(names)
     }
+    /// Returns at most `limit` names without allocating for the rest of a large directory.
+    pub fn name_batch(&self, limit: usize) -> Result<Vec<Vec<u8>>, StoreError> {
+        let mut dir = Dir::read_from(&self.file)
+            .map_err(|error| io_error("read directory descriptor", &self.path, error.into()))?;
+        let mut names = Vec::with_capacity(limit.min(4_096));
+        while names.len() < limit {
+            let Some(entry) = dir.read() else { break };
+            let entry = entry
+                .map_err(|error| io_error("read directory entry", &self.path, error.into()))?;
+            let name = entry.file_name().to_bytes();
+            if name != b"." && name != b".." {
+                names.push(name.to_vec());
+            }
+        }
+        names.sort();
+        Ok(names)
+    }
     pub fn kind(&self, name: &OsStr) -> Result<FileType, StoreError> {
         validate_component(name, &self.path)?;
         let stat = rfs::statat(&self.file, name, AtFlags::SYMLINK_NOFOLLOW).map_err(|error| {
@@ -461,8 +594,22 @@ impl Directory {
     pub fn file(&self) -> &File {
         &self.file
     }
+    pub(crate) fn try_clone(&self) -> Result<Self, StoreError> {
+        let file = self
+            .file
+            .try_clone()
+            .map_err(|source| io_error("clone retained directory", &self.path, source))?;
+        Self::from_file(self.path.clone(), file, Some(self.device))
+    }
     pub fn proc_path(&self) -> PathBuf {
         PathBuf::from(format!("/proc/self/fd/{}", self.file.as_raw_fd()))
+    }
+    pub fn child_proc_path(&self) -> PathBuf {
+        PathBuf::from(format!(
+            "/proc/{}/fd/{}",
+            std::process::id(),
+            self.file.as_raw_fd()
+        ))
     }
     pub fn entry_is(&self, name: &OsStr, child: &Self) -> Result<bool, StoreError> {
         validate_component(name, &self.path)?;
@@ -540,6 +687,8 @@ pub struct Store {
     pub(super) recovery_dir: Arc<Directory>,
     pub(super) checkpoints_dir: Arc<Directory>,
     pub(super) admission_attempts_dir: Arc<Directory>,
+    pub(super) sync_pending_dir: Arc<Directory>,
+    pub(super) quarantine_dir: Arc<Directory>,
     strict_domains: bool,
 }
 impl Store {
@@ -613,6 +762,8 @@ impl Store {
         let (recovery, _) = local.ensure_dir(OsStr::new(RECOVERY_DIR))?;
         let (checkpoints, _) = local.ensure_dir(OsStr::new(CHECKPOINTS_DIR))?;
         let (admission_attempts, _) = local.ensure_dir(OsStr::new(ADMISSION_ATTEMPTS_DIR))?;
+        let (sync_pending, _) = local.ensure_dir(OsStr::new(SYNC_PENDING_DIR))?;
+        let (quarantine, _) = local.ensure_dir(OsStr::new(QUARANTINE_DIR))?;
         #[cfg(test)]
         race(RacePoint::ReservedAnchors);
         for directory in [
@@ -622,6 +773,8 @@ impl Store {
             &recovery,
             &checkpoints,
             &admission_attempts,
+            &sync_pending,
+            &quarantine,
         ] {
             directory.sync()?;
         }
@@ -643,6 +796,8 @@ impl Store {
             recovery_dir: Arc::new(recovery),
             checkpoints_dir: Arc::new(checkpoints),
             admission_attempts_dir: Arc::new(admission_attempts),
+            sync_pending_dir: Arc::new(sync_pending),
+            quarantine_dir: Arc::new(quarantine),
             strict_domains,
         })
     }
@@ -651,7 +806,7 @@ impl Store {
     /// Returns layout, I/O, recovery, codec, or ownership failures.
     pub fn read(&self) -> Result<StoreSnapshot, StoreError> {
         loop {
-            {
+            let needs_exclusive = {
                 let _local = self
                     .local_lock
                     .read()
@@ -659,13 +814,41 @@ impl Store {
                 let lock = self.root_dir.lock_file()?;
                 lock.lock_shared()
                     .map_err(|source| io_error("acquire shared root lock", &self.root, source))?;
-                if !self.has_residue()? {
-                    return scan_visible(self);
+                match crate::federation::pending::gate_without_git(self)? {
+                    crate::federation::pending::GateAction::Allow => {
+                        if !self.has_residue()? {
+                            return scan_visible(self);
+                        }
+                        true
+                    }
+                    crate::federation::pending::GateAction::CleanDisposable => true,
                 }
+            };
+            if needs_exclusive {
+                let guard = self.lock_exclusive_unsnapshotted()?;
+                crate::federation::pending::clean_disposable_locked(self)?;
+                guard.recover_transactions()?;
             }
-            transaction::recover(self)?;
         }
     }
+    pub(super) fn lock_exclusive_unsnapshotted(
+        &self,
+    ) -> Result<UnsnapshottedExclusive<'_>, StoreError> {
+        let local_guard = self
+            .local_lock
+            .write()
+            .map_err(|_| StoreError::LockPoisoned)?;
+        let file_guard = self.root_dir.lock_file()?;
+        file_guard
+            .lock()
+            .map_err(|source| io_error("acquire exclusive root lock", &self.root, source))?;
+        Ok(UnsnapshottedExclusive {
+            store: self,
+            file_guard,
+            local_guard,
+        })
+    }
+
     /// Returns a validated snapshot while holding the exclusive retained-root lock.
     /// # Errors
     /// Returns locking, recovery, or scan failures.
@@ -683,6 +866,10 @@ impl Store {
         transaction::append(self, prepared, expected)
     }
     fn has_residue(&self) -> Result<bool, StoreError> {
+        self.has_transaction_residue_locked()
+    }
+
+    pub(crate) fn has_transaction_residue_locked(&self) -> Result<bool, StoreError> {
         fn nonempty(directory: &Directory) -> Result<bool, StoreError> {
             let mut found = false;
             directory.for_each_name(MAX_CANONICAL_ENTRIES, |_| {
@@ -1241,6 +1428,116 @@ pub(super) fn scan_collected(
         identity,
         legacy,
     })
+}
+
+#[cfg(test)]
+mod s4b_lock_tests {
+    use super::*;
+    use crate::{LegacyEntry, LegacyStoreAdapter, wayjournal_domain_registry};
+    use std::{fs, sync::Arc};
+
+    #[derive(Debug)]
+    struct NoLegacy;
+    impl LegacyStoreAdapter for NoLegacy {
+        fn validate(&self, _: &[LegacyEntry<'_>]) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn legacy_streaming_default_preserves_validate_and_rejects_full_domain() {
+        #[derive(Debug)]
+        struct RejectOne;
+        impl LegacyStoreAdapter for RejectOne {
+            fn validate(&self, entries: &[LegacyEntry<'_>]) -> Result<(), String> {
+                if entries.len() == 1 {
+                    Err("one entry rejected".to_owned())
+                } else {
+                    Ok(())
+                }
+            }
+        }
+
+        struct OneEntrySource {
+            emitted: bool,
+            path: Vec<u8>,
+            bytes: Vec<u8>,
+        }
+        impl crate::LegacyEntrySource for OneEntrySource {
+            fn next_entry(&mut self) -> Result<Option<LegacyEntry<'_>>, String> {
+                if self.emitted {
+                    return Ok(None);
+                }
+                self.emitted = true;
+                Ok(Some(LegacyEntry {
+                    path: &self.path,
+                    bytes: &self.bytes,
+                    class: PathClass::LegacyBatch,
+                }))
+            }
+        }
+
+        let adapter = RejectOne;
+        let mut source = OneEntrySource {
+            emitted: false,
+            path: b"batches/01913f1d-8e2a-7c30-8f4a-426614174012.json".to_vec(),
+            bytes: b"legacy".to_vec(),
+        };
+        assert_eq!(
+            adapter.validate_stream(
+                crate::LegacyStreamRequirement::CompatibleCollecting,
+                &mut source,
+            ),
+            Err(crate::LegacyStreamingError::Invalid(
+                "one entry rejected".to_owned()
+            ))
+        );
+        assert_eq!(
+            adapter.require_streaming(crate::LegacyStreamRequirement::FullDomainBounded),
+            Err(crate::LegacyStreamingError::UnsupportedFullDomain)
+        );
+    }
+
+    #[test]
+    fn unsnapshotted_lock_does_not_scan_partial_store() {
+        let root = std::env::temp_dir().join(format!(
+            "wayjournal-s4b-unsnapshotted-{}",
+            uuid::Uuid::now_v7()
+        ));
+        fs::create_dir(&root).expect("root");
+        let store = Store::open(
+            &root,
+            wayjournal_domain_registry().expect("registry"),
+            Arc::new(NoLegacy),
+        )
+        .expect("store");
+        fs::write(root.join("journal/batches/not-canonical.json"), b"partial")
+            .expect("partial prefix");
+        let guard = store
+            .lock_exclusive_unsnapshotted()
+            .expect("lock without scan");
+        assert!(guard.scan_visible_locked().is_err());
+        drop(guard);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn store_retains_s4b_local_directories() {
+        let root =
+            std::env::temp_dir().join(format!("wayjournal-s4b-retained-{}", uuid::Uuid::now_v7()));
+        fs::create_dir(&root).expect("root");
+        let store = Store::open(
+            &root,
+            wayjournal_domain_registry().expect("registry"),
+            Arc::new(NoLegacy),
+        )
+        .expect("store");
+        assert!(store.sync_pending_dir.path.ends_with("sync-pending"));
+        assert!(store.quarantine_dir.path.ends_with("quarantine"));
+        store.sync_pending_dir.sync().expect("pending sync");
+        store.quarantine_dir.sync().expect("quarantine sync");
+        fs::remove_dir_all(root).expect("cleanup");
+    }
 }
 
 #[cfg(test)]

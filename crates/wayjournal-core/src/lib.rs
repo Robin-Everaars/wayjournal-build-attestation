@@ -33,7 +33,8 @@ pub use domains::{
 pub use federation::{
     AdmissionCheckpoint, ApprovalError, ApprovedRef, ApprovedRemote, ApprovedRemoteLocator,
     CheckpointError, GitAdmissionError, GitAdmissionOutcome, GitCommandError, GitObjectFormat,
-    GitOid, GitOidError, GitSyncRequest, LocalTrustBinding,
+    GitOid, GitOidError, GitQuarantineReason, GitSyncError, GitSyncOperationId, GitSyncOutcome,
+    GitSyncPendingPhase, GitSyncRequest, LocalTrustBinding, QuarantineError, QuarantineIncidentId,
 };
 pub use hash::{Digest, DigestError};
 pub use identity::{
@@ -57,6 +58,7 @@ pub use revision::{
     compute_store_revision,
 };
 pub use store::{
-    CommitOutcome, ExclusiveSnapshot, LegacyEntry, LegacyStoreAdapter, MAX_LEGACY_FILE_BYTES,
-    Store, StoreCorruption, StoreError, StoreSnapshot,
+    CommitOutcome, ExclusiveSnapshot, LegacyEntry, LegacyEntrySource, LegacyStoreAdapter,
+    LegacyStreamRequirement, LegacyStreamingError, MAX_LEGACY_FILE_BYTES, Store, StoreCorruption,
+    StoreError, StoreSnapshot,
 };

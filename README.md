@@ -11,9 +11,11 @@ deterministic causal folds for advisory profiles and catalogs, canonical path
 classification, deterministic revisions, and checked protocol artifacts. The local
 store uses descriptor-relative publication and explicit durability barriers; recovery
 is tested at those modeled barriers, not against arbitrary device, kernel, or filesystem
-failures. The follow-up S4b slice will implement advancing Git sync, pending
-journals, crash-safe bulk publication, monotonic union, expected-OID CAS push,
-and durable admission quarantine; none of those advancing APIs exist in S4a.
+failures. S4b adds retained pending/quarantine roots, closed bounded pending and
+quarantine codecs, full-capacity chunk metadata, pending-aware Store access, complete
+monotonic history validation, immutable exact union, descriptor-safe bulk recovery,
+expected-old local-ref/checkpoint transitions, one-ref lease push with observation,
+and two-slot stale-successor recovery.
 
 ## Product boundaries
 
@@ -37,10 +39,26 @@ and durable admission quarantine; none of those advancing APIs exist in S4a.
   not supported reliably; callers should supply an ordinary native Git binary.
 - `Store::bootstrap_git_admission` can establish or revalidate a durable local
   checkpoint only when local HEAD, the fetched approved tip, the filesystem, identity,
-  and revision already match. Differing tips return `AdvanceRequired` without mutation;
-  S4b owns advancing sync, its pending journal, bulk publication recovery, union,
-  CAS push, and quarantine. Shared profile data is advisory and never supplies
-  approval or credentials.
+  and revision already match. Differing tips return `AdvanceRequired` without mutation.
+  If any durable S4b pending operation exists, `read`, `append`, `exclusive_snapshot`,
+  and `admission_checkpoint` fail before scanning in every phase, including stale and
+  confirmed phases. Bootstrap alone may use its retained Git executable to verify the
+  candidate filesystem, approved local ref, and checkpoint read-only; it cannot recover,
+  advance, retire, or clean durable pending state. Shared profile data is advisory and
+  never supplies approval or credentials.
+- Quarantine incidents are closed canonical private files and block automatic Git retry.
+  There is no S4b acknowledgement or clearing API. Ordinary local Store APIs are not
+  blocked by quarantine when no pending operation exists.
+- Advancing synchronization validates every new commit and parent boundary, detects
+  delete/modify-and-restore edges, and converges by exact canonical path-byte set and
+  revision. It reuses a tip only with the required ancestry; otherwise it constructs a
+  bounded two-parent merge and verifies both parents are ancestors. Remote publication
+  updates exactly the existing approved ref with an expected-OID lease; missing refs are
+  quarantined and are never created.
+- Fetched repositories are disposable until their metadata, physical count/byte/depth,
+  object graph, commit graph, canonical trees, and snapshots validate. Git CLI still
+  cannot impose a portable byte cap before receiving an incoming pack. Checkpoint
+  expected-old replacement is cooperative serialization, not a kernel compare-and-swap.
 - The Git executable, one credential-free canonical `file://` or `https://` locator,
   one `refs/heads/...` ref, and a local trust binding are explicit checked inputs. The
   runner clears ambient environment/configuration and rejects unsafe repository-local

@@ -29,6 +29,10 @@ pub enum CheckpointError {
     Oversized,
     #[error("checkpoint is not strict canonical v1 JSON: {0}")]
     Invalid(String),
+    #[error("checkpoint does not equal the expected old value")]
+    ExpectedOldMismatch,
+    #[error("checkpoint replacement was not durable at the expected candidate")]
+    ReplacementMismatch,
     #[cfg(test)]
     #[error("injected checkpoint crash at barrier {0}")]
     InjectedCrash(usize),
@@ -179,6 +183,84 @@ pub(super) fn write(
     checkpoint: &AdmissionCheckpoint,
 ) -> Result<(), CheckpointError> {
     write_impl(store, checkpoint, |_| Ok(()))
+}
+
+#[allow(dead_code)]
+pub(super) fn replace_expected(
+    store: &Store,
+    expected: &AdmissionCheckpoint,
+    candidate: &AdmissionCheckpoint,
+) -> Result<(), CheckpointError> {
+    let expected_bytes = encode(expected)?;
+    let candidate_bytes = encode(candidate)?;
+    let current = read_current_bytes(store)?;
+    if current == candidate_bytes {
+        decode(&current)?;
+        return Ok(());
+    }
+    if current != expected_bytes {
+        return Err(CheckpointError::ExpectedOldMismatch);
+    }
+    let temporary = format!(".{CHECKPOINT_NAME}.tmp-{}", uuid::Uuid::now_v7());
+    let temporary_name = OsStr::new(&temporary);
+    let mut file = store.checkpoints_dir.create_file(temporary_name)?;
+    file.write_all(&candidate_bytes).map_err(|source| {
+        crate::store::io_error(
+            "write expected-old checkpoint",
+            &store.checkpoints_dir.path.join(temporary_name),
+            source,
+        )
+    })?;
+    file.sync_all().map_err(|source| {
+        crate::store::io_error(
+            "sync expected-old checkpoint",
+            &store.checkpoints_dir.path.join(temporary_name),
+            source,
+        )
+    })?;
+    super::fault::hit("checkpoint-temporary-durable");
+    drop(file);
+    if read_current_bytes(store)? != expected_bytes {
+        store.checkpoints_dir.unlink_file(temporary_name)?;
+        store.checkpoints_dir.sync()?;
+        return Err(CheckpointError::ExpectedOldMismatch);
+    }
+    store
+        .checkpoints_dir
+        .rename_file(temporary_name, OsStr::new(CHECKPOINT_NAME))?;
+    super::fault::hit("checkpoint-renamed");
+    store.checkpoints_dir.sync()?;
+    super::fault::hit("checkpoint-parent-durable");
+    let published = read_current_bytes(store)?;
+    if published != candidate_bytes || decode(&published)? != *candidate {
+        return Err(CheckpointError::ReplacementMismatch);
+    }
+    Ok(())
+}
+
+fn read_current_bytes(store: &Store) -> Result<Vec<u8>, CheckpointError> {
+    let name = OsStr::new(CHECKPOINT_NAME);
+    let file = store.checkpoints_dir.open_file(name)?;
+    let size = store.checkpoints_dir.require_regular(&file, name)?;
+    require_private_mode(&file)?;
+    if size > MAX_CHECKPOINT_BYTES {
+        return Err(CheckpointError::Oversized);
+    }
+    let mut bytes =
+        Vec::with_capacity(usize::try_from(size).map_err(|_| CheckpointError::Oversized)?);
+    file.take(MAX_CHECKPOINT_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|source| {
+            crate::store::io_error(
+                "read expected-old checkpoint",
+                &store.checkpoints_dir.path.join(name),
+                source,
+            )
+        })?;
+    if bytes.len() as u64 > MAX_CHECKPOINT_BYTES {
+        return Err(CheckpointError::Oversized);
+    }
+    Ok(bytes)
 }
 
 fn write_impl(
@@ -345,6 +427,37 @@ mod tests {
             .expect("revision"),
         }
     }
+    #[test]
+    fn checkpoint_replace_requires_expected_old() {
+        let directory = TestDir::new();
+        let store = Store::open(
+            &directory.0,
+            wayjournal_domain_registry().expect("registry"),
+            Arc::new(NoLegacy),
+        )
+        .expect("store");
+        let expected = checkpoint("1111111111111111111111111111111111111111");
+        let unrelated = checkpoint("2222222222222222222222222222222222222222");
+        let candidate = checkpoint("3333333333333333333333333333333333333333");
+        write(&store, &unrelated).expect("unrelated");
+        assert!(replace_expected(&store, &expected, &candidate).is_err());
+        assert_eq!(
+            read(&store)
+                .expect("read")
+                .expect("present")
+                .accepted_commit(),
+            unrelated.accepted_commit()
+        );
+        replace_expected(&store, &unrelated, &candidate).expect("expected replacement");
+        assert_eq!(
+            read(&store)
+                .expect("read")
+                .expect("present")
+                .accepted_commit(),
+            candidate.accepted_commit()
+        );
+    }
+
     #[test]
     fn every_atomic_replace_barrier_reopens_as_exactly_old_or_new() {
         for barrier in 0..4 {
