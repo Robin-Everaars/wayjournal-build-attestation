@@ -636,7 +636,7 @@ impl crate::Store {
         }
         pending::clean_disposable_locked(self)?;
         guard.recover_transactions()?;
-        let current = guard.scan_visible_locked()?;
+        let current = guard.scan_visible_streaming_locked()?;
         match start_sync_operation(
             self,
             request,
@@ -1213,7 +1213,7 @@ fn recover_sync_operation(
     loop {
         // The phase is never authority. Re-derive every prerequisite from durable filesystem,
         // approved-ref and checkpoint truth, accepting only old or candidate at each surface.
-        let visible_before = guard.scan_visible_locked()?;
+        let visible_before = guard.scan_visible_streaming_locked()?;
         if visible_before.revision() == base_snapshot.revision() {
             let mut publication_failed = false;
             for rank in 0..=1 {
@@ -1231,7 +1231,8 @@ fn recover_sync_operation(
                 }
             }
             if publication_failed
-                || guard.scan_visible_locked()?.revision() != active.document.candidate_revision
+                || guard.scan_visible_streaming_locked()?.revision()
+                    != active.document.candidate_revision
             {
                 return quarantine_publication(
                     store,
@@ -1338,7 +1339,7 @@ fn recover_sync_operation(
                         GitQuarantineReason::HostilePublicationState,
                     );
                 }
-                let visible = guard.scan_visible_locked()?;
+                let visible = guard.scan_visible_streaming_locked()?;
                 if visible.revision() != active.document.candidate_revision {
                     return quarantine_publication(
                         store,
@@ -1451,7 +1452,7 @@ fn recover_sync_operation(
                 }
             }
             GitSyncPendingPhase::RemoteCasStale => {
-                let current = guard.scan_visible_locked()?;
+                let current = guard.scan_visible_streaming_locked()?;
                 let original = AdmissionCheckpoint {
                     logical_store_id: active.document.logical_store_id.clone(),
                     local_trust_binding: active.document.local_trust_binding,
@@ -1482,7 +1483,7 @@ fn recover_sync_operation(
                 }
             }
             GitSyncPendingPhase::RemoteCasConfirmed => {
-                let visible = guard.scan_visible_locked()?;
+                let visible = guard.scan_visible_streaming_locked()?;
                 let local = git::inspect_local(store, &runner, request)?;
                 let durable = checkpoint::read(store)?.ok_or(GitSyncError::BootstrapRequired)?;
                 let remote = git::observe_remote_ref(

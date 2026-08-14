@@ -204,11 +204,8 @@ fn validate_tree(
     repository: &SyncRepository,
     oid: &GitOid,
 ) -> Result<(), HistoryError> {
-    let raw = repository
-        .tree_files(store, runner, oid)
-        .map_err(HistoryError::from)?;
-    crate::store::scan_collected_streaming(store, &raw, Vec::new())
-        .map_err(GitAdmissionError::from)
+    repository
+        .tree_snapshot(store, runner, oid)
         .map_err(HistoryError::from)?;
     Ok(())
 }

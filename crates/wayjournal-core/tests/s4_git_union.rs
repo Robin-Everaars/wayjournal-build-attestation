@@ -27,6 +27,26 @@ impl LegacyStoreAdapter for CollectingLegacy {
     }
 }
 
+#[derive(Debug)]
+struct NonDrainingStreamingLegacy;
+impl LegacyStoreAdapter for NonDrainingStreamingLegacy {
+    fn validate(&self, _: &[LegacyEntry<'_>]) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn require_streaming(&self, _: LegacyStreamRequirement) -> Result<(), LegacyStreamingError> {
+        Ok(())
+    }
+
+    fn validate_stream(
+        &self,
+        _: LegacyStreamRequirement,
+        _: &mut dyn LegacyEntrySource,
+    ) -> Result<(), LegacyStreamingError> {
+        Ok(())
+    }
+}
+
 type ObservedLegacyStream = (LegacyStreamRequirement, BTreeSet<Vec<u8>>);
 type ObservedLegacyStreams = Arc<Mutex<Vec<ObservedLegacyStream>>>;
 
@@ -255,6 +275,40 @@ fn collecting_adapter_is_rejected_before_transfer_or_mutation() {
     assert_eq!(names(&pending), pending_before);
     assert_eq!(names(&quarantine), quarantine_before);
     assert_eq!(names(&attempts), attempts_before);
+}
+
+#[test]
+fn bounded_adapter_must_consume_every_legacy_entry() {
+    const LEGACY: &str =
+        "events/123e4567-e89b-42d3-a456-426614174000/01913f1d-8e2a-7c30-8f4a-426614174040.json";
+    let fixture = fixture_with_legacy("stream-must-drain", Arc::new(NonDrainingStreamingLegacy));
+    let clone = fixture.root.0.join("stream-must-drain-clone");
+    run(
+        &fixture.root.0,
+        &[
+            "clone",
+            fixture.remote.to_str().expect("remote"),
+            clone.to_str().expect("clone"),
+        ],
+    );
+    configure(&clone);
+    let target = clone.join(LEGACY);
+    fs::create_dir_all(target.parent().expect("legacy parent")).expect("legacy parent");
+    fs::write(&target, b"legacy").expect("legacy entry");
+    run(&clone, &["add", LEGACY]);
+    run(&clone, &["commit", "-m", "legacy"]);
+    run(&clone, &["push", "origin", "HEAD:refs/heads/main"]);
+
+    assert!(matches!(
+        fixture
+            .store
+            .sync_git_union(&fixture.request)
+            .expect("closed quarantine outcome"),
+        GitSyncOutcome::Quarantined {
+            reason: GitQuarantineReason::InvalidCommitSnapshot,
+            ..
+        }
+    ));
 }
 
 #[test]
@@ -556,5 +610,105 @@ fn two_offline_clones_converge_by_set_and_revision() {
     assert_eq!(
         store_a.read().expect("A read").revision(),
         store_b.read().expect("B read").revision()
+    );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+#[ignore = "explicit exact-1-GiB Git-tip bounded-memory gate"]
+fn exact_one_gib_git_tip_sync_stays_below_the_memory_budget() {
+    const EXACT_BYTES: u64 = 1024 * 1024 * 1024;
+    const FILE_BYTES: usize = wayjournal_core::MAX_LEGACY_FILE_BYTES;
+    const ENTITY: &str = "123e4567-e89b-42d3-a456-426614174000";
+
+    fn canonical_bytes(root: &Path) -> u64 {
+        fn walk(path: &Path) -> u64 {
+            fs::read_dir(path)
+                .expect("canonical directory")
+                .map(|entry| entry.expect("canonical entry"))
+                .map(|entry| {
+                    let kind = entry.file_type().expect("canonical file type");
+                    if kind.is_dir() {
+                        walk(&entry.path())
+                    } else {
+                        entry.metadata().expect("canonical metadata").len()
+                    }
+                })
+                .sum()
+        }
+
+        ["batches", "events", "journal"]
+            .into_iter()
+            .map(|name| root.join(name))
+            .filter(|path| path.exists())
+            .map(|path| walk(&path))
+            .sum()
+    }
+
+    fn high_water_bytes() -> u64 {
+        let status = fs::read_to_string("/proc/self/status").expect("procfs status");
+        status
+            .lines()
+            .find(|line| line.starts_with("VmHWM:"))
+            .and_then(|line| line.split_ascii_whitespace().nth(1))
+            .expect("VmHWM value")
+            .parse::<u64>()
+            .expect("VmHWM integer")
+            * 1024
+    }
+
+    let fixture = fixture("exact-gib-tip");
+    let clone = fixture.root.0.join("exact-gib-clone");
+    run(
+        &fixture.root.0,
+        &[
+            "clone",
+            fixture.remote.to_str().expect("remote"),
+            clone.to_str().expect("clone"),
+        ],
+    );
+    configure(&clone);
+    let base_bytes = canonical_bytes(&clone);
+    let mut remaining = EXACT_BYTES
+        .checked_sub(base_bytes)
+        .expect("base below limit");
+    let directory = clone.join(format!("events/{ENTITY}"));
+    fs::create_dir_all(&directory).expect("legacy directory");
+    let mut ordinal = 0_u64;
+    while remaining > 0 {
+        let length = usize::try_from(remaining.min(FILE_BYTES as u64)).expect("file length");
+        let mut bytes = vec![b'x'; length];
+        let marker = ordinal.to_be_bytes();
+        let marker_length = length.min(marker.len());
+        bytes[..marker_length].copy_from_slice(&marker[..marker_length]);
+        let record = format!("00000000-0000-7000-8000-{ordinal:012x}.json");
+        fs::write(directory.join(record), bytes).expect("legacy payload");
+        remaining -= length as u64;
+        ordinal += 1;
+    }
+    assert_eq!(canonical_bytes(&clone), EXACT_BYTES);
+    run(&clone, &["add", "events"]);
+    run(&clone, &["commit", "-m", "exact 1 GiB tip"]);
+    run(&clone, &["push", "origin", "HEAD:refs/heads/main"]);
+    let before_high_water = high_water_bytes();
+
+    assert!(matches!(
+        fixture
+            .store
+            .sync_git_union(&fixture.request)
+            .expect("exact 1 GiB sync"),
+        GitSyncOutcome::Advanced { .. }
+    ));
+
+    assert_eq!(canonical_bytes(&fixture.local), EXACT_BYTES);
+    assert_eq!(
+        oid(&fixture.local, "refs/heads/main"),
+        oid(&fixture.remote, "refs/heads/main")
+    );
+    let high_water_growth = high_water_bytes().saturating_sub(before_high_water);
+    eprintln!("exact-1-GiB Git sync VmHWM growth: {high_water_growth} bytes");
+    assert!(
+        high_water_growth < 256 * 1024 * 1024,
+        "exact-1-GiB Git sync retained {high_water_growth} bytes"
     );
 }

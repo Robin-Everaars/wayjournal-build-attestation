@@ -144,6 +144,55 @@ pub enum RevisionError {
     InvalidCanonicalPath(Vec<u8>),
     #[error("nonregular path below a reserved root: {0:?}")]
     NonRegularCanonicalPath(Vec<u8>),
+    #[error("canonical revision path is not strictly ordered: {0:?}")]
+    NonCanonicalOrder(Vec<u8>),
+}
+
+pub(crate) struct CanonicalRevisionAccumulator {
+    hasher: blake3::Hasher,
+    previous_path: Option<Vec<u8>>,
+}
+
+impl CanonicalRevisionAccumulator {
+    pub(crate) fn new() -> Self {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(STORE_REVISION_DOMAIN);
+        Self {
+            hasher,
+            previous_path: None,
+        }
+    }
+
+    pub(crate) fn push(&mut self, path: &[u8], bytes: &[u8]) -> Result<(), RevisionError> {
+        if !matches!(
+            classify_path(path),
+            PathClass::LegacyEvent
+                | PathClass::LegacyBatch
+                | PathClass::JournalRecord
+                | PathClass::JournalBatch
+        ) {
+            return Err(RevisionError::InvalidCanonicalPath(path.to_vec()));
+        }
+        if let Some(previous) = self.previous_path.as_deref() {
+            if previous == path {
+                return Err(RevisionError::DuplicatePath(path.to_vec()));
+            }
+            if previous > path {
+                return Err(RevisionError::NonCanonicalOrder(path.to_vec()));
+            }
+        }
+        update_frame(&mut self.hasher, path);
+        update_frame(&mut self.hasher, bytes);
+        self.previous_path = Some(path.to_vec());
+        Ok(())
+    }
+
+    pub(crate) fn finish(self) -> StoreRevisionRef {
+        StoreRevisionRef {
+            algorithm: RevisionAlgorithm::WayjournalBlake3FramedV1,
+            digest: Digest::from_hash(self.hasher.finalize()),
+        }
+    }
 }
 
 /// Computes `wayjournal.store/blake3-framed-v1` over all four canonical roots.
@@ -165,7 +214,7 @@ pub fn compute_store_revision(
     {
         return Err(RevisionError::DuplicatePath(path));
     }
-    let mut canonical = Vec::new();
+    let mut accumulator = CanonicalRevisionAccumulator::new();
     for entry in &entries {
         match classify_path(&entry.path) {
             PathClass::InvalidReserved => {
@@ -178,19 +227,55 @@ pub fn compute_store_revision(
                 if !entry.regular {
                     return Err(RevisionError::NonRegularCanonicalPath(entry.path.clone()));
                 }
-                canonical.push(entry);
+                accumulator.push(&entry.path, &entry.bytes)?;
             }
             PathClass::NonCanonical => {}
         }
     }
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(STORE_REVISION_DOMAIN);
-    for entry in canonical {
-        update_frame(&mut hasher, &entry.path);
-        update_frame(&mut hasher, &entry.bytes);
+    Ok(accumulator.finish())
+}
+
+#[cfg(test)]
+mod streaming_tests {
+    use super::{CanonicalRevisionAccumulator, RevisionEntry, compute_store_revision};
+
+    #[test]
+    fn canonical_revision_accumulator_matches_sorted_revision_without_retaining_bytes() {
+        let entries = [
+            (
+                b"batches/01913f1d-8e2a-7c30-8f4a-426614174012.json".as_slice(),
+                b"batch".as_slice(),
+            ),
+            (
+                b"events/123e4567-e89b-42d3-a456-426614174000/01913f1d-8e2a-7c30-8f4a-426614174001.json"
+                    .as_slice(),
+                b"event".as_slice(),
+            ),
+        ];
+        let expected = compute_store_revision(
+            entries
+                .iter()
+                .map(|(path, bytes)| RevisionEntry::regular(*path, *bytes)),
+        )
+        .expect("revision");
+        let mut accumulator = CanonicalRevisionAccumulator::new();
+        for (path, bytes) in entries {
+            accumulator.push(path, bytes).expect("ordered entry");
+        }
+
+        assert_eq!(accumulator.finish(), expected);
     }
-    Ok(StoreRevisionRef {
-        algorithm: RevisionAlgorithm::WayjournalBlake3FramedV1,
-        digest: Digest::from_hash(hasher.finalize()),
-    })
+
+    #[test]
+    fn canonical_revision_accumulator_rejects_duplicate_and_out_of_order_paths() {
+        let later =
+            b"events/123e4567-e89b-42d3-a456-426614174000/01913f1d-8e2a-7c30-8f4a-426614174002.json";
+        let earlier = b"batches/01913f1d-8e2a-7c30-8f4a-426614174012.json";
+        let mut duplicate = CanonicalRevisionAccumulator::new();
+        duplicate.push(later, b"one").expect("first");
+        assert!(duplicate.push(later, b"two").is_err());
+        let mut unordered = CanonicalRevisionAccumulator::new();
+        unordered.push(later, b"one").expect("first");
+        assert!(unordered.push(earlier, b"two").is_err());
+    }
 }
