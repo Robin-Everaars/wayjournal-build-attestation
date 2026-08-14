@@ -1,5 +1,6 @@
 use std::{
     ffi::{OsStr, OsString},
+    fs::File,
     io::{self, BufRead, Read, Write},
     os::unix::{
         ffi::{OsStrExt, OsStringExt},
@@ -30,6 +31,7 @@ use super::{GitObjectFormat, GitOid, GitSyncRequest};
 
 const MAX_SMALL_OUTPUT: usize = 64 * 1024;
 const MAX_TREE_OUTPUT: usize = 512 * 1024 * 1024;
+const MAX_TREE_DIFF_OUTPUT: usize = 1024 * 1024 * 1024;
 const MAX_TREE_RECORD_BYTES: usize = 512;
 pub(super) const MAX_PENDING_REPO_OBJECTS: usize = 7_010_000;
 pub(super) const MAX_PENDING_REPO_FS_ENTRIES: usize = 7_100_000;
@@ -157,6 +159,24 @@ impl<'a> GitRunner<'a> {
         Err(status_error(operation, captured.status))
     }
 
+    pub(super) fn output_to_file(
+        &self,
+        operation: &'static str,
+        cwd: &Directory,
+        args: &[OsString],
+        output: File,
+        stdout_limit: usize,
+    ) -> Result<usize, GitCommandError> {
+        run_bounded_command_to_file(
+            self.command(cwd, args),
+            operation,
+            output,
+            stdout_limit,
+            MAX_SMALL_OUTPUT,
+            self.timeout,
+        )
+    }
+
     fn status(
         &self,
         operation: &'static str,
@@ -229,6 +249,135 @@ fn run_bounded_command(
         stderr_limit,
         timeout,
     )
+}
+
+#[allow(clippy::too_many_lines)]
+#[allow(unsafe_code)]
+fn run_bounded_command_to_file(
+    mut command: Command,
+    operation: &'static str,
+    output: File,
+    stdout_limit: usize,
+    stderr_limit: usize,
+    timeout: Duration,
+) -> Result<usize, GitCommandError> {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0);
+    // SAFETY: the hook runs after fork and invokes only the async-signal-safe `umask(2)` syscall.
+    unsafe {
+        command.pre_exec(|| {
+            rustix::process::umask(rustix::fs::Mode::empty());
+            Ok(())
+        });
+    }
+    let mut child = command.spawn().map_err(|error| GitCommandError {
+        operation,
+        message: error.to_string(),
+    })?;
+    let pid = i32::try_from(child.id()).ok().and_then(Pid::from_raw);
+    let Some(stdout) = child.stdout.take() else {
+        terminate_process_group(pid, &mut child, true);
+        return Err(GitCommandError {
+            operation,
+            message: "stdout pipe was not created".to_owned(),
+        });
+    };
+    let Some(stderr) = child.stderr.take() else {
+        terminate_process_group(pid, &mut child, true);
+        return Err(GitCommandError {
+            operation,
+            message: "stderr pipe was not created".to_owned(),
+        });
+    };
+    let overflow = Arc::new(AtomicBool::new(false));
+    let (stdout_writer, stdout_rx) =
+        spawn_bounded_file_writer(stdout, output, stdout_limit, Arc::clone(&overflow));
+    let (stderr_reader, stderr_rx) =
+        spawn_bounded_reader(stderr, stderr_limit, Arc::clone(&overflow));
+    let started = Instant::now();
+    let mut status = None;
+    let mut written = None;
+    let mut stderr = None;
+    loop {
+        if written.is_none() {
+            match poll_writer(&stdout_rx, operation) {
+                Ok(value) => written = value,
+                Err(error) => {
+                    terminate_process_group(pid, &mut child, status.is_none());
+                    let _ = stdout_writer.join();
+                    let _ = stderr_reader.join();
+                    return Err(error);
+                }
+            }
+        }
+        if stderr.is_none() {
+            match poll_reader(&stderr_rx, operation) {
+                Ok(value) => stderr = value,
+                Err(error) => {
+                    terminate_process_group(pid, &mut child, status.is_none());
+                    let _ = stdout_writer.join();
+                    let _ = stderr_reader.join();
+                    return Err(error);
+                }
+            }
+        }
+        if status.is_none() {
+            match child.try_wait() {
+                Ok(value) => status = value,
+                Err(error) => {
+                    terminate_process_group(pid, &mut child, true);
+                    let _ = stdout_writer.join();
+                    let _ = stderr_reader.join();
+                    return Err(GitCommandError {
+                        operation,
+                        message: error.to_string(),
+                    });
+                }
+            }
+        }
+        let failure = if overflow.load(Ordering::Acquire) {
+            Some("bounded output exceeded")
+        } else if started.elapsed() >= timeout {
+            Some("operation timed out")
+        } else {
+            None
+        };
+        if let Some(message) = failure {
+            terminate_process_group(pid, &mut child, status.is_none());
+            let _ = stdout_writer.join();
+            let _ = stderr_reader.join();
+            return Err(GitCommandError {
+                operation,
+                message: message.to_owned(),
+            });
+        }
+        if status.is_some() && written.is_some() && stderr.is_some() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    stdout_writer.join().map_err(|_| GitCommandError {
+        operation,
+        message: "stdout writer panicked".to_owned(),
+    })?;
+    stderr_reader.join().map_err(|_| GitCommandError {
+        operation,
+        message: "stderr reader panicked".to_owned(),
+    })?;
+    let status = status.expect("loop exits only after child status");
+    if !status.success() {
+        return Err(GitCommandError {
+            operation,
+            message: format!(
+                "process exited with {status}: {}",
+                String::from_utf8_lossy(&stderr.expect("loop exits only after stderr")).trim()
+            ),
+        });
+    }
+    Ok(written.expect("loop exits only after stdout"))
 }
 
 #[allow(clippy::too_many_lines)]
@@ -404,6 +553,58 @@ fn spawn_bounded_reader(
         let _ = tx.send(result);
     });
     (handle, rx)
+}
+
+fn spawn_bounded_file_writer(
+    mut pipe: impl Read + Send + 'static,
+    mut output: File,
+    limit: usize,
+    overflow: Arc<AtomicBool>,
+) -> (thread::JoinHandle<()>, Receiver<io::Result<usize>>) {
+    let (tx, rx) = mpsc::sync_channel(1);
+    let handle = thread::spawn(move || {
+        let result = (|| {
+            let mut written = 0_usize;
+            let mut buffer = [0_u8; 8192];
+            loop {
+                let read = pipe.read(&mut buffer)?;
+                if read == 0 {
+                    output.flush()?;
+                    return Ok(written);
+                }
+                let Some(next) = written.checked_add(read) else {
+                    overflow.store(true, Ordering::Release);
+                    return Ok(written);
+                };
+                if next > limit {
+                    overflow.store(true, Ordering::Release);
+                    return Ok(written);
+                }
+                output.write_all(&buffer[..read])?;
+                written = next;
+            }
+        })();
+        let _ = tx.send(result);
+    });
+    (handle, rx)
+}
+
+fn poll_writer(
+    receiver: &Receiver<io::Result<usize>>,
+    operation: &'static str,
+) -> Result<Option<usize>, GitCommandError> {
+    match receiver.try_recv() {
+        Ok(Ok(bytes)) => Ok(Some(bytes)),
+        Ok(Err(error)) => Err(GitCommandError {
+            operation,
+            message: error.to_string(),
+        }),
+        Err(TryRecvError::Empty) => Ok(None),
+        Err(TryRecvError::Disconnected) => Err(GitCommandError {
+            operation,
+            message: "output writer disconnected".to_owned(),
+        }),
+    }
 }
 
 fn poll_reader(
@@ -659,12 +860,46 @@ impl SyncRepository {
         tree_snapshot_streaming(store, runner, &self.bare, self.format, oid)
     }
 
-    pub(super) fn tree_paths(
+    pub(super) fn spool_tree_additions(
         &self,
         runner: &GitRunner<'_>,
-        oid: &GitOid,
-    ) -> Result<std::collections::BTreeSet<Vec<u8>>, super::GitAdmissionError> {
-        tree_paths(runner, &self.bare, self.format, oid)
+        local: &GitOid,
+        candidate: &GitOid,
+        output: File,
+    ) -> Result<usize, GitCommandError> {
+        if local.format() != self.format || candidate.format() != self.format {
+            return Err(GitCommandError {
+                operation: "enumerate candidate additions",
+                message: "tree diff object format does not match repository".to_owned(),
+            });
+        }
+        runner.output_to_file(
+            "enumerate candidate additions",
+            &self.bare,
+            &repository_args(vec![
+                OsString::from("diff-tree"),
+                OsString::from("-r"),
+                OsString::from("--no-commit-id"),
+                OsString::from("--raw"),
+                OsString::from("-z"),
+                OsString::from("--no-renames"),
+                OsString::from("--no-abbrev"),
+                OsString::from(local.as_hex()),
+                OsString::from(candidate.as_hex()),
+                OsString::from("--"),
+            ]),
+            output,
+            MAX_TREE_DIFF_OUTPUT,
+        )
+    }
+
+    pub(super) fn tree_addition_source(
+        &self,
+        runner: &GitRunner<'_>,
+        diff: File,
+    ) -> Result<TreeAdditionSource, GitCommandError> {
+        let command = runner.command(&self.bare, &repository_args(args(&["cat-file", "--batch"])));
+        TreeAdditionSource::new(diff, self.format, command, runner.timeout)
     }
 
     pub(super) fn path_exists(
@@ -1709,53 +1944,6 @@ fn tree_snapshot_streaming(
     scan_collected_streaming(store, &files, Vec::new()).map_err(Into::into)
 }
 
-fn tree_paths(
-    runner: &GitRunner<'_>,
-    git_dir: &Directory,
-    format: GitObjectFormat,
-    oid: &GitOid,
-) -> Result<std::collections::BTreeSet<Vec<u8>>, super::GitAdmissionError> {
-    if oid.format() != format {
-        return Err(super::GitAdmissionError::CheckpointObjectFormatMismatch);
-    }
-    let listing = runner.output(
-        "list canonical tree paths",
-        git_dir,
-        &repository_args(vec![
-            OsString::from("ls-tree"),
-            OsString::from("-r"),
-            OsString::from("-z"),
-            OsString::from("--name-only"),
-            OsString::from("--full-tree"),
-            OsString::from(oid.as_hex()),
-        ]),
-        MAX_TREE_OUTPUT,
-    )?;
-    let mut paths = std::collections::BTreeSet::new();
-    for path in listing
-        .split(|byte| *byte == 0)
-        .filter(|path| !path.is_empty())
-    {
-        if paths.len() >= MAX_CANONICAL_ENTRIES {
-            return Err(super::GitAdmissionError::Git(GitCommandError {
-                operation: "parse tree paths",
-                message: "canonical entry-count limit exceeded".to_owned(),
-            }));
-        }
-        if !matches!(
-            classify_path(path),
-            PathClass::LegacyEvent
-                | PathClass::LegacyBatch
-                | PathClass::JournalRecord
-                | PathClass::JournalBatch
-        ) || !paths.insert(path.to_vec())
-        {
-            return Err(super::GitAdmissionError::NonCanonicalTrackedPath);
-        }
-    }
-    Ok(paths)
-}
-
 struct TreeListingEntry {
     path: Vec<u8>,
     blob: GitOid,
@@ -1836,6 +2024,162 @@ impl<R: BufRead> TreeListingCursor<R> {
             blob,
             class,
         }))
+    }
+}
+
+struct TreeDiffCursor<R> {
+    reader: R,
+    format: GitObjectFormat,
+    entries: usize,
+    previous_path: Option<Vec<u8>>,
+}
+
+impl<R: BufRead> TreeDiffCursor<R> {
+    fn new(reader: R, format: GitObjectFormat) -> Self {
+        Self {
+            reader,
+            format,
+            entries: 0,
+            previous_path: None,
+        }
+    }
+
+    fn next_addition(&mut self) -> Result<Option<TreeListingEntry>, super::GitAdmissionError> {
+        let Some(metadata) = read_nul_record(&mut self.reader, MAX_TREE_RECORD_BYTES)? else {
+            return Ok(None);
+        };
+        let path = read_nul_record(&mut self.reader, MAX_TREE_RECORD_BYTES)?.ok_or_else(|| {
+            GitCommandError {
+                operation: "parse tree diff",
+                message: "tree diff ended before an addition path".to_owned(),
+            }
+        })?;
+        if self.entries >= MAX_CANONICAL_ENTRIES {
+            return Err(GitCommandError {
+                operation: "parse tree diff",
+                message: "canonical entry-count limit exceeded".to_owned(),
+            }
+            .into());
+        }
+        let mut parts = metadata.split(|byte| *byte == b' ');
+        let old_mode = parts.next().unwrap_or_default();
+        let new_mode = parts.next().unwrap_or_default();
+        let old_blob = parts.next().unwrap_or_default();
+        let new_blob = parts.next().unwrap_or_default();
+        let status = parts.next().unwrap_or_default();
+        if old_mode != b":000000"
+            || new_mode != b"100644"
+            || old_blob.len() != self.format.hex_len()
+            || !old_blob.iter().all(|byte| *byte == b'0')
+            || status != b"A"
+            || parts.next().is_some()
+        {
+            return Err(super::GitAdmissionError::InvalidTreeEntry);
+        }
+        let class = classify_path(&path);
+        if !matches!(
+            class,
+            PathClass::LegacyEvent
+                | PathClass::LegacyBatch
+                | PathClass::JournalRecord
+                | PathClass::JournalBatch
+        ) {
+            return Err(super::GitAdmissionError::NonCanonicalTrackedPath);
+        }
+        if self
+            .previous_path
+            .as_deref()
+            .is_some_and(|previous| previous >= path.as_slice())
+        {
+            return Err(super::GitAdmissionError::InvalidTreeEntry);
+        }
+        let new_blob = std::str::from_utf8(new_blob).map_err(|_| GitCommandError {
+            operation: "parse tree diff",
+            message: "blob id is not UTF-8".to_owned(),
+        })?;
+        let blob = GitOid::parse(self.format, new_blob).map_err(|error| GitCommandError {
+            operation: "parse tree diff",
+            message: error.to_string(),
+        })?;
+        self.entries += 1;
+        self.previous_path = Some(path.clone());
+        Ok(Some(TreeListingEntry { path, blob, class }))
+    }
+}
+
+pub(super) struct TreeAdditionSource {
+    cursor: TreeDiffCursor<std::io::BufReader<File>>,
+    blobs: CatFileBatch,
+}
+
+impl TreeAdditionSource {
+    fn new(
+        diff: File,
+        format: GitObjectFormat,
+        blob_command: Command,
+        timeout: Duration,
+    ) -> Result<Self, GitCommandError> {
+        Ok(Self {
+            cursor: TreeDiffCursor::new(std::io::BufReader::new(diff), format),
+            blobs: CatFileBatch::spawn(blob_command, timeout)?,
+        })
+    }
+
+    pub(super) fn next_file(&mut self) -> Result<Option<RawFile>, super::GitAdmissionError> {
+        let Some(entry) = self.cursor.next_addition()? else {
+            return Ok(None);
+        };
+        let byte_limit = canonical_blob_limit(entry.class)
+            .ok_or(super::GitAdmissionError::NonCanonicalTrackedPath)?;
+        let bytes = self.blobs.read_blob(&entry.blob, byte_limit)?;
+        Ok(Some(RawFile {
+            path: entry.path,
+            bytes,
+        }))
+    }
+
+    pub(super) fn totals(mut self) -> Result<(usize, u64), super::GitAdmissionError> {
+        let mut count = 0_usize;
+        let mut total_bytes = 0_u64;
+        while let Some(file) = self.next_file()? {
+            count = count.checked_add(1).ok_or_else(|| GitCommandError {
+                operation: "count candidate additions",
+                message: "addition count overflow".to_owned(),
+            })?;
+            total_bytes = total_bytes
+                .checked_add(
+                    u64::try_from(file.bytes.len()).map_err(|_| GitCommandError {
+                        operation: "count candidate additions",
+                        message: "addition byte count exceeds u64".to_owned(),
+                    })?,
+                )
+                .ok_or_else(|| GitCommandError {
+                    operation: "count candidate additions",
+                    message: "addition byte count overflow".to_owned(),
+                })?;
+            if total_bytes > MAX_TOTAL_CANONICAL_BYTES {
+                return Err(GitCommandError {
+                    operation: "count candidate additions",
+                    message: "addition bytes exceed the canonical store limit".to_owned(),
+                }
+                .into());
+            }
+        }
+        self.finish()?;
+        Ok((count, total_bytes))
+    }
+
+    pub(super) fn finish(self) -> Result<(), GitCommandError> {
+        self.blobs.finish()
+    }
+}
+
+fn canonical_blob_limit(class: PathClass) -> Option<usize> {
+    match class {
+        PathClass::LegacyEvent | PathClass::LegacyBatch => Some(crate::MAX_LEGACY_FILE_BYTES),
+        PathClass::JournalRecord => Some(MAX_RECORD_BYTES),
+        PathClass::JournalBatch => Some(MAX_BATCH_BYTES),
+        _ => None,
     }
 }
 
@@ -2518,12 +2862,8 @@ fn tree_files(
     let mut files = Vec::new();
     let mut total_bytes = 0_u64;
     stream_tree_listing(command, format, runner.timeout, |entry| {
-        let file_limit = match entry.class {
-            PathClass::JournalRecord => MAX_RECORD_BYTES,
-            PathClass::JournalBatch => MAX_BATCH_BYTES,
-            PathClass::LegacyEvent | PathClass::LegacyBatch => crate::MAX_LEGACY_FILE_BYTES,
-            PathClass::NonCanonical | PathClass::InvalidReserved => unreachable!(),
-        };
+        let file_limit = canonical_blob_limit(entry.class)
+            .ok_or(super::GitAdmissionError::NonCanonicalTrackedPath)?;
         let bytes = blobs.read_blob(&entry.blob, file_limit)?;
         total_bytes = total_bytes
             .checked_add(u64::try_from(bytes.len()).map_err(|_| GitCommandError {
@@ -2553,9 +2893,10 @@ fn tree_files(
 #[cfg(test)]
 mod tests {
     use super::{
-        CatFileBatch, TreeListingCursor, audit_repository_metadata,
+        CatFileBatch, TreeDiffCursor, TreeListingCursor, audit_repository_metadata,
         clear_cat_file_response_send_hook, install_cat_file_response_send_hook,
-        read_cat_file_response, run_bounded_command, stream_tree_listing,
+        read_cat_file_response, run_bounded_command, run_bounded_command_to_file,
+        stream_tree_listing,
     };
     use std::{
         io::{BufReader, Cursor, Read},
@@ -2606,6 +2947,81 @@ mod tests {
         assert_eq!(second.blob.as_hex(), oid_b);
         assert_eq!(second.class, crate::PathClass::LegacyEvent);
         assert!(cursor.next_entry().expect("end").is_none());
+    }
+
+    #[test]
+    fn tree_diff_cursor_streams_additions_across_read_boundaries() {
+        let oid_a = "1111111111111111111111111111111111111111";
+        let oid_b = "2222222222222222222222222222222222222222";
+        let path_a = "batches/01913f1d-8e2a-7c30-8f4a-426614174012.json";
+        let path_b =
+            "events/123e4567-e89b-42d3-a456-426614174000/01913f1d-8e2a-7c30-8f4a-426614174001.json";
+        let zeros = "0000000000000000000000000000000000000000";
+        let diff = format!(
+            ":000000 100644 {zeros} {oid_a} A\0{path_a}\0\
+             :000000 100644 {zeros} {oid_b} A\0{path_b}\0"
+        )
+        .into_bytes();
+        let reader = BufReader::with_capacity(
+            2,
+            ChunkedReader {
+                inner: Cursor::new(diff),
+                max_chunk: 3,
+            },
+        );
+        let mut cursor = TreeDiffCursor::new(reader, crate::GitObjectFormat::Sha1);
+
+        let first = cursor
+            .next_addition()
+            .expect("first record")
+            .expect("first");
+        assert_eq!(first.path, path_a.as_bytes());
+        assert_eq!(first.blob.as_hex(), oid_a);
+        assert_eq!(first.class, crate::PathClass::LegacyBatch);
+        let second = cursor
+            .next_addition()
+            .expect("second record")
+            .expect("second");
+        assert_eq!(second.path, path_b.as_bytes());
+        assert_eq!(second.blob.as_hex(), oid_b);
+        assert_eq!(second.class, crate::PathClass::LegacyEvent);
+        assert!(cursor.next_addition().expect("end").is_none());
+    }
+
+    #[test]
+    fn tree_diff_cursor_rejects_non_additions_and_malformed_streams() {
+        let oid = "1111111111111111111111111111111111111111";
+        let zeros = "0000000000000000000000000000000000000000";
+        let path = "batches/01913f1d-8e2a-7c30-8f4a-426614174012.json";
+        let hostiles = [
+            format!(":100644 100644 {oid} {oid} M\0{path}\0"),
+            format!(":000000 100755 {zeros} {oid} A\0{path}\0"),
+            format!(":000000 100644 {oid} {oid} A\0{path}\0"),
+            format!(":000000 100644 {zeros} {oid} D\0{path}\0"),
+            format!(":000000 100644 {zeros} short A\0{path}\0"),
+            format!(":000000 100644 {zeros} {oid} A\0{path}"),
+        ];
+        for hostile in hostiles {
+            let mut cursor = TreeDiffCursor::new(
+                BufReader::new(Cursor::new(hostile.into_bytes())),
+                crate::GitObjectFormat::Sha1,
+            );
+            assert!(cursor.next_addition().is_err());
+        }
+
+        let later =
+            "events/123e4567-e89b-42d3-a456-426614174000/01913f1d-8e2a-7c30-8f4a-426614174002.json";
+        let earlier = "batches/01913f1d-8e2a-7c30-8f4a-426614174012.json";
+        let unordered = format!(
+            ":000000 100644 {zeros} {oid} A\0{later}\0\
+             :000000 100644 {zeros} {oid} A\0{earlier}\0"
+        );
+        let mut cursor = TreeDiffCursor::new(
+            BufReader::new(Cursor::new(unordered.into_bytes())),
+            crate::GitObjectFormat::Sha1,
+        );
+        assert!(cursor.next_addition().expect("first").is_some());
+        assert!(cursor.next_addition().is_err());
     }
 
     #[test]
@@ -2759,6 +3175,65 @@ sleep 3 >/dev/null &"#;
         let directory = crate::store::Directory::open_ambient(&root).expect("directory");
         let error = audit_repository_metadata(&directory).expect_err("reject alternates");
         assert_eq!(error.operation(), "audit repository metadata");
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn bounded_process_runner_spools_stdout_to_a_file() {
+        let root = std::env::temp_dir().join(format!(
+            "wayjournal-bounded-output-{}",
+            uuid::Uuid::now_v7()
+        ));
+        std::fs::create_dir(&root).expect("root");
+        let path = root.join("output");
+        let output = std::fs::File::create(&path).expect("output file");
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "printf streamed-output"]);
+
+        let bytes = run_bounded_command_to_file(
+            command,
+            "test file output",
+            output,
+            64,
+            64,
+            Duration::from_secs(2),
+        )
+        .expect("bounded file output");
+
+        assert_eq!(bytes, 15);
+        assert_eq!(
+            std::fs::read(&path).expect("read output"),
+            b"streamed-output"
+        );
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn bounded_process_file_writer_stops_at_its_limit() {
+        let root = std::env::temp_dir().join(format!(
+            "wayjournal-bounded-output-limit-{}",
+            uuid::Uuid::now_v7()
+        ));
+        std::fs::create_dir(&root).expect("root");
+        let path = root.join("output");
+        let output = std::fs::File::create(&path).expect("output file");
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "while :; do printf xxxxxxxxxxxxxxxx; done"]);
+        let started = Instant::now();
+
+        let error = run_bounded_command_to_file(
+            command,
+            "test bounded file output",
+            output,
+            1024,
+            64,
+            Duration::from_secs(2),
+        )
+        .expect_err("unbounded output must fail");
+
+        assert!(error.to_string().contains("bounded output exceeded"));
+        assert!(std::fs::metadata(&path).expect("metadata").len() <= 1024);
+        assert!(started.elapsed() < Duration::from_secs(2));
         std::fs::remove_dir_all(root).expect("cleanup");
     }
 

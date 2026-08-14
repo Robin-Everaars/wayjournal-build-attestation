@@ -501,6 +501,21 @@ impl Directory {
         })?;
         Ok(file)
     }
+    pub fn temporary_file(&self) -> Result<File, StoreError> {
+        let display = self.path.join("<temporary>");
+        let fd = rfs::openat(
+            &self.file,
+            OsStr::new("."),
+            OFlags::RDWR | OFlags::TMPFILE | OFlags::CLOEXEC,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .map_err(|error| io_error("create unnamed temporary file", &display, error.into()))?;
+        let file = File::from(fd);
+        rfs::fchmod(&file, Mode::RUSR | Mode::WUSR)
+            .map_err(|error| io_error("set unnamed temporary file mode", &display, error.into()))?;
+        Ok(file)
+    }
+
     pub fn require_regular(&self, file: &File, name: &OsStr) -> Result<u64, StoreError> {
         let stat = rfs::fstat(file).map_err(|error| {
             io_error(

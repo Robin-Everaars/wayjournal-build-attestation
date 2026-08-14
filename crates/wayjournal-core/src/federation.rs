@@ -2,6 +2,7 @@ use std::{
     ffi::{OsStr, OsString},
     fmt,
     fs::File,
+    io::{Seek, SeekFrom},
     os::{
         fd::AsRawFd,
         unix::{ffi::OsStrExt, fs::MetadataExt},
@@ -945,7 +946,6 @@ fn start_sync_operation(
             reason: incident.reason,
         }));
     }
-    let current_paths = repository.tree_paths(&runner, &local_tip)?;
     let candidate = match git::select_candidate(&runner, &repository, &local_tip, &remote_tip) {
         Ok(candidate) => candidate,
         Err(error) if error.operation() == "create union tree" => {
@@ -987,8 +987,73 @@ fn start_sync_operation(
         candidate_parents,
         predecessor,
     );
-    let candidate_files = repository.tree_files(store, &runner, &document.candidate_commit)?;
-    pending::stage_raw_additions(&operation, &mut document, &current_paths, candidate_files)?;
+    drop(candidate_snapshot);
+    drop(local_snapshot);
+    let mut diff_file = operation.temporary_file()?;
+    let diff_output = diff_file
+        .try_clone()
+        .map_err(|source| GitAdmissionError::Io {
+            operation: "retain candidate addition diff",
+            source,
+        })?;
+    repository.spool_tree_additions(
+        &runner,
+        &local_tip,
+        &document.candidate_commit,
+        diff_output,
+    )?;
+    diff_file
+        .seek(SeekFrom::Start(0))
+        .map_err(|source| GitAdmissionError::Io {
+            operation: "rewind candidate addition diff",
+            source,
+        })?;
+    let count_source = diff_file
+        .try_clone()
+        .map_err(|source| GitAdmissionError::Io {
+            operation: "retain candidate addition diff",
+            source,
+        })?;
+    let (addition_count, addition_bytes) = repository
+        .tree_addition_source(&runner, count_source)?
+        .totals()?;
+    diff_file
+        .seek(SeekFrom::Start(0))
+        .map_err(|source| GitAdmissionError::Io {
+            operation: "rewind candidate addition diff",
+            source,
+        })?;
+    let staging_source = diff_file
+        .try_clone()
+        .map_err(|source| GitAdmissionError::Io {
+            operation: "retain candidate addition diff",
+            source,
+        })?;
+    let mut additions = repository.tree_addition_source(&runner, staging_source)?;
+    let mut source_error = None;
+    let stage_result = {
+        let stream = std::iter::from_fn(|| match additions.next_file() {
+            Ok(Some(file)) => Some((file.path, file.bytes)),
+            Ok(None) => None,
+            Err(error) => {
+                source_error = Some(error);
+                None
+            }
+        });
+        pending::stage_known_additions(
+            &operation,
+            &mut document,
+            addition_count,
+            addition_bytes,
+            stream,
+        )
+    };
+    let finish_result = additions.finish();
+    if let Some(error) = source_error {
+        return Err(error.into());
+    }
+    finish_result?;
+    stage_result?;
     git::sync_repository_durable(&runner, &repository)?;
     operation.sync()?;
     fault::hit("repository-and-additions-durable");

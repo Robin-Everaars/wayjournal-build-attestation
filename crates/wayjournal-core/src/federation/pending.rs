@@ -508,40 +508,6 @@ pub(super) fn create_operation(
     Ok(operation)
 }
 
-pub(super) fn stage_raw_additions(
-    operation: &Directory,
-    document: &mut PendingDocument,
-    current: &std::collections::BTreeSet<Vec<u8>>,
-    candidate: Vec<crate::store::RawFile>,
-) -> Result<(), PendingError> {
-    let mut addition_count = 0_usize;
-    let mut total_bytes = 0_u64;
-    for file in candidate
-        .iter()
-        .filter(|file| !current.contains(&file.path))
-    {
-        addition_count = addition_count
-            .checked_add(1)
-            .ok_or_else(|| PendingError::Invalid("addition count overflow".to_owned()))?;
-        total_bytes =
-            total_bytes
-                .checked_add(u64::try_from(file.bytes.len()).map_err(|_| {
-                    PendingError::Invalid("addition byte count exceeds u64".to_owned())
-                })?)
-                .ok_or_else(|| PendingError::Invalid("addition byte count overflow".to_owned()))?;
-    }
-    stage_known_additions(
-        operation,
-        document,
-        addition_count,
-        total_bytes,
-        candidate
-            .into_iter()
-            .filter(|file| !current.contains(&file.path))
-            .map(|file| (file.path, file.bytes)),
-    )
-}
-
 #[cfg(test)]
 pub(super) fn stage_additions(
     operation: &Directory,
@@ -579,7 +545,7 @@ pub(super) fn stage_additions(
 
 /// Stages a preflight-counted sorted addition stream while retaining only one canonical payload
 /// and one metadata chunk. Callers must derive the totals without retaining the payload set.
-fn stage_known_additions(
+pub(super) fn stage_known_additions(
     operation: &Directory,
     document: &mut PendingDocument,
     addition_count: usize,
