@@ -1,3 +1,6 @@
+#[allow(dead_code)]
+mod support;
+
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -8,17 +11,11 @@ use std::{
 use serde_json::json;
 use wayjournal_core::{
     ActorId, ApprovedRef, ApprovedRemote, ApprovedRemoteLocator, GitAdmissionError, GitSyncOutcome,
-    GitSyncRequest, LegacyEntry, LegacyStoreAdapter, LocalTrustBinding, Record, Store, StoreError,
-    StoreRevisionRef, prepare_batch, wayjournal_domain_registry,
+    GitSyncRequest, LocalTrustBinding, Record, Store, StoreError, StoreRevisionRef, prepare_batch,
+    wayjournal_domain_registry,
 };
 
-#[derive(Debug)]
-struct NoLegacy;
-impl LegacyStoreAdapter for NoLegacy {
-    fn validate(&self, _: &[LegacyEntry<'_>]) -> Result<(), String> {
-        Ok(())
-    }
-}
+use support::BoundedNoLegacy as NoLegacy;
 struct TestDir(PathBuf);
 impl TestDir {
     fn new(label: &str) -> Self {

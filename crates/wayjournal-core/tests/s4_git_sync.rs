@@ -1,6 +1,7 @@
 use std::{
     ffi::OsString,
     fs,
+    mem::MaybeUninit,
     os::unix::{ffi::OsStringExt, fs::PermissionsExt},
     path::{Path, PathBuf},
     process::Command,
@@ -159,36 +160,47 @@ fn rewrite_checkpoint(fixture: &AdmissionFixture, mutate: impl FnOnce(&mut serde
     fs::write(path, bytes).expect("rewrite checkpoint");
 }
 
-fn install_transfer_probe(fixture: &AdmissionFixture) -> PathBuf {
+struct TransferProbe {
+    descriptor: rustix::fd::OwnedFd,
+    watch: i32,
+}
+
+fn install_transfer_probe(fixture: &AdmissionFixture) -> TransferProbe {
     install_remote_transfer_probe(&fixture.remote)
 }
 
-fn install_remote_transfer_probe(remote: &Path) -> PathBuf {
-    let probe = remote.join("objects/info/alternates");
-    fs::write(&probe, b"wayjournal-contact-probe\n").expect("install transfer probe");
-    let epoch = rustix::fs::Timespec {
-        tv_sec: 1,
-        tv_nsec: 0,
-    };
-    rustix::fs::utimensat(
-        rustix::fs::CWD,
-        &probe,
-        &rustix::fs::Timestamps {
-            last_access: epoch,
-            last_modification: epoch,
-        },
-        rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
-    )
-    .expect("set probe timestamp");
+fn install_remote_transfer_probe(remote: &Path) -> TransferProbe {
+    use rustix::fs::inotify;
+
+    let path = remote.join("objects/info/alternates");
+    fs::write(&path, b"wayjournal-contact-probe\n").expect("install transfer probe");
+    let descriptor = inotify::init(inotify::CreateFlags::CLOEXEC | inotify::CreateFlags::NONBLOCK)
+        .expect("create transfer probe");
+    let watch = inotify::add_watch(&descriptor, &path, inotify::WatchFlags::OPEN)
+        .expect("watch transfer probe");
+    let probe = TransferProbe { descriptor, watch };
     assert!(!transfer_probe_contacted(&probe));
     probe
 }
 
-fn transfer_probe_contacted(probe: &Path) -> bool {
-    rustix::fs::stat(probe)
-        .expect("inspect transfer probe")
-        .st_atime
-        != 1
+fn transfer_probe_contacted(probe: &TransferProbe) -> bool {
+    use rustix::fs::inotify;
+
+    let mut buffer = [MaybeUninit::uninit(); 256];
+    let mut reader = inotify::Reader::new(&probe.descriptor, &mut buffer);
+    loop {
+        match reader.next() {
+            Ok(event)
+                if event.wd() == probe.watch
+                    && event.events().contains(inotify::ReadFlags::OPEN) =>
+            {
+                return true;
+            }
+            Ok(_) => {}
+            Err(rustix::io::Errno::AGAIN) => return false,
+            Err(error) => panic!("read transfer probe: {error}"),
+        }
+    }
 }
 
 #[test]

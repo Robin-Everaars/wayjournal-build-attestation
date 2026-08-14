@@ -1,7 +1,35 @@
 use serde_json::{Value, json};
 use wayjournal_core::{
-    ActorId, DomainRegistration, DomainRegistry, KindId, Record, RecordTimestamp,
+    ActorId, DomainRegistration, DomainRegistry, KindId, LegacyEntry, LegacyEntrySource,
+    LegacyStoreAdapter, LegacyStreamRequirement, LegacyStreamingError, Record, RecordTimestamp,
 };
+
+#[allow(dead_code)]
+#[derive(Debug)]
+pub struct BoundedNoLegacy;
+impl LegacyStoreAdapter for BoundedNoLegacy {
+    fn validate(&self, _: &[LegacyEntry<'_>]) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn require_streaming(&self, _: LegacyStreamRequirement) -> Result<(), LegacyStreamingError> {
+        Ok(())
+    }
+
+    fn validate_stream(
+        &self,
+        requirement: LegacyStreamRequirement,
+        source: &mut dyn LegacyEntrySource,
+    ) -> Result<(), LegacyStreamingError> {
+        self.require_streaming(requirement)?;
+        while source
+            .next_entry()
+            .map_err(LegacyStreamingError::Source)?
+            .is_some()
+        {}
+        Ok(())
+    }
+}
 
 pub const RECORD_A: &str = "01913f1d-8e2a-7c30-8f4a-426614174001";
 pub const RECORD_B: &str = "01913f1d-8e2a-7c30-8f4a-426614174002";

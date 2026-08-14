@@ -150,7 +150,8 @@ pub trait LegacyStoreAdapter: std::fmt::Debug + Send + Sync {
     /// Validates frozen legacy entries from an object-safe pull source.
     ///
     /// The compatibility default preserves the exact existing `validate` semantics by collecting
-    /// and borrowing the entries. Full-domain bounded adapters override this method.
+    /// and borrowing the entries. Full-domain validation fails closed even if only the capability
+    /// method is overridden; bounded adapters must override this method too.
     /// # Errors
     /// Returns a typed capability, source, or validation failure.
     fn validate_stream(
@@ -158,6 +159,9 @@ pub trait LegacyStoreAdapter: std::fmt::Debug + Send + Sync {
         requirement: LegacyStreamRequirement,
         source: &mut dyn LegacyEntrySource,
     ) -> Result<(), LegacyStreamingError> {
+        if requirement == LegacyStreamRequirement::FullDomainBounded {
+            return Err(LegacyStreamingError::UnsupportedFullDomain);
+        }
         self.require_streaming(requirement)?;
         let mut owned = Vec::<OwnedLegacyEntry>::new();
         while let Some(entry) = source.next_entry().map_err(LegacyStreamingError::Source)? {
@@ -283,6 +287,21 @@ struct OwnedLegacyEntry {
     path: Vec<u8>,
     bytes: Vec<u8>,
     class: PathClass,
+}
+struct CollectedLegacySource<'a> {
+    entries: &'a [OwnedLegacyEntry],
+    next: usize,
+}
+impl LegacyEntrySource for CollectedLegacySource<'_> {
+    fn next_entry(&mut self) -> Result<Option<LegacyEntry<'_>>, String> {
+        let index = self.next;
+        self.next = self.next.saturating_add(1);
+        Ok(self.entries.get(index).map(|entry| LegacyEntry {
+            path: &entry.path,
+            bytes: &entry.bytes,
+            class: entry.class,
+        }))
+    }
 }
 impl StoreSnapshot {
     #[must_use]
@@ -692,6 +711,13 @@ pub struct Store {
     strict_domains: bool,
 }
 impl Store {
+    pub(super) fn require_legacy_streaming(
+        &self,
+        requirement: LegacyStreamRequirement,
+    ) -> Result<(), LegacyStreamingError> {
+        self.legacy.require_streaming(requirement)
+    }
+
     /// Opens or initializes a store. Cooperative processes lock the retained store-root inode.
     /// Names below that inode may be renamed by an attacker without redirecting in-flight work.
     /// The caller is responsible for binding the ambient root pathname to the intended store;
@@ -1325,6 +1351,33 @@ pub(super) fn scan_collected(
     files: &[RawFile],
     nonregular: Vec<Vec<u8>>,
 ) -> Result<StoreSnapshot, StoreError> {
+    scan_collected_with_legacy_requirement(
+        store,
+        files,
+        nonregular,
+        LegacyStreamRequirement::CompatibleCollecting,
+    )
+}
+
+pub(super) fn scan_collected_streaming(
+    store: &Store,
+    files: &[RawFile],
+    nonregular: Vec<Vec<u8>>,
+) -> Result<StoreSnapshot, StoreError> {
+    scan_collected_with_legacy_requirement(
+        store,
+        files,
+        nonregular,
+        LegacyStreamRequirement::FullDomainBounded,
+    )
+}
+
+fn scan_collected_with_legacy_requirement(
+    store: &Store,
+    files: &[RawFile],
+    nonregular: Vec<Vec<u8>>,
+    legacy_requirement: LegacyStreamRequirement,
+) -> Result<StoreSnapshot, StoreError> {
     if let Some(path) = nonregular.into_iter().next() {
         return Err(StoreError::Corrupt {
             issue: StoreCorruption::NonRegularPath { path },
@@ -1394,20 +1447,7 @@ pub(super) fn scan_collected(
     } else {
         None
     };
-    let borrowed = legacy
-        .iter()
-        .map(|entry| LegacyEntry {
-            path: &entry.path,
-            bytes: &entry.bytes,
-            class: entry.class,
-        })
-        .collect::<Vec<_>>();
-    store
-        .legacy
-        .validate(&borrowed)
-        .map_err(|message| StoreError::Corrupt {
-            issue: StoreCorruption::InvalidLegacy { message },
-        })?;
+    validate_collected_legacy(store, &legacy, legacy_requirement)?;
     let revision = compute_store_revision(
         files
             .iter()
@@ -1428,6 +1468,45 @@ pub(super) fn scan_collected(
         identity,
         legacy,
     })
+}
+
+fn validate_collected_legacy(
+    store: &Store,
+    legacy: &[OwnedLegacyEntry],
+    requirement: LegacyStreamRequirement,
+) -> Result<(), StoreError> {
+    match requirement {
+        LegacyStreamRequirement::CompatibleCollecting => {
+            let borrowed = legacy
+                .iter()
+                .map(|entry| LegacyEntry {
+                    path: &entry.path,
+                    bytes: &entry.bytes,
+                    class: entry.class,
+                })
+                .collect::<Vec<_>>();
+            store
+                .legacy
+                .validate(&borrowed)
+                .map_err(|message| StoreError::Corrupt {
+                    issue: StoreCorruption::InvalidLegacy { message },
+                })
+        }
+        LegacyStreamRequirement::FullDomainBounded => {
+            let mut source = CollectedLegacySource {
+                entries: legacy,
+                next: 0,
+            };
+            store
+                .legacy
+                .validate_stream(requirement, &mut source)
+                .map_err(|error| StoreError::Corrupt {
+                    issue: StoreCorruption::InvalidLegacy {
+                        message: error.to_string(),
+                    },
+                })
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1494,6 +1573,39 @@ mod s4b_lock_tests {
         );
         assert_eq!(
             adapter.require_streaming(crate::LegacyStreamRequirement::FullDomainBounded),
+            Err(crate::LegacyStreamingError::UnsupportedFullDomain)
+        );
+    }
+
+    #[test]
+    fn full_domain_default_cannot_be_enabled_by_capability_only() {
+        #[derive(Debug)]
+        struct CapabilityOnly;
+        impl LegacyStoreAdapter for CapabilityOnly {
+            fn validate(&self, _: &[LegacyEntry<'_>]) -> Result<(), String> {
+                Ok(())
+            }
+
+            fn require_streaming(
+                &self,
+                _: crate::LegacyStreamRequirement,
+            ) -> Result<(), crate::LegacyStreamingError> {
+                Ok(())
+            }
+        }
+
+        struct EmptySource;
+        impl crate::LegacyEntrySource for EmptySource {
+            fn next_entry(&mut self) -> Result<Option<LegacyEntry<'_>>, String> {
+                Ok(None)
+            }
+        }
+
+        assert_eq!(
+            CapabilityOnly.validate_stream(
+                crate::LegacyStreamRequirement::FullDomainBounded,
+                &mut EmptySource,
+            ),
             Err(crate::LegacyStreamingError::UnsupportedFullDomain)
         );
     }

@@ -1,21 +1,62 @@
+#[allow(dead_code)]
+mod support;
+
 use std::{
+    collections::BTreeSet,
     fs,
     path::{Path, PathBuf},
     process::Command,
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 use serde_json::json;
 use wayjournal_core::{
     ActorId, ApprovedRef, ApprovedRemote, ApprovedRemoteLocator, GitQuarantineReason, GitSyncError,
-    GitSyncOutcome, GitSyncRequest, LegacyEntry, LegacyStoreAdapter, LocalTrustBinding, Record,
-    Store, prepare_batch, wayjournal_domain_registry,
+    GitSyncOutcome, GitSyncRequest, LegacyEntry, LegacyEntrySource, LegacyStoreAdapter,
+    LegacyStreamRequirement, LegacyStreamingError, LocalTrustBinding, Record, Store, prepare_batch,
+    wayjournal_domain_registry,
 };
 
+use support::BoundedNoLegacy as NoLegacy;
+
 #[derive(Debug)]
-struct NoLegacy;
-impl LegacyStoreAdapter for NoLegacy {
+struct CollectingLegacy;
+impl LegacyStoreAdapter for CollectingLegacy {
     fn validate(&self, _: &[LegacyEntry<'_>]) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+type ObservedLegacyStream = (LegacyStreamRequirement, BTreeSet<Vec<u8>>);
+type ObservedLegacyStreams = Arc<Mutex<Vec<ObservedLegacyStream>>>;
+
+#[derive(Debug)]
+struct ObservingStreamingLegacy {
+    seen: ObservedLegacyStreams,
+}
+impl LegacyStoreAdapter for ObservingStreamingLegacy {
+    fn validate(&self, _: &[LegacyEntry<'_>]) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn require_streaming(&self, _: LegacyStreamRequirement) -> Result<(), LegacyStreamingError> {
+        Ok(())
+    }
+
+    fn validate_stream(
+        &self,
+        requirement: LegacyStreamRequirement,
+        source: &mut dyn LegacyEntrySource,
+    ) -> Result<(), LegacyStreamingError> {
+        self.require_streaming(requirement)?;
+        let mut paths = BTreeSet::new();
+        while let Some(entry) = source.next_entry().map_err(LegacyStreamingError::Source)? {
+            paths.insert(entry.path().to_vec());
+        }
+        self.seen
+            .lock()
+            .expect("seen lock")
+            .push((requirement, paths));
         Ok(())
     }
 }
@@ -129,6 +170,10 @@ struct Fixture {
     request: GitSyncRequest,
 }
 fn fixture(label: &str) -> Fixture {
+    fixture_with_legacy(label, Arc::new(NoLegacy))
+}
+
+fn fixture_with_legacy(label: &str, legacy: Arc<dyn LegacyStoreAdapter>) -> Fixture {
     let root = TestDir::new(label);
     let remote = root.0.join("remote.git");
     run(
@@ -138,7 +183,7 @@ fn fixture(label: &str) -> Fixture {
     let local = root.0.join("local");
     fs::create_dir(&local).expect("local");
     let registry = wayjournal_domain_registry().expect("registry");
-    let store = Store::open(&local, registry, Arc::new(NoLegacy)).expect("store");
+    let store = Store::open(&local, registry, legacy).expect("store");
     let batch = prepare_batch(&[genesis()], "genesis", &registry).expect("batch");
     store
         .append(&batch, store.read().expect("read").revision())
@@ -178,7 +223,7 @@ fn fixture(label: &str) -> Fixture {
 
 #[test]
 fn collecting_adapter_is_rejected_before_transfer_or_mutation() {
-    let fixture = fixture("collecting-adapter-gate");
+    let fixture = fixture_with_legacy("collecting-adapter-gate", Arc::new(CollectingLegacy));
     let remote_before = oid(&fixture.remote, "refs/heads/main");
     let checkpoint = fixture
         .local
@@ -210,6 +255,63 @@ fn collecting_adapter_is_rejected_before_transfer_or_mutation() {
     assert_eq!(names(&pending), pending_before);
     assert_eq!(names(&quarantine), quarantine_before);
     assert_eq!(names(&attempts), attempts_before);
+}
+
+#[test]
+fn every_intermediate_tree_uses_full_domain_streaming_validation() {
+    const LEGACY_A: &str =
+        "events/123e4567-e89b-42d3-a456-426614174000/01913f1d-8e2a-7c30-8f4a-426614174041.json";
+    const LEGACY_B: &str =
+        "events/123e4567-e89b-42d3-a456-426614174000/01913f1d-8e2a-7c30-8f4a-426614174042.json";
+
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let fixture = fixture_with_legacy(
+        "stream-every-tree",
+        Arc::new(ObservingStreamingLegacy {
+            seen: Arc::clone(&seen),
+        }),
+    );
+    let clone = fixture.root.0.join("stream-clone");
+    run(
+        &fixture.root.0,
+        &[
+            "clone",
+            fixture.remote.to_str().expect("remote"),
+            clone.to_str().expect("clone"),
+        ],
+    );
+    configure(&clone);
+    for (path, value) in [(LEGACY_A, b"one".as_slice()), (LEGACY_B, b"two".as_slice())] {
+        let target = clone.join(path);
+        fs::create_dir_all(target.parent().expect("legacy parent")).expect("legacy parent");
+        fs::write(&target, value).expect("legacy entry");
+        run(&clone, &["add", path]);
+        run(&clone, &["commit", "-m", path]);
+    }
+    run(&clone, &["push", "origin", "HEAD:refs/heads/main"]);
+
+    assert!(matches!(
+        fixture
+            .store
+            .sync_git_union(&fixture.request)
+            .expect("sync"),
+        GitSyncOutcome::Advanced { .. }
+    ));
+    let observed = seen.lock().expect("seen lock");
+    let first = BTreeSet::from([LEGACY_A.as_bytes().to_vec()]);
+    let both = BTreeSet::from([LEGACY_A.as_bytes().to_vec(), LEGACY_B.as_bytes().to_vec()]);
+    assert!(
+        observed.iter().any(|(requirement, paths)| {
+            *requirement == LegacyStreamRequirement::FullDomainBounded && paths == &first
+        }),
+        "first intermediate tree was not full-domain stream-validated: {observed:?}"
+    );
+    assert!(
+        observed.iter().any(|(requirement, paths)| {
+            *requirement == LegacyStreamRequirement::FullDomainBounded && paths == &both
+        }),
+        "second intermediate tree was not full-domain stream-validated: {observed:?}"
+    );
 }
 
 fn clone_store(root: &Path, remote: &Path, name: &str) -> (PathBuf, Store, GitSyncRequest) {

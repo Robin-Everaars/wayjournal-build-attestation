@@ -539,6 +539,8 @@ pub enum GitSyncError {
     Store(#[from] crate::StoreError),
     #[error(transparent)]
     Quarantine(#[from] QuarantineError),
+    #[error(transparent)]
+    LegacyStreaming(#[from] crate::LegacyStreamingError),
     #[error("pending synchronization failed: {message}")]
     PendingState { message: String },
     #[error(transparent)]
@@ -601,6 +603,7 @@ impl crate::Store {
     /// Fails closed when bootstrap or advancing synchronization is required.
     #[allow(clippy::too_many_lines)]
     pub fn sync_git_union(&self, request: &GitSyncRequest) -> Result<GitSyncOutcome, GitSyncError> {
+        self.require_legacy_streaming(crate::LegacyStreamRequirement::FullDomainBounded)?;
         let guard = self.lock_exclusive_unsnapshotted()?;
         if let Some(incident) = quarantine::active(self, request)? {
             return Ok(GitSyncOutcome::Quarantined {
@@ -889,7 +892,7 @@ fn start_sync_operation(
         Err(error) => return Err(error.into()),
     };
     git::require_local_commit(&runner, &local, &local.tip)?;
-    let local_snapshot = git::local_tree_snapshot(store, &runner, &local, &local.tip)?;
+    let local_snapshot = git::local_tree_snapshot_streaming(store, &runner, &local, &local.tip)?;
     require_same_store(&local_snapshot, current)?;
     if local_snapshot.revision() != current.revision() {
         return Err(GitAdmissionError::CandidateRevisionMismatch.into());

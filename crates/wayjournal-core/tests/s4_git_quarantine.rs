@@ -1,3 +1,6 @@
+#[allow(dead_code)]
+mod support;
+
 use std::{
     fs,
     os::unix::fs::PermissionsExt,
@@ -8,17 +11,10 @@ use std::{
 use serde_json::json;
 use wayjournal_core::{
     ApprovedRef, ApprovedRemote, ApprovedRemoteLocator, GitQuarantineReason, GitSyncOutcome,
-    GitSyncRequest, LegacyEntry, LegacyStoreAdapter, LocalTrustBinding, Store,
-    wayjournal_domain_registry,
+    GitSyncRequest, LocalTrustBinding, Store, wayjournal_domain_registry,
 };
 
-#[derive(Debug)]
-struct NoLegacy;
-impl LegacyStoreAdapter for NoLegacy {
-    fn validate(&self, _: &[LegacyEntry<'_>]) -> Result<(), String> {
-        Ok(())
-    }
-}
+use support::BoundedNoLegacy as NoLegacy;
 
 fn git() -> PathBuf {
     PathBuf::from(std::env::var_os("WAYJOURNAL_TEST_GIT").expect("Git"))

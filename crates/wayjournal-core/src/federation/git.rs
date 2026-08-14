@@ -1,6 +1,6 @@
 use std::{
     ffi::{OsStr, OsString},
-    io::{self, Read, Write},
+    io::{self, BufRead, Read, Write},
     os::unix::{
         ffi::{OsStrExt, OsStringExt},
         process::CommandExt,
@@ -20,13 +20,17 @@ use thiserror::Error;
 
 use crate::{
     MAX_BATCH_BYTES, MAX_RECORD_BYTES, PathClass, Store, classify_path,
-    store::{Directory, MAX_CANONICAL_ENTRIES, MAX_TOTAL_CANONICAL_BYTES, RawFile, scan_collected},
+    store::{
+        Directory, MAX_CANONICAL_ENTRIES, MAX_TOTAL_CANONICAL_BYTES, RawFile, scan_collected,
+        scan_collected_streaming,
+    },
 };
 
 use super::{GitObjectFormat, GitOid, GitSyncRequest};
 
 const MAX_SMALL_OUTPUT: usize = 64 * 1024;
 const MAX_TREE_OUTPUT: usize = 512 * 1024 * 1024;
+const MAX_TREE_RECORD_BYTES: usize = 512;
 pub(super) const MAX_PENDING_REPO_OBJECTS: usize = 7_010_000;
 pub(super) const MAX_PENDING_REPO_FS_ENTRIES: usize = 7_100_000;
 pub(super) const MAX_PENDING_REPO_BYTES: u64 = 24 * 1024 * 1024 * 1024;
@@ -103,6 +107,14 @@ impl<'a> GitRunner<'a> {
             .arg("core.hooksPath=/dev/null")
             .arg("-c")
             .arg("core.fsmonitor=false")
+            .arg("-c")
+            .arg("maintenance.auto=false")
+            .arg("-c")
+            .arg("maintenance.autoDetach=false")
+            .arg("-c")
+            .arg("gc.auto=0")
+            .arg("-c")
+            .arg("gc.autoDetach=false")
             .arg("-c")
             .arg("commit.gpgSign=false")
             .arg("-c")
@@ -644,7 +656,7 @@ impl SyncRepository {
         runner: &GitRunner<'_>,
         oid: &GitOid,
     ) -> Result<crate::StoreSnapshot, super::GitAdmissionError> {
-        tree_snapshot(store, runner, &self.bare, self.format, oid)
+        tree_snapshot_streaming(store, runner, &self.bare, self.format, oid)
     }
 
     pub(super) fn tree_paths(
@@ -1657,6 +1669,15 @@ pub(super) fn local_tree_snapshot(
     tree_snapshot(store, runner, &repository.git_dir, repository.format, oid)
 }
 
+pub(super) fn local_tree_snapshot_streaming(
+    store: &Store,
+    runner: &GitRunner<'_>,
+    repository: &LocalRepository,
+    oid: &GitOid,
+) -> Result<crate::StoreSnapshot, super::GitAdmissionError> {
+    tree_snapshot_streaming(store, runner, &repository.git_dir, repository.format, oid)
+}
+
 pub(super) fn fetched_tree_snapshot(
     store: &Store,
     runner: &GitRunner<'_>,
@@ -1675,6 +1696,17 @@ fn tree_snapshot(
 ) -> Result<crate::StoreSnapshot, super::GitAdmissionError> {
     let files = tree_files(store, runner, git_dir, format, oid)?;
     scan_collected(store, &files, Vec::new()).map_err(Into::into)
+}
+
+fn tree_snapshot_streaming(
+    store: &Store,
+    runner: &GitRunner<'_>,
+    git_dir: &Directory,
+    format: GitObjectFormat,
+    oid: &GitOid,
+) -> Result<crate::StoreSnapshot, super::GitAdmissionError> {
+    let files = tree_files(store, runner, git_dir, format, oid)?;
+    scan_collected_streaming(store, &files, Vec::new()).map_err(Into::into)
 }
 
 fn tree_paths(
@@ -1724,48 +1756,46 @@ fn tree_paths(
     Ok(paths)
 }
 
-fn tree_files(
-    _store: &Store,
-    runner: &GitRunner<'_>,
-    git_dir: &Directory,
+struct TreeListingEntry {
+    path: Vec<u8>,
+    blob: GitOid,
+    class: PathClass,
+}
+
+struct TreeListingCursor<R> {
+    reader: R,
     format: GitObjectFormat,
-    oid: &GitOid,
-) -> Result<Vec<RawFile>, super::GitAdmissionError> {
-    if oid.format() != format {
-        return Err(super::GitAdmissionError::CheckpointObjectFormatMismatch);
+    entries: usize,
+    previous_path: Option<Vec<u8>>,
+}
+impl<R: BufRead> TreeListingCursor<R> {
+    const fn new(reader: R, format: GitObjectFormat) -> Self {
+        Self {
+            reader,
+            format,
+            entries: 0,
+            previous_path: None,
+        }
     }
-    let listing = runner.output(
-        "list canonical tree",
-        git_dir,
-        &repository_args(vec![
-            OsString::from("ls-tree"),
-            OsString::from("-r"),
-            OsString::from("-z"),
-            OsString::from("--full-tree"),
-            OsString::from(oid.as_hex()),
-        ]),
-        MAX_TREE_OUTPUT,
-    )?;
-    let mut files = Vec::new();
-    let mut total_bytes = 0_u64;
-    for entry in listing
-        .split(|byte| *byte == 0)
-        .filter(|entry| !entry.is_empty())
-    {
-        if files.len() >= MAX_CANONICAL_ENTRIES {
+
+    fn next_entry(&mut self) -> Result<Option<TreeListingEntry>, super::GitAdmissionError> {
+        let Some(record) = read_nul_record(&mut self.reader, MAX_TREE_RECORD_BYTES)? else {
+            return Ok(None);
+        };
+        if self.entries >= MAX_CANONICAL_ENTRIES {
             return Err(super::GitAdmissionError::Git(GitCommandError {
                 operation: "parse tree",
                 message: "canonical entry-count limit exceeded".to_owned(),
             }));
         }
-        let separator = entry
+        let separator = record
             .iter()
             .position(|byte| *byte == b'\t')
             .ok_or_else(|| GitCommandError {
                 operation: "parse tree",
                 message: "tree entry has no path separator".to_owned(),
             })?;
-        let (metadata, path_with_tab) = entry.split_at(separator);
+        let (metadata, path_with_tab) = record.split_at(separator);
         let path = &path_with_tab[1..];
         let mut parts = metadata.split(|byte| *byte == b' ');
         let mode = parts.next().unwrap_or_default();
@@ -1784,30 +1814,717 @@ fn tree_files(
         ) {
             return Err(super::GitAdmissionError::NonCanonicalTrackedPath);
         }
+        if self
+            .previous_path
+            .as_deref()
+            .is_some_and(|previous| previous >= path)
+        {
+            return Err(super::GitAdmissionError::InvalidTreeEntry);
+        }
         let blob = std::str::from_utf8(blob).map_err(|_| GitCommandError {
             operation: "parse tree",
             message: "blob id is not UTF-8".to_owned(),
         })?;
-        GitOid::parse(format, blob).map_err(|error| GitCommandError {
+        let blob = GitOid::parse(self.format, blob).map_err(|error| GitCommandError {
             operation: "parse tree",
             message: error.to_string(),
         })?;
-        let file_limit = match class {
+        self.entries += 1;
+        self.previous_path = Some(path.to_vec());
+        Ok(Some(TreeListingEntry {
+            path: path.to_vec(),
+            blob,
+            class,
+        }))
+    }
+}
+
+fn read_nul_record(
+    reader: &mut impl BufRead,
+    limit: usize,
+) -> Result<Option<Vec<u8>>, GitCommandError> {
+    read_delimited_record(
+        reader,
+        0,
+        limit,
+        "stream canonical tree",
+        "tree listing ended inside a record",
+        "tree record length overflow",
+        "tree record exceeds byte limit",
+    )
+}
+
+fn read_delimited_record(
+    reader: &mut impl BufRead,
+    delimiter: u8,
+    limit: usize,
+    operation: &'static str,
+    truncated_message: &'static str,
+    overflow_message: &'static str,
+    limit_message: &'static str,
+) -> Result<Option<Vec<u8>>, GitCommandError> {
+    let mut record = Vec::new();
+    loop {
+        let available = reader.fill_buf().map_err(|error| GitCommandError {
+            operation,
+            message: error.to_string(),
+        })?;
+        if available.is_empty() {
+            return if record.is_empty() {
+                Ok(None)
+            } else {
+                Err(GitCommandError {
+                    operation,
+                    message: truncated_message.to_owned(),
+                })
+            };
+        }
+        let delimiter = available.iter().position(|byte| *byte == delimiter);
+        let take = delimiter.unwrap_or(available.len());
+        let length = record
+            .len()
+            .checked_add(take)
+            .ok_or_else(|| GitCommandError {
+                operation,
+                message: overflow_message.to_owned(),
+            })?;
+        if length > limit {
+            return Err(GitCommandError {
+                operation,
+                message: limit_message.to_owned(),
+            });
+        }
+        record.extend_from_slice(&available[..take]);
+        let terminated = delimiter.is_some();
+        reader.consume(take + usize::from(terminated));
+        if terminated {
+            return Ok(Some(record));
+        }
+    }
+}
+
+fn read_cat_file_response(
+    reader: &mut impl BufRead,
+    expected: &GitOid,
+    byte_limit: usize,
+) -> Result<Vec<u8>, GitCommandError> {
+    const OPERATION: &str = "read canonical blob batch";
+    const HEADER_LIMIT: usize = 256;
+    let header = read_delimited_record(
+        reader,
+        b'\n',
+        HEADER_LIMIT,
+        OPERATION,
+        "cat-file ended inside a response header",
+        "cat-file response header length overflow",
+        "cat-file response header exceeds byte limit",
+    )?
+    .ok_or_else(|| GitCommandError {
+        operation: OPERATION,
+        message: "cat-file ended before a response header".to_owned(),
+    })?;
+    let mut parts = header.split(|byte| *byte == b' ');
+    let oid = parts.next().unwrap_or_default();
+    let kind = parts.next().unwrap_or_default();
+    let size = parts.next().unwrap_or_default();
+    if oid != expected.as_hex().as_bytes() || kind != b"blob" || parts.next().is_some() {
+        return Err(GitCommandError {
+            operation: OPERATION,
+            message: "cat-file response does not match the requested blob".to_owned(),
+        });
+    }
+    if size.is_empty()
+        || (size.len() > 1 && size[0] == b'0')
+        || !size.iter().all(u8::is_ascii_digit)
+    {
+        return Err(GitCommandError {
+            operation: OPERATION,
+            message: "cat-file blob length is not canonical decimal".to_owned(),
+        });
+    }
+    let size = std::str::from_utf8(size)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .ok_or_else(|| GitCommandError {
+            operation: OPERATION,
+            message: "cat-file blob length exceeds usize".to_owned(),
+        })?;
+    if size > byte_limit {
+        return Err(GitCommandError {
+            operation: OPERATION,
+            message: "cat-file blob exceeds byte limit".to_owned(),
+        });
+    }
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(size)
+        .map_err(|error| GitCommandError {
+            operation: OPERATION,
+            message: error.to_string(),
+        })?;
+    bytes.resize(size, 0);
+    reader
+        .read_exact(&mut bytes)
+        .map_err(|error| GitCommandError {
+            operation: OPERATION,
+            message: error.to_string(),
+        })?;
+    let mut terminator = [0_u8; 1];
+    reader
+        .read_exact(&mut terminator)
+        .map_err(|error| GitCommandError {
+            operation: OPERATION,
+            message: error.to_string(),
+        })?;
+    if terminator != *b"\n" {
+        return Err(GitCommandError {
+            operation: OPERATION,
+            message: "cat-file blob has an invalid terminator".to_owned(),
+        });
+    }
+    Ok(bytes)
+}
+
+struct CatFileRequest {
+    expected: GitOid,
+    byte_limit: usize,
+}
+
+#[cfg(test)]
+static CAT_FILE_RESPONSE_SEND_HOOK: std::sync::Mutex<Option<(String, Arc<std::sync::Barrier>)>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn install_cat_file_response_send_hook(expected: &GitOid, barrier: Arc<std::sync::Barrier>) {
+    *CAT_FILE_RESPONSE_SEND_HOOK.lock().expect("hook lock") =
+        Some((expected.as_hex().to_owned(), barrier));
+}
+
+#[cfg(test)]
+fn clear_cat_file_response_send_hook() {
+    *CAT_FILE_RESPONSE_SEND_HOOK.lock().expect("hook lock") = None;
+}
+
+#[cfg(test)]
+fn wait_for_cat_file_response_send_hook(expected: &GitOid) {
+    let barrier = CAT_FILE_RESPONSE_SEND_HOOK
+        .lock()
+        .expect("hook lock")
+        .as_ref()
+        .filter(|(oid, _)| oid == expected.as_hex())
+        .map(|(_, barrier)| Arc::clone(barrier));
+    if let Some(barrier) = barrier {
+        barrier.wait();
+    }
+}
+
+struct CatFileBatch {
+    child: std::process::Child,
+    pid: Option<Pid>,
+    stdin: Option<std::process::ChildStdin>,
+    request_tx: Option<mpsc::SyncSender<CatFileRequest>>,
+    response_rx: Receiver<Result<Vec<u8>, GitCommandError>>,
+    response_reader: Option<thread::JoinHandle<()>>,
+    stderr_rx: Receiver<io::Result<Vec<u8>>>,
+    stderr_reader: Option<thread::JoinHandle<()>>,
+    stderr_overflow: Arc<AtomicBool>,
+    timeout: Duration,
+    finished: bool,
+}
+impl CatFileBatch {
+    #[allow(unsafe_code)]
+    fn spawn(mut command: Command, timeout: Duration) -> Result<Self, GitCommandError> {
+        const OPERATION: &str = "start canonical blob batch";
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0);
+        // SAFETY: the hook runs after fork and invokes only the async-signal-safe `umask(2)`
+        // syscall. The setting belongs solely to this process tree.
+        unsafe {
+            command.pre_exec(|| {
+                rustix::process::umask(rustix::fs::Mode::empty());
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().map_err(|error| GitCommandError {
+            operation: OPERATION,
+            message: error.to_string(),
+        })?;
+        let pid = i32::try_from(child.id()).ok().and_then(Pid::from_raw);
+        let Some(stdin) = child.stdin.take() else {
+            terminate_process_group(pid, &mut child, true);
+            return Err(GitCommandError {
+                operation: OPERATION,
+                message: "stdin pipe was not created".to_owned(),
+            });
+        };
+        let Some(stdout) = child.stdout.take() else {
+            terminate_process_group(pid, &mut child, true);
+            return Err(GitCommandError {
+                operation: OPERATION,
+                message: "stdout pipe was not created".to_owned(),
+            });
+        };
+        let Some(stderr) = child.stderr.take() else {
+            terminate_process_group(pid, &mut child, true);
+            return Err(GitCommandError {
+                operation: OPERATION,
+                message: "stderr pipe was not created".to_owned(),
+            });
+        };
+        let stderr_overflow = Arc::new(AtomicBool::new(false));
+        let (stderr_reader, stderr_rx) =
+            spawn_bounded_reader(stderr, MAX_SMALL_OUTPUT, Arc::clone(&stderr_overflow));
+        let (request_tx, request_rx) = mpsc::sync_channel::<CatFileRequest>(1);
+        let (response_tx, response_rx) = mpsc::sync_channel::<Result<Vec<u8>, GitCommandError>>(1);
+        let response_reader = thread::spawn(move || {
+            let mut reader = std::io::BufReader::new(stdout);
+            while let Ok(request) = request_rx.recv() {
+                let response =
+                    read_cat_file_response(&mut reader, &request.expected, request.byte_limit);
+                #[cfg(test)]
+                wait_for_cat_file_response_send_hook(&request.expected);
+                let failed = response.is_err();
+                if response_tx.send(response).is_err() || failed {
+                    break;
+                }
+            }
+        });
+        Ok(Self {
+            child,
+            pid,
+            stdin: Some(stdin),
+            request_tx: Some(request_tx),
+            response_rx,
+            response_reader: Some(response_reader),
+            stderr_rx,
+            stderr_reader: Some(stderr_reader),
+            stderr_overflow,
+            timeout,
+            finished: false,
+        })
+    }
+
+    fn read_blob(
+        &mut self,
+        expected: &GitOid,
+        byte_limit: usize,
+    ) -> Result<Vec<u8>, GitCommandError> {
+        const OPERATION: &str = "read canonical blob batch";
+        if self.finished {
+            return Err(GitCommandError {
+                operation: OPERATION,
+                message: "cat-file batch is closed".to_owned(),
+            });
+        }
+        let request = CatFileRequest {
+            expected: expected.clone(),
+            byte_limit,
+        };
+        if self
+            .request_tx
+            .as_ref()
+            .ok_or_else(|| GitCommandError {
+                operation: OPERATION,
+                message: "cat-file request channel is closed".to_owned(),
+            })?
+            .send(request)
+            .is_err()
+        {
+            let error = GitCommandError {
+                operation: OPERATION,
+                message: "cat-file request reader disconnected".to_owned(),
+            };
+            self.abort();
+            return Err(error);
+        }
+        let write_result = (|| {
+            let stdin = self.stdin.as_mut().ok_or_else(|| GitCommandError {
+                operation: OPERATION,
+                message: "cat-file stdin is closed".to_owned(),
+            })?;
+            stdin
+                .write_all(expected.as_hex().as_bytes())
+                .and_then(|()| stdin.write_all(b"\n"))
+                .and_then(|()| stdin.flush())
+                .map_err(|error| GitCommandError {
+                    operation: OPERATION,
+                    message: error.to_string(),
+                })
+        })();
+        if let Err(error) = write_result {
+            self.abort();
+            return Err(error);
+        }
+        let started = Instant::now();
+        loop {
+            if self.stderr_overflow.load(Ordering::Acquire) {
+                let error = GitCommandError {
+                    operation: OPERATION,
+                    message: "bounded stderr exceeded".to_owned(),
+                };
+                self.abort();
+                return Err(error);
+            }
+            match self.response_rx.recv_timeout(Duration::from_millis(5)) {
+                Ok(Ok(bytes)) => return Ok(bytes),
+                Ok(Err(error)) => {
+                    self.abort();
+                    return Err(error);
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    let error = GitCommandError {
+                        operation: OPERATION,
+                        message: "cat-file response reader disconnected".to_owned(),
+                    };
+                    self.abort();
+                    return Err(error);
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+            }
+            if started.elapsed() >= self.timeout {
+                let error = GitCommandError {
+                    operation: OPERATION,
+                    message: "operation timed out".to_owned(),
+                };
+                self.abort();
+                return Err(error);
+            }
+        }
+    }
+
+    fn finish(mut self) -> Result<(), GitCommandError> {
+        const OPERATION: &str = "finish canonical blob batch";
+        self.request_tx.take();
+        self.stdin.take();
+        let started = Instant::now();
+        let mut status = None;
+        let mut stderr = None;
+        loop {
+            if stderr.is_none() {
+                match poll_reader(&self.stderr_rx, OPERATION) {
+                    Ok(value) => stderr = value,
+                    Err(error) => {
+                        self.abort();
+                        return Err(error);
+                    }
+                }
+            }
+            if status.is_none() {
+                match self.child.try_wait() {
+                    Ok(value) => status = value,
+                    Err(error) => {
+                        let error = GitCommandError {
+                            operation: OPERATION,
+                            message: error.to_string(),
+                        };
+                        self.abort();
+                        return Err(error);
+                    }
+                }
+            }
+            let failure = if self.stderr_overflow.load(Ordering::Acquire) {
+                Some("bounded stderr exceeded")
+            } else if started.elapsed() >= self.timeout {
+                Some("operation timed out")
+            } else {
+                None
+            };
+            if let Some(message) = failure {
+                let error = GitCommandError {
+                    operation: OPERATION,
+                    message: message.to_owned(),
+                };
+                self.abort();
+                return Err(error);
+            }
+            if status.is_some() && stderr.is_some() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        self.finished = true;
+        self.response_reader
+            .take()
+            .expect("open batch owns response reader")
+            .join()
+            .map_err(|_| GitCommandError {
+                operation: OPERATION,
+                message: "cat-file response reader panicked".to_owned(),
+            })?;
+        self.stderr_reader
+            .take()
+            .expect("open batch owns stderr reader")
+            .join()
+            .map_err(|_| GitCommandError {
+                operation: OPERATION,
+                message: "cat-file stderr reader panicked".to_owned(),
+            })?;
+        let status = status.expect("finish waits for child status");
+        let stderr = stderr.expect("finish waits for stderr");
+        if !status.success() {
+            return Err(GitCommandError {
+                operation: OPERATION,
+                message: format!(
+                    "process exited with {status}: {}",
+                    String::from_utf8_lossy(&stderr).trim()
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    fn abort(&mut self) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        self.request_tx.take();
+        self.stdin.take();
+        let running = self.child.try_wait().ok().flatten().is_none();
+        terminate_process_group(self.pid, &mut self.child, running);
+        if let Some(reader) = self.response_reader.take() {
+            let _ = reader.join();
+        }
+        if let Some(reader) = self.stderr_reader.take() {
+            let _ = reader.join();
+        }
+    }
+}
+impl Drop for CatFileBatch {
+    fn drop(&mut self) {
+        self.abort();
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+#[allow(unsafe_code)]
+fn stream_tree_listing(
+    mut command: Command,
+    format: GitObjectFormat,
+    timeout: Duration,
+    mut visit: impl FnMut(TreeListingEntry) -> Result<(), super::GitAdmissionError>,
+) -> Result<(), super::GitAdmissionError> {
+    const OPERATION: &str = "stream canonical tree";
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0);
+    // SAFETY: the hook runs after fork and invokes only the async-signal-safe `umask(2)` syscall.
+    // The setting belongs solely to this Git process and its descendants; the parent is unchanged.
+    unsafe {
+        command.pre_exec(|| {
+            rustix::process::umask(rustix::fs::Mode::empty());
+            Ok(())
+        });
+    }
+    let mut child = command.spawn().map_err(|error| GitCommandError {
+        operation: OPERATION,
+        message: error.to_string(),
+    })?;
+    let pid = i32::try_from(child.id()).ok().and_then(Pid::from_raw);
+    let Some(stdout) = child.stdout.take() else {
+        terminate_process_group(pid, &mut child, true);
+        return Err(GitCommandError {
+            operation: OPERATION,
+            message: "stdout pipe was not created".to_owned(),
+        }
+        .into());
+    };
+    let Some(stderr) = child.stderr.take() else {
+        terminate_process_group(pid, &mut child, true);
+        return Err(GitCommandError {
+            operation: OPERATION,
+            message: "stderr pipe was not created".to_owned(),
+        }
+        .into());
+    };
+    let overflow = Arc::new(AtomicBool::new(false));
+    let (stderr_reader, stderr_rx) =
+        spawn_bounded_reader(stderr, MAX_SMALL_OUTPUT, Arc::clone(&overflow));
+    let (entry_tx, entry_rx) = mpsc::sync_channel(1);
+    let listing_reader = thread::spawn(move || {
+        let mut cursor = TreeListingCursor::new(std::io::BufReader::new(stdout), format);
+        loop {
+            let next = cursor.next_entry();
+            let finished = !matches!(&next, Ok(Some(_)));
+            if entry_tx.send(next).is_err() || finished {
+                break;
+            }
+        }
+    });
+
+    let mut status = None;
+    let mut stderr = None;
+    let mut stream_error = None;
+    let mut listing_done = false;
+    let mut last_progress = Instant::now();
+    while !listing_done && stream_error.is_none() {
+        if overflow.load(Ordering::Acquire) {
+            stream_error = Some(super::GitAdmissionError::Git(GitCommandError {
+                operation: OPERATION,
+                message: "bounded stderr exceeded".to_owned(),
+            }));
+            break;
+        }
+        if last_progress.elapsed() >= timeout {
+            stream_error = Some(super::GitAdmissionError::Git(GitCommandError {
+                operation: OPERATION,
+                message: "operation timed out".to_owned(),
+            }));
+            break;
+        }
+        match entry_rx.recv_timeout(Duration::from_millis(5)) {
+            Ok(Ok(Some(entry))) => {
+                last_progress = Instant::now();
+                if let Err(error) = visit(entry) {
+                    stream_error = Some(error);
+                }
+            }
+            Ok(Ok(None)) => {
+                listing_done = true;
+                last_progress = Instant::now();
+            }
+            Ok(Err(error)) => stream_error = Some(error),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                stream_error = Some(super::GitAdmissionError::Git(GitCommandError {
+                    operation: OPERATION,
+                    message: "tree listing reader disconnected".to_owned(),
+                }));
+            }
+        }
+    }
+    while listing_done && stream_error.is_none() && (status.is_none() || stderr.is_none()) {
+        if stderr.is_none() {
+            match poll_reader(&stderr_rx, OPERATION) {
+                Ok(value) => stderr = value,
+                Err(error) => stream_error = Some(error.into()),
+            }
+        }
+        if status.is_none() {
+            match child.try_wait() {
+                Ok(value) => status = value,
+                Err(error) => {
+                    stream_error = Some(super::GitAdmissionError::Git(GitCommandError {
+                        operation: OPERATION,
+                        message: error.to_string(),
+                    }));
+                }
+            }
+        }
+        let failure = if overflow.load(Ordering::Acquire) {
+            Some("bounded stderr exceeded")
+        } else if last_progress.elapsed() >= timeout {
+            Some("operation timed out")
+        } else {
+            None
+        };
+        if let Some(message) = failure {
+            stream_error = Some(super::GitAdmissionError::Git(GitCommandError {
+                operation: OPERATION,
+                message: message.to_owned(),
+            }));
+        }
+        if (status.is_none() || stderr.is_none()) && stream_error.is_none() {
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+    if stream_error.is_some() {
+        terminate_process_group(pid, &mut child, status.is_none());
+    }
+    drop(entry_rx);
+    if listing_reader.join().is_err() && stream_error.is_none() {
+        stream_error = Some(super::GitAdmissionError::Git(GitCommandError {
+            operation: OPERATION,
+            message: "tree listing reader panicked".to_owned(),
+        }));
+    }
+    if stderr_reader.join().is_err() && stream_error.is_none() {
+        stream_error = Some(super::GitAdmissionError::Git(GitCommandError {
+            operation: OPERATION,
+            message: "stderr reader panicked".to_owned(),
+        }));
+    }
+    let stderr = if let Some(bytes) = stderr {
+        bytes
+    } else {
+        match stderr_rx.recv() {
+            Ok(Ok(bytes)) => bytes,
+            Ok(Err(error)) => {
+                if stream_error.is_none() {
+                    stream_error = Some(super::GitAdmissionError::Git(GitCommandError {
+                        operation: OPERATION,
+                        message: error.to_string(),
+                    }));
+                }
+                Vec::new()
+            }
+            Err(_) => {
+                if stream_error.is_none() {
+                    stream_error = Some(super::GitAdmissionError::Git(GitCommandError {
+                        operation: OPERATION,
+                        message: "stderr reader disconnected".to_owned(),
+                    }));
+                }
+                Vec::new()
+            }
+        }
+    };
+    if let Some(error) = stream_error {
+        return Err(error);
+    }
+    let status = status.expect("successful listing records a child status");
+    if !status.success() {
+        return Err(super::GitAdmissionError::Git(GitCommandError {
+            operation: OPERATION,
+            message: format!(
+                "process exited with {status}: {}",
+                String::from_utf8_lossy(&stderr).trim()
+            ),
+        }));
+    }
+    Ok(())
+}
+
+fn tree_files(
+    _store: &Store,
+    runner: &GitRunner<'_>,
+    git_dir: &Directory,
+    format: GitObjectFormat,
+    oid: &GitOid,
+) -> Result<Vec<RawFile>, super::GitAdmissionError> {
+    if oid.format() != format {
+        return Err(super::GitAdmissionError::CheckpointObjectFormatMismatch);
+    }
+    let cat_file = runner.command(
+        git_dir,
+        &repository_args(vec![OsString::from("cat-file"), OsString::from("--batch")]),
+    );
+    let mut blobs = CatFileBatch::spawn(cat_file, runner.timeout)?;
+    let command = runner.command(
+        git_dir,
+        &repository_args(vec![
+            OsString::from("ls-tree"),
+            OsString::from("-r"),
+            OsString::from("-z"),
+            OsString::from("--full-tree"),
+            OsString::from(oid.as_hex()),
+        ]),
+    );
+    let mut files = Vec::new();
+    let mut total_bytes = 0_u64;
+    stream_tree_listing(command, format, runner.timeout, |entry| {
+        let file_limit = match entry.class {
             PathClass::JournalRecord => MAX_RECORD_BYTES,
             PathClass::JournalBatch => MAX_BATCH_BYTES,
             PathClass::LegacyEvent | PathClass::LegacyBatch => crate::MAX_LEGACY_FILE_BYTES,
             PathClass::NonCanonical | PathClass::InvalidReserved => unreachable!(),
         };
-        let bytes = runner.output(
-            "read canonical blob",
-            git_dir,
-            &repository_args(vec![
-                OsString::from("cat-file"),
-                OsString::from("blob"),
-                OsString::from(blob),
-            ]),
-            file_limit,
-        )?;
+        let bytes = blobs.read_blob(&entry.blob, file_limit)?;
         total_bytes = total_bytes
             .checked_add(u64::try_from(bytes.len()).map_err(|_| GitCommandError {
                 operation: "read canonical blob",
@@ -1824,20 +2541,211 @@ fn tree_files(
             }));
         }
         files.push(RawFile {
-            path: path.to_vec(),
+            path: entry.path,
             bytes,
         });
-    }
+        Ok(())
+    })?;
+    blobs.finish()?;
     Ok(files)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{audit_repository_metadata, run_bounded_command};
+    use super::{
+        CatFileBatch, TreeListingCursor, audit_repository_metadata,
+        clear_cat_file_response_send_hook, install_cat_file_response_send_hook,
+        read_cat_file_response, run_bounded_command, stream_tree_listing,
+    };
     use std::{
+        io::{BufReader, Cursor, Read},
         process::Command,
+        sync::{Arc, Barrier},
+        thread,
         time::{Duration, Instant},
     };
+
+    struct ChunkedReader {
+        inner: Cursor<Vec<u8>>,
+        max_chunk: usize,
+    }
+    impl Read for ChunkedReader {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            let length = buffer.len().min(self.max_chunk);
+            self.inner.read(&mut buffer[..length])
+        }
+    }
+
+    #[test]
+    fn tree_listing_cursor_streams_nul_records_across_read_boundaries() {
+        let oid_a = "1111111111111111111111111111111111111111";
+        let oid_b = "2222222222222222222222222222222222222222";
+        let path_a = "batches/01913f1d-8e2a-7c30-8f4a-426614174012.json";
+        let path_b =
+            "events/123e4567-e89b-42d3-a456-426614174000/01913f1d-8e2a-7c30-8f4a-426614174001.json";
+        let listing = format!(
+            "100644 blob {oid_a}\t{path_a}\0\
+             100644 blob {oid_b}\t{path_b}\0"
+        )
+        .into_bytes();
+        let reader = BufReader::with_capacity(
+            2,
+            ChunkedReader {
+                inner: Cursor::new(listing),
+                max_chunk: 3,
+            },
+        );
+        let mut cursor = TreeListingCursor::new(reader, crate::GitObjectFormat::Sha1);
+
+        let first = cursor.next_entry().expect("first record").expect("first");
+        assert_eq!(first.path, path_a.as_bytes());
+        assert_eq!(first.blob.as_hex(), oid_a);
+        assert_eq!(first.class, crate::PathClass::LegacyBatch);
+        let second = cursor.next_entry().expect("second record").expect("second");
+        assert_eq!(second.path, path_b.as_bytes());
+        assert_eq!(second.blob.as_hex(), oid_b);
+        assert_eq!(second.class, crate::PathClass::LegacyEvent);
+        assert!(cursor.next_entry().expect("end").is_none());
+    }
+
+    #[test]
+    fn cat_file_response_streams_exact_framed_blob_across_read_boundaries() {
+        let oid = "1111111111111111111111111111111111111111";
+        let response = format!("{oid} blob 5\nhello\n").into_bytes();
+        let mut reader = BufReader::with_capacity(
+            2,
+            ChunkedReader {
+                inner: Cursor::new(response),
+                max_chunk: 3,
+            },
+        );
+        let expected = super::GitOid::parse(crate::GitObjectFormat::Sha1, oid).expect("OID");
+
+        assert_eq!(
+            read_cat_file_response(&mut reader, &expected, 5).expect("response"),
+            b"hello"
+        );
+    }
+
+    #[test]
+    fn cat_file_batch_reuses_one_process_for_multiple_blobs() {
+        let oid_a = "1111111111111111111111111111111111111111";
+        let oid_b = "2222222222222222222222222222222222222222";
+        let script = format!(
+            r#"while IFS= read -r oid; do
+  case "$oid" in
+    "{oid_a}") printf '%s blob 3\none\n' "$oid" ;;
+    "{oid_b}") printf '%s blob 3\ntwo\n' "$oid" ;;
+    *) printf '%s missing\n' "$oid" ;;
+  esac
+done"#
+        );
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", &script]);
+        let expected_a = super::GitOid::parse(crate::GitObjectFormat::Sha1, oid_a).expect("OID A");
+        let expected_b = super::GitOid::parse(crate::GitObjectFormat::Sha1, oid_b).expect("OID B");
+        let mut batch = CatFileBatch::spawn(command, Duration::from_secs(2)).expect("batch");
+
+        assert_eq!(batch.read_blob(&expected_a, 3).expect("first"), b"one");
+        assert_eq!(batch.read_blob(&expected_b, 3).expect("second"), b"two");
+        batch.finish().expect("finish");
+    }
+
+    #[test]
+    fn cat_file_batch_accepts_a_queued_response_after_direct_child_exit() {
+        let oid = "3333333333333333333333333333333333333333";
+        let script = "IFS= read -r oid; printf '%s blob 3\\none\\n' \"$oid\"";
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", script]);
+        let expected = super::GitOid::parse(crate::GitObjectFormat::Sha1, oid).expect("OID");
+        let barrier = Arc::new(Barrier::new(2));
+        install_cat_file_response_send_hook(&expected, Arc::clone(&barrier));
+        let releaser = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            barrier.wait();
+        });
+        let mut batch = CatFileBatch::spawn(command, Duration::from_secs(2)).expect("batch");
+
+        let response = batch.read_blob(&expected, 3);
+
+        releaser.join().expect("release hook");
+        clear_cat_file_response_send_hook();
+        assert_eq!(response.expect("queued response"), b"one");
+        batch.finish().expect("finish");
+    }
+
+    #[test]
+    fn cat_file_batch_finish_times_out_when_descendant_holds_stderr() {
+        let oid = "1111111111111111111111111111111111111111";
+        let script = r#"IFS= read -r oid
+printf '%s blob 3\none\n' "$oid"
+sleep 0.05
+sleep 3 >/dev/null &"#;
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", script]);
+        let expected = super::GitOid::parse(crate::GitObjectFormat::Sha1, oid).expect("OID");
+        let mut batch = CatFileBatch::spawn(command, Duration::from_millis(100)).expect("batch");
+        assert_eq!(batch.read_blob(&expected, 3).expect("blob"), b"one");
+        let started = Instant::now();
+
+        let error = batch.finish().expect_err("held stderr must time out");
+
+        assert!(error.to_string().contains("timed out"));
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn tree_listing_process_streams_records_from_a_live_pipe() {
+        let oid_a = "1111111111111111111111111111111111111111";
+        let oid_b = "2222222222222222222222222222222222222222";
+        let path_a = "batches/01913f1d-8e2a-7c30-8f4a-426614174012.json";
+        let path_b =
+            "events/123e4567-e89b-42d3-a456-426614174000/01913f1d-8e2a-7c30-8f4a-426614174001.json";
+        let script = format!(
+            "printf '%s\\0%s\\0' '100644 blob {oid_a}\t{path_a}' \
+             '100644 blob {oid_b}\t{path_b}'"
+        );
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", &script]);
+        let mut paths = Vec::new();
+
+        stream_tree_listing(
+            command,
+            crate::GitObjectFormat::Sha1,
+            Duration::from_secs(2),
+            |entry| {
+                paths.push(entry.path);
+                Ok(())
+            },
+        )
+        .expect("stream listing");
+
+        assert_eq!(paths, [path_a.as_bytes(), path_b.as_bytes()]);
+    }
+
+    #[test]
+    fn tree_listing_process_times_out_when_descendant_holds_stderr() {
+        let oid = "1111111111111111111111111111111111111111";
+        let path = "batches/01913f1d-8e2a-7c30-8f4a-426614174012.json";
+        let script = format!(
+            "printf '%s\\0' '100644 blob {oid}\t{path}'; \
+             sleep 0.05; sleep 3 >/dev/null &"
+        );
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", &script]);
+        let started = Instant::now();
+
+        let error = stream_tree_listing(
+            command,
+            crate::GitObjectFormat::Sha1,
+            Duration::from_millis(100),
+            |_| Ok(()),
+        )
+        .expect_err("held stderr must time out");
+
+        assert!(error.to_string().contains("timed out"));
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
 
     #[test]
     fn hostile_git_authority_is_inert() {
