@@ -86,8 +86,11 @@ fn profile(record: &str, batch: &str, value: &str) -> Record {
     }
 }
 fn request(remote: &Path) -> GitSyncRequest {
+    request_with_git(remote, git())
+}
+fn request_with_git(remote: &Path, executable: PathBuf) -> GitSyncRequest {
     GitSyncRequest::new(
-        git(),
+        executable,
         LocalTrustBinding::parse(
             "3c4835897266c2b72f1ad9528309c6002f388071b0e9c780827bedbfaa35ce15",
         )
@@ -410,6 +413,97 @@ fn every_normal_durability_fault_recovers_and_gates_five_fresh_handle_process_ap
         .unwrap();
         resumed.read().expect("APIs resume after durable cleanup");
     }
+}
+
+#[test]
+fn prepared_recovery_uses_constant_git_processes_for_many_additions() {
+    let f = fixture("constant-process-recovery");
+    let registry = wayjournal_domain_registry().unwrap();
+    let records = (0..16)
+        .map(|index| {
+            profile(
+                &format!("01913f1d-8e2a-7c30-8f4a-4266141741{index:02}"),
+                "01913f1d-8e2a-7c30-8f4a-426614174200",
+                &format!("value-{index}"),
+            )
+        })
+        .collect::<Vec<_>>();
+    let batch = prepare_batch(&records, "many-additions", &registry).unwrap();
+    let (writer_path, writer, _) = clone_store(&f, "many-additions-writer");
+    writer
+        .append(&batch, writer.read().unwrap().revision())
+        .unwrap();
+    run(&writer_path, &["add", "journal"]);
+    run(&writer_path, &["commit", "-m", "many additions"]);
+    run(
+        &writer_path,
+        &[
+            "push",
+            url::Url::from_file_path(&f.remote).unwrap().as_str(),
+            "HEAD:refs/heads/main",
+        ],
+    );
+    assert_eq!(
+        child_sync(&f.local, &f.remote, "pending-root-durable").code(),
+        Some(86)
+    );
+
+    let wrapper = f.root.0.join("counting-git");
+    let wrapper_source = f.root.0.join("counting-git.rs");
+    let log = f.root.0.join("git-invocations");
+    fs::write(
+        &wrapper_source,
+        format!(
+            r#"use std::{{env, fs::OpenOptions, io::Write, process::Command}};
+fn main() {{
+    let args = env::args_os().skip(1).collect::<Vec<_>>();
+    let mut log = OpenOptions::new().create(true).append(true).open({log:?}).unwrap();
+    writeln!(log, "{{}}", args.iter().map(|arg| arg.to_string_lossy()).collect::<Vec<_>>().join(" ")).unwrap();
+    let status = Command::new({git:?}).args(&args).status().unwrap();
+    std::process::exit(status.code().unwrap_or(127));
+}}
+"#,
+            log = log,
+            git = git(),
+        ),
+    )
+    .unwrap();
+    let compiled = Command::new("rustc")
+        .args([
+            wrapper_source.as_os_str(),
+            "-o".as_ref(),
+            wrapper.as_os_str(),
+        ])
+        .status()
+        .unwrap();
+    assert!(compiled.success(), "compile counting Git wrapper");
+    let outcome = f
+        .store
+        .sync_git_union(&request_with_git(&f.remote, wrapper))
+        .unwrap();
+    assert!(matches!(outcome, GitSyncOutcome::Advanced { .. }));
+
+    let invocations = fs::read_to_string(log).unwrap();
+    assert_eq!(
+        invocations
+            .lines()
+            .filter(|line| line.contains(" cat-file -e "))
+            .count(),
+        0,
+        "recovery must not spawn cat-file -e per staged path:\n{invocations}"
+    );
+    assert_eq!(
+        invocations
+            .lines()
+            .filter(|line| line.contains(" cat-file blob "))
+            .count(),
+        0,
+        "recovery must use one persistent cat-file batch:\n{invocations}"
+    );
+    assert!(
+        invocations.lines().count() < 80,
+        "recovery process count must be independent of additions:\n{invocations}"
+    );
 }
 
 #[test]

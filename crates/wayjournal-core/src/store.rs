@@ -73,6 +73,61 @@ pub const MAX_LEGACY_FILE_BYTES: usize = 1024 * 1024;
 pub(crate) const MAX_CANONICAL_ENTRIES: usize = 1_000_000;
 pub(crate) const MAX_TOTAL_CANONICAL_BYTES: u64 = 1024 * 1024 * 1024;
 
+/// Counts the canonical file-plus-parent entry set from a sorted file stream.
+///
+/// Canonical root directories (`events`, `batches`, and `journal`) are store anchors rather than
+/// entries. Every other directory prefix is counted once, without retaining the full path set.
+pub(crate) struct CanonicalEntryBudget {
+    entries: usize,
+    previous_file: Option<Vec<u8>>,
+}
+impl CanonicalEntryBudget {
+    pub(crate) const fn new() -> Self {
+        Self {
+            entries: 0,
+            previous_file: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn with_entries(entries: usize) -> Self {
+        Self {
+            entries,
+            previous_file: None,
+        }
+    }
+
+    pub(crate) fn push_sorted_file(&mut self, path: &[u8], limit: usize) -> Result<(), ()> {
+        if self
+            .previous_file
+            .as_deref()
+            .is_some_and(|previous| previous >= path)
+        {
+            return Err(());
+        }
+        let previous = self.previous_file.as_deref();
+        let mut added = 1_usize;
+        for (end, _) in path.iter().enumerate().filter(|(_, byte)| **byte == b'/') {
+            let parent = &path[..end];
+            if matches!(parent, b"events" | b"batches" | b"journal") {
+                continue;
+            }
+            let already_counted = previous.is_some_and(|previous| {
+                previous.starts_with(parent) && previous.get(parent.len()) == Some(&b'/')
+            });
+            if !already_counted {
+                added = added.checked_add(1).ok_or(())?;
+            }
+        }
+        self.entries = self.entries.checked_add(added).ok_or(())?;
+        if self.entries > limit {
+            return Err(());
+        }
+        self.previous_file = Some(path.to_vec());
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct LegacyEntry<'a> {
     path: &'a [u8],
@@ -1291,6 +1346,14 @@ fn spool_visible_files(store: &Store) -> Result<(File, Vec<VisibleSpoolEntry>), 
         .flush()
         .map_err(|source| io_error("flush visible snapshot spool", &store.root, source))?;
     entries.sort_by(|left, right| left.path.cmp(&right.path));
+    let mut canonical_entries = CanonicalEntryBudget::new();
+    for entry in &entries {
+        canonical_entries
+            .push_sorted_file(&entry.path, budget.limits.entries)
+            .map_err(|()| {
+                invalid_layout(&store.root, "canonical store exceeds entry-count limit")
+            })?;
+    }
     Ok((spool, entries))
 }
 

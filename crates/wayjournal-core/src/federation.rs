@@ -1179,28 +1179,68 @@ fn recover_sync_operation(
             GitQuarantineReason::HostilePublicationState,
         );
     }
-    let mut observed_additions = 0_u64;
-    let staged_valid = pending::for_each_addition(&active, |file| {
-        observed_additions = observed_additions.saturating_add(1);
-        let existed = repository
-            .path_exists(&runner, &active.document.observed_local_tip, &file.path)
+    // Revalidate the complete candidate-only diff with one `diff-tree` process and one
+    // persistent `cat-file --batch` process. Both streams are globally sorted, so the durable
+    // additions can be compared lockstep without per-path Git invocations or a path index.
+    let staged_valid = (|| -> Result<(), pending::PendingError> {
+        let mut diff_file = active.directory.temporary_file()?;
+        let diff_output = diff_file
+            .try_clone()
             .map_err(|error| pending::PendingError::Invalid(error.to_string()))?;
-        let candidate = repository
-            .path_bytes(
+        repository
+            .spool_tree_additions(
                 &runner,
+                &active.document.observed_local_tip,
                 &active.document.candidate_commit,
-                &file.path,
-                file.bytes.len(),
+                diff_output,
             )
             .map_err(|error| pending::PendingError::Invalid(error.to_string()))?;
-        if existed || candidate != file.bytes {
+        diff_file
+            .seek(SeekFrom::Start(0))
+            .map_err(|error| pending::PendingError::Invalid(error.to_string()))?;
+        let mut candidate = repository
+            .tree_addition_source(&runner, diff_file)
+            .map_err(|error| pending::PendingError::Invalid(error.to_string()))?;
+        let mut observed_additions = 0_u64;
+        pending::for_each_addition(&active, |staged| {
+            let Some(expected) = candidate
+                .next_file()
+                .map_err(|error| pending::PendingError::Invalid(error.to_string()))?
+            else {
+                return Err(pending::PendingError::Invalid(
+                    "candidate additions ended before staged additions".to_owned(),
+                ));
+            };
+            observed_additions = observed_additions.checked_add(1).ok_or_else(|| {
+                pending::PendingError::Invalid("addition count overflow".to_owned())
+            })?;
+            if expected.path != staged.path || expected.bytes != staged.bytes {
+                return Err(pending::PendingError::Invalid(
+                    "staged blob does not equal candidate-only path".to_owned(),
+                ));
+            }
+            Ok(())
+        })?;
+        if candidate
+            .next_file()
+            .map_err(|error| pending::PendingError::Invalid(error.to_string()))?
+            .is_some()
+        {
             return Err(pending::PendingError::Invalid(
-                "staged blob does not equal candidate-only path".to_owned(),
+                "candidate additions continue after staged additions".to_owned(),
+            ));
+        }
+        candidate
+            .finish()
+            .map_err(|error| pending::PendingError::Invalid(error.to_string()))?;
+        if observed_additions != active.document.additions_count {
+            return Err(pending::PendingError::Invalid(
+                "staged addition count does not match pending document".to_owned(),
             ));
         }
         Ok(())
-    });
-    if staged_valid.is_err() || observed_additions != active.document.additions_count {
+    })();
+    if staged_valid.is_err() {
         return quarantine_publication(
             store,
             request,

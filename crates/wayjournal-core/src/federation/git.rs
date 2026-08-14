@@ -2,10 +2,7 @@ use std::{
     ffi::{OsStr, OsString},
     fs::File,
     io::{self, BufRead, Read, Seek, SeekFrom, Write},
-    os::unix::{
-        ffi::{OsStrExt, OsStringExt},
-        process::CommandExt,
-    },
+    os::unix::{ffi::OsStrExt, process::CommandExt},
     process::{Command, Stdio},
     sync::{
         Arc,
@@ -757,7 +754,18 @@ impl SyncRepository {
         parent: &GitOid,
         child: &GitOid,
     ) -> Result<Option<super::GitQuarantineReason>, GitCommandError> {
-        let output = runner.output(
+        let mut output = self
+            .bare
+            .temporary_file()
+            .map_err(|error| GitCommandError {
+                operation: "validate immutable history edge",
+                message: error.to_string(),
+            })?;
+        let retained = output.try_clone().map_err(|error| GitCommandError {
+            operation: "validate immutable history edge",
+            message: error.to_string(),
+        })?;
+        runner.output_to_file(
             "validate immutable history edge",
             &self.bare,
             &repository_args(vec![
@@ -766,24 +774,21 @@ impl SyncRepository {
                 OsString::from("--no-commit-id"),
                 OsString::from("--name-status"),
                 OsString::from("-z"),
+                OsString::from("--no-renames"),
                 OsString::from(parent.as_hex()),
                 OsString::from(child.as_hex()),
                 OsString::from("--"),
             ]),
+            retained,
             MAX_TREE_OUTPUT,
         )?;
-        for entry in output
-            .split(|byte| *byte == 0)
-            .filter(|entry| !entry.is_empty())
-        {
-            if entry.first() == Some(&b'D') {
-                return Ok(Some(super::GitQuarantineReason::Deletion));
-            }
-            if entry.first() == Some(&b'M') {
-                return Ok(Some(super::GitQuarantineReason::Modification));
-            }
-        }
-        Ok(None)
+        output
+            .seek(SeekFrom::Start(0))
+            .map_err(|error| GitCommandError {
+                operation: "validate immutable history edge",
+                message: error.to_string(),
+            })?;
+        immutable_edge_violation_from_reader(std::io::BufReader::new(output))
     }
 
     pub(super) fn new_history(
@@ -893,48 +898,6 @@ impl SyncRepository {
     ) -> Result<TreeAdditionSource, GitCommandError> {
         let command = runner.command(&self.bare, &repository_args(args(&["cat-file", "--batch"])));
         TreeAdditionSource::new(diff, self.format, command, runner.timeout)
-    }
-
-    pub(super) fn path_exists(
-        &self,
-        runner: &GitRunner<'_>,
-        oid: &GitOid,
-        path: &[u8],
-    ) -> Result<bool, GitCommandError> {
-        let mut spec = oid.as_hex().as_bytes().to_vec();
-        spec.push(b':');
-        spec.extend_from_slice(path);
-        runner.succeeds(
-            "test canonical path in tree",
-            &self.bare,
-            &repository_args(vec![
-                OsString::from("cat-file"),
-                OsString::from("-e"),
-                OsString::from_vec(spec),
-            ]),
-        )
-    }
-
-    pub(super) fn path_bytes(
-        &self,
-        runner: &GitRunner<'_>,
-        oid: &GitOid,
-        path: &[u8],
-        limit: usize,
-    ) -> Result<Vec<u8>, GitCommandError> {
-        let mut spec = oid.as_hex().as_bytes().to_vec();
-        spec.push(b':');
-        spec.extend_from_slice(path);
-        runner.output(
-            "read canonical path from tree",
-            &self.bare,
-            &repository_args(vec![
-                OsString::from("cat-file"),
-                OsString::from("blob"),
-                OsString::from_vec(spec),
-            ]),
-            limit,
-        )
     }
 }
 
@@ -1215,22 +1178,31 @@ fn verify_reachable_objects(
         ]),
         MAX_SMALL_OUTPUT,
     )?;
-    let objects = runner.output(
+    let mut objects = repository
+        .bare
+        .temporary_file()
+        .map_err(|error| GitCommandError {
+            operation: "inventory fetched objects",
+            message: error.to_string(),
+        })?;
+    let retained = objects.try_clone().map_err(|error| GitCommandError {
+        operation: "inventory fetched objects",
+        message: error.to_string(),
+    })?;
+    runner.output_to_file(
         "inventory fetched objects",
         &repository.bare,
         &repository_args(args(&["rev-list", "--objects", "--all"])),
+        retained,
         MAX_TREE_OUTPUT,
     )?;
-    let count = objects
-        .split(|byte| *byte == b'\n')
-        .filter(|line| !line.is_empty())
-        .count();
-    if count > MAX_PENDING_REPO_OBJECTS {
-        return Err(GitCommandError {
+    objects
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| GitCommandError {
             operation: "inventory fetched objects",
-            message: "reachable object count exceeds bound".to_owned(),
-        });
-    }
+            message: error.to_string(),
+        })?;
+    count_reachable_inventory(std::io::BufReader::new(objects), MAX_PENDING_REPO_OBJECTS)?;
     Ok(())
 }
 
@@ -2060,7 +2032,7 @@ struct TreeListingEntry {
 struct TreeListingCursor<R> {
     reader: R,
     format: GitObjectFormat,
-    entries: usize,
+    entry_budget: crate::store::CanonicalEntryBudget,
     previous_path: Option<Vec<u8>>,
 }
 impl<R: BufRead> TreeListingCursor<R> {
@@ -2068,7 +2040,7 @@ impl<R: BufRead> TreeListingCursor<R> {
         Self {
             reader,
             format,
-            entries: 0,
+            entry_budget: crate::store::CanonicalEntryBudget::new(),
             previous_path: None,
         }
     }
@@ -2077,12 +2049,6 @@ impl<R: BufRead> TreeListingCursor<R> {
         let Some(record) = read_nul_record(&mut self.reader, MAX_TREE_RECORD_BYTES)? else {
             return Ok(None);
         };
-        if self.entries >= MAX_CANONICAL_ENTRIES {
-            return Err(super::GitAdmissionError::Git(GitCommandError {
-                operation: "parse tree",
-                message: "canonical entry-count limit exceeded".to_owned(),
-            }));
-        }
         let separator = record
             .iter()
             .position(|byte| *byte == b'\t')
@@ -2124,7 +2090,12 @@ impl<R: BufRead> TreeListingCursor<R> {
             operation: "parse tree",
             message: error.to_string(),
         })?;
-        self.entries += 1;
+        self.entry_budget
+            .push_sorted_file(path, MAX_CANONICAL_ENTRIES)
+            .map_err(|()| GitCommandError {
+                operation: "parse tree",
+                message: "canonical entry-count limit exceeded".to_owned(),
+            })?;
         self.previous_path = Some(path.to_vec());
         Ok(Some(TreeListingEntry {
             path: path.to_vec(),
@@ -2398,6 +2369,71 @@ fn canonical_blob_limit(class: PathClass) -> Option<usize> {
         PathClass::JournalBatch => Some(MAX_BATCH_BYTES),
         _ => None,
     }
+}
+
+fn count_reachable_inventory(
+    mut reader: impl BufRead,
+    limit: usize,
+) -> Result<usize, GitCommandError> {
+    let mut count = 0_usize;
+    while read_delimited_record(
+        &mut reader,
+        b'\n',
+        MAX_TREE_RECORD_BYTES,
+        "inventory fetched objects",
+        "reachable object inventory ended inside a record",
+        "reachable object inventory record length overflow",
+        "reachable object inventory record exceeds byte limit",
+    )?
+    .is_some()
+    {
+        count = count.checked_add(1).ok_or_else(|| GitCommandError {
+            operation: "inventory fetched objects",
+            message: "reachable object count overflow".to_owned(),
+        })?;
+        if count > limit {
+            return Err(GitCommandError {
+                operation: "inventory fetched objects",
+                message: "reachable object count exceeds bound".to_owned(),
+            });
+        }
+    }
+    Ok(count)
+}
+
+fn immutable_edge_violation_from_reader(
+    mut reader: impl BufRead,
+) -> Result<Option<super::GitQuarantineReason>, GitCommandError> {
+    while let Some(status) = read_delimited_record(
+        &mut reader,
+        0,
+        MAX_TREE_RECORD_BYTES,
+        "validate immutable history edge",
+        "immutable edge diff ended inside a status",
+        "immutable edge diff status length overflow",
+        "immutable edge diff status exceeds byte limit",
+    )? {
+        read_delimited_record(
+            &mut reader,
+            0,
+            MAX_TREE_RECORD_BYTES,
+            "validate immutable history edge",
+            "immutable edge diff ended inside a path",
+            "immutable edge diff path length overflow",
+            "immutable edge diff path exceeds byte limit",
+        )?
+        .ok_or_else(|| GitCommandError {
+            operation: "validate immutable history edge",
+            message: "immutable edge diff ended before a path".to_owned(),
+        })?;
+        if status.first() == Some(&b'D') {
+            return Ok(Some(super::GitQuarantineReason::Deletion));
+        }
+        if status.first() == Some(&b'M') {
+            return Ok(Some(super::GitQuarantineReason::Modification));
+        }
+    }
+    Ok(None)
 }
 
 fn read_nul_record(
@@ -3111,7 +3147,8 @@ fn tree_files(
 mod tests {
     use super::{
         CatFileBatch, TreeDiffCursor, TreeListingCursor, audit_repository_metadata,
-        clear_cat_file_response_send_hook, install_cat_file_response_send_hook,
+        clear_cat_file_response_send_hook, count_reachable_inventory,
+        immutable_edge_violation_from_reader, install_cat_file_response_send_hook,
         read_cat_file_response, run_bounded_command, run_bounded_command_to_file,
         stream_tree_listing,
     };
@@ -3164,6 +3201,31 @@ mod tests {
         assert_eq!(second.blob.as_hex(), oid_b);
         assert_eq!(second.class, crate::PathClass::LegacyEvent);
         assert!(cursor.next_entry().expect("end").is_none());
+    }
+
+    #[test]
+    fn tree_listing_entry_budget_counts_canonical_parents() {
+        let oid = "1111111111111111111111111111111111111111";
+        let first = "journal/records/example.notes/123e4567-e89b-42d3-a456-426614174000/01913f1d-8e2a-7c30-8f4a-426614174001.json";
+        let second = "journal/records/example.notes/123e4567-e89b-42d3-a456-426614174000/01913f1d-8e2a-7c30-8f4a-426614174002.json";
+        let listing = format!(
+            "100644 blob {oid}\t{first}\0\
+             100644 blob {oid}\t{second}\0"
+        );
+        let mut cursor = TreeListingCursor::new(
+            BufReader::new(Cursor::new(listing.into_bytes())),
+            crate::GitObjectFormat::Sha1,
+        );
+        // The first path contributes the file and its three non-root canonical parents;
+        // the second path contributes one more file.
+        cursor.entry_budget = crate::store::CanonicalEntryBudget::with_entries(
+            crate::store::MAX_CANONICAL_ENTRIES - 4,
+        );
+        assert!(cursor.next_entry().expect("exact-limit entry").is_some());
+        let Err(error) = cursor.next_entry() else {
+            panic!("limit plus one canonical entry must fail");
+        };
+        assert!(error.to_string().contains("entry-count limit"));
     }
 
     #[test]
@@ -3239,6 +3301,52 @@ mod tests {
         );
         assert!(cursor.next_addition().expect("first").is_some());
         assert!(cursor.next_addition().is_err());
+    }
+
+    #[test]
+    fn reachable_object_inventory_counts_across_read_boundaries_and_rejects_limit_plus_one() {
+        let inventory = b"1111111111111111111111111111111111111111 first/path\n2222222222222222222222222222222222222222\n".to_vec();
+        let reader = BufReader::with_capacity(
+            2,
+            ChunkedReader {
+                inner: Cursor::new(inventory.clone()),
+                max_chunk: 3,
+            },
+        );
+        assert_eq!(
+            count_reachable_inventory(reader, 2).expect("exact limit"),
+            2
+        );
+        let reader = BufReader::with_capacity(
+            2,
+            ChunkedReader {
+                inner: Cursor::new(inventory),
+                max_chunk: 3,
+            },
+        );
+        let error = count_reachable_inventory(reader, 1).expect_err("limit plus one");
+        assert!(error.to_string().contains("object count exceeds bound"));
+    }
+
+    #[test]
+    fn immutable_edge_stream_rejects_delete_and_modify_without_collecting_output() {
+        for (status, expected) in [
+            ("D", super::super::GitQuarantineReason::Deletion),
+            ("M", super::super::GitQuarantineReason::Modification),
+        ] {
+            let output = format!("A\0first/path\0{status}\0second/path\0").into_bytes();
+            let reader = BufReader::with_capacity(
+                2,
+                ChunkedReader {
+                    inner: Cursor::new(output),
+                    max_chunk: 3,
+                },
+            );
+            assert_eq!(
+                immutable_edge_violation_from_reader(reader).expect("parse diff"),
+                Some(expected)
+            );
+        }
     }
 
     #[test]
