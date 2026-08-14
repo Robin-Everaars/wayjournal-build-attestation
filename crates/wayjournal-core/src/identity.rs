@@ -293,6 +293,61 @@ pub fn validate_store_identity(
     }))
 }
 
+/// Derives the same identity after bounded replay has already established complete manifest
+/// ownership and member validity. Only the unique genesis payload and first-manifest metadata are
+/// retained; all full-domain joins remain on descriptor-confined external facts.
+pub(crate) fn validate_replayed_identity(
+    manifests: usize,
+    members: usize,
+    first_batch: Option<(crate::BatchId, usize, Option<crate::RecordId>)>,
+    unsupported_identity_schema: bool,
+    genesis_count: usize,
+    genesis: Option<(&[u8], &[u8], &crate::Record)>,
+) -> Result<Option<StoreIdentity>, GenesisError> {
+    if manifests == 0 && members == 0 {
+        return Ok(None);
+    }
+    if unsupported_identity_schema {
+        return Err(GenesisError::InvalidRecord(
+            "unsupported record in reserved identity domain".to_owned(),
+        ));
+    }
+    if genesis_count == 0 {
+        return Err(GenesisError::MissingGenesis);
+    }
+    if genesis_count != 1 {
+        return Err(GenesisError::DuplicateGenesis);
+    }
+    let (path, bytes, record) = genesis.ok_or(GenesisError::MissingGenesis)?;
+    let Some((first_batch_id, first_member_count, first_member_id)) = first_batch else {
+        return Err(GenesisError::MissingGenesis);
+    };
+    if record.batch_id != first_batch_id
+        || first_member_count != 1
+        || first_member_id != Some(record.record_id)
+    {
+        return Err(GenesisError::GenesisNotFirst);
+    }
+    let payload: GenesisPayload = serde_json::from_value(record.payload.clone())
+        .map_err(|error| GenesisError::InvalidRecord(error.to_string()))?;
+    if record.entity_id.as_uuid() != payload.store_uuid.as_uuid() {
+        return Err(GenesisError::EntityMismatch);
+    }
+    if payload
+        .forked_from
+        .as_ref()
+        .is_some_and(|fork| fork.parent.store_uuid == payload.store_uuid)
+    {
+        return Err(GenesisError::ForkReusesParentUuid);
+    }
+    Ok(Some(StoreIdentity {
+        logical_id: LogicalStoreId::new(payload.store_uuid, genesis_fingerprint(path, bytes)),
+        store_kind: payload.store_kind,
+        forked_from: payload.forked_from,
+        genesis_record_id: record.record_id,
+    }))
+}
+
 #[cfg(test)]
 mod branch_tests {
     use super::*;

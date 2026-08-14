@@ -17,12 +17,10 @@ use rustix::process::{Pid, Signal, kill_process_group};
 use thiserror::Error;
 
 use crate::{
-    LegacyEntry, LegacyEntrySource, LegacyStreamRequirement, MAX_BATCH_BYTES, MAX_RECORD_BYTES,
-    PathClass, Store, classify_path,
-    revision::CanonicalRevisionAccumulator,
+    MAX_BATCH_BYTES, MAX_RECORD_BYTES, PathClass, Store, classify_path,
     store::{
-        Directory, MAX_CANONICAL_ENTRIES, MAX_TOTAL_CANONICAL_BYTES, RawFile,
-        scan_after_streaming_legacy, scan_collected,
+        Directory, MAX_CANONICAL_ENTRIES, MAX_TOTAL_CANONICAL_BYTES, RawFile, scan_collected,
+        streaming::{ValidatedStoreState, replay_builder, validate_bounded_replay},
     },
 };
 
@@ -854,7 +852,7 @@ impl SyncRepository {
         store: &Store,
         runner: &GitRunner<'_>,
         oid: &GitOid,
-    ) -> Result<crate::StoreSnapshot, super::GitAdmissionError> {
+    ) -> Result<ValidatedStoreState, super::GitAdmissionError> {
         tree_snapshot_streaming(store, runner, &self.bare, self.format, oid)
     }
 
@@ -1874,7 +1872,7 @@ pub(super) fn local_tree_snapshot_streaming(
     runner: &GitRunner<'_>,
     repository: &LocalRepository,
     oid: &GitOid,
-) -> Result<crate::StoreSnapshot, super::GitAdmissionError> {
+) -> Result<ValidatedStoreState, super::GitAdmissionError> {
     tree_snapshot_streaming(store, runner, &repository.git_dir, repository.format, oid)
 }
 
@@ -1904,7 +1902,7 @@ fn tree_snapshot_streaming(
     git_dir: &Directory,
     format: GitObjectFormat,
     oid: &GitOid,
-) -> Result<crate::StoreSnapshot, super::GitAdmissionError> {
+) -> Result<ValidatedStoreState, super::GitAdmissionError> {
     let source = tree_file_source(runner, git_dir, format, oid)?;
     scan_streamed_tree(store, source)
 }
@@ -1956,71 +1954,14 @@ fn tree_file_source(
 fn scan_streamed_tree(
     store: &Store,
     mut tree: TreeFileSource,
-) -> Result<crate::StoreSnapshot, super::GitAdmissionError> {
-    let mut revision = CanonicalRevisionAccumulator::new();
-    let mut legacy = TreeLegacySource {
-        tree: &mut tree,
-        revision: &mut revision,
-        current: None,
-        first_journal: None,
-        source_error: None,
-        reached_journal: false,
-    };
-    let validation =
-        store.validate_legacy_stream(LegacyStreamRequirement::FullDomainBounded, &mut legacy);
-    if let Some(error) = legacy.source_error.take() {
-        return Err(error);
-    }
-    let mut unconsumed = false;
-    loop {
-        match legacy.next_entry() {
-            Ok(Some(_)) => unconsumed = true,
-            Ok(None) => break,
-            Err(_) => {
-                if let Some(error) = legacy.source_error.take() {
-                    return Err(error);
-                }
-                return Err(crate::StoreError::Corrupt {
-                    issue: crate::StoreCorruption::InvalidLegacy {
-                        message: "legacy source failed while checking exhaustion".to_owned(),
-                    },
-                }
-                .into());
-            }
-        }
-    }
-    if validation.is_ok() && unconsumed {
-        return Err(crate::StoreError::Corrupt {
-            issue: crate::StoreCorruption::InvalidLegacy {
-                message: "bounded legacy adapter did not consume every legacy entry".to_owned(),
-            },
-        }
-        .into());
-    }
-    validation?;
-    let first_journal = legacy.first_journal.take();
-    drop(legacy);
-    let mut journal_files = Vec::new();
-    if let Some(file) = first_journal {
-        journal_files.push(file);
-    }
+) -> Result<ValidatedStoreState, super::GitAdmissionError> {
+    let mut replay = replay_builder(store)?;
     while let Some(file) = tree.next_file()? {
-        if !matches!(
-            classify_path(&file.path),
-            PathClass::JournalRecord | PathClass::JournalBatch
-        ) {
-            return Err(super::GitAdmissionError::InvalidTreeEntry);
-        }
-        revision
-            .push(&file.path, &file.bytes)
-            .map_err(|error| GitCommandError {
-                operation: "compute streamed tree revision",
-                message: error.to_string(),
-            })?;
-        journal_files.push(file);
+        replay.push(file)?;
     }
     tree.finish()?;
-    scan_after_streaming_legacy(store, &journal_files, revision.finish()).map_err(Into::into)
+    let replay = replay.finish()?;
+    validate_bounded_replay(store, &replay).map_err(Into::into)
 }
 
 struct TreeListingEntry {
@@ -2304,61 +2245,6 @@ impl TreeFileSource {
 
     fn finish(self) -> Result<(), GitCommandError> {
         self.blobs.finish()
-    }
-}
-
-struct TreeLegacySource<'a> {
-    tree: &'a mut TreeFileSource,
-    revision: &'a mut CanonicalRevisionAccumulator,
-    current: Option<RawFile>,
-    first_journal: Option<RawFile>,
-    source_error: Option<super::GitAdmissionError>,
-    reached_journal: bool,
-}
-
-impl LegacyEntrySource for TreeLegacySource<'_> {
-    fn next_entry(&mut self) -> Result<Option<LegacyEntry<'_>>, String> {
-        if self.reached_journal {
-            return Ok(None);
-        }
-        self.current = None;
-        let file = match self.tree.next_file() {
-            Ok(Some(file)) => file,
-            Ok(None) => {
-                self.reached_journal = true;
-                return Ok(None);
-            }
-            Err(error) => {
-                self.source_error = Some(error);
-                return Err("canonical Git tree source failed".to_owned());
-            }
-        };
-        if let Err(error) = self.revision.push(&file.path, &file.bytes) {
-            self.source_error = Some(
-                GitCommandError {
-                    operation: "compute streamed tree revision",
-                    message: error.to_string(),
-                }
-                .into(),
-            );
-            return Err("canonical Git tree revision failed".to_owned());
-        }
-        match classify_path(&file.path) {
-            class @ (PathClass::LegacyEvent | PathClass::LegacyBatch) => {
-                self.current = Some(file);
-                let current = self.current.as_ref().expect("current legacy entry");
-                Ok(Some(LegacyEntry::new(&current.path, &current.bytes, class)))
-            }
-            PathClass::JournalRecord | PathClass::JournalBatch => {
-                self.first_journal = Some(file);
-                self.reached_journal = true;
-                Ok(None)
-            }
-            PathClass::NonCanonical | PathClass::InvalidReserved => {
-                self.source_error = Some(super::GitAdmissionError::NonCanonicalTrackedPath);
-                Err("canonical Git tree path classification failed".to_owned())
-            }
-        }
     }
 }
 

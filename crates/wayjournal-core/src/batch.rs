@@ -35,6 +35,10 @@ impl RecordRef {
         self.record_id
     }
     #[must_use]
+    pub(crate) const fn record_schema(&self) -> &RecordSchemaId {
+        &self.record_schema
+    }
+    #[must_use]
     pub const fn content_digest(&self) -> Digest {
         self.content_digest
     }
@@ -285,8 +289,28 @@ struct RawManifest {
     schema: String,
 }
 
-fn content_digest(bytes: &[u8]) -> Digest {
+pub(crate) fn content_digest(bytes: &[u8]) -> Digest {
     hash_bytes(CONTENT_DIGEST_DOMAIN, bytes)
+}
+
+/// Incremental form of the canonical batch request digest used by bounded store replay.
+pub(crate) struct RequestDigestAccumulator(blake3::Hasher);
+
+impl RequestDigestAccumulator {
+    pub(crate) fn new() -> Self {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(REQUEST_DIGEST_DOMAIN);
+        Self(hasher)
+    }
+
+    pub(crate) fn push(&mut self, path: &[u8], bytes: &[u8]) {
+        crate::hash::update_frame(&mut self.0, path);
+        crate::hash::update_frame(&mut self.0, bytes);
+    }
+
+    pub(crate) fn finish(self) -> Digest {
+        Digest::from_hash(self.0.finalize())
+    }
 }
 
 fn idempotency_digest(actor: &ActorId, key: &str) -> Digest {

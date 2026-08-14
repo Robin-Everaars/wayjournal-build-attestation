@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
@@ -131,6 +131,43 @@ impl CausalNode for DomainOperation {
 
     fn parents(&self) -> &[RecordId] {
         &self.parents
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct DomainOperationHeader {
+    source: usize,
+    record_id: RecordId,
+    entity_id: EntityId,
+    parents: Vec<RecordId>,
+    domain: DomainId,
+    target: Option<LogicalStoreId>,
+}
+
+impl CausalNode for DomainOperationHeader {
+    fn record_id(&self) -> RecordId {
+        self.record_id
+    }
+
+    fn parents(&self) -> &[RecordId] {
+        &self.parents
+    }
+}
+
+impl DomainOperation {
+    pub(crate) fn target(&self) -> Option<&LogicalStoreId> {
+        self.target.as_ref()
+    }
+
+    pub(crate) fn into_header(self, source: usize) -> DomainOperationHeader {
+        DomainOperationHeader {
+            source,
+            record_id: self.record_id,
+            entity_id: self.entity_id,
+            parents: self.parents,
+            domain: self.domain,
+            target: self.target,
+        }
     }
 }
 
@@ -709,7 +746,154 @@ struct FoldState {
     adds: BTreeMap<(SetField, String), BTreeMap<RecordId, SetValue>>,
 }
 
-#[allow(clippy::too_many_lines)]
+trait FoldAccumulator {
+    fn register_ids(&self, field: ScalarField) -> Vec<RecordId>;
+    fn remove_register(&mut self, field: ScalarField, record_id: RecordId);
+    fn insert_register(&mut self, field: ScalarField, record_id: RecordId, value: &ScalarValue);
+    fn add_ids(&self, field: SetField, key: &str) -> Vec<RecordId>;
+    fn remove_add(&mut self, field: SetField, key: &str, record_id: RecordId);
+    fn insert_add(&mut self, field: SetField, key: &str, record_id: RecordId, value: &SetValue);
+}
+
+impl FoldAccumulator for FoldState {
+    fn register_ids(&self, field: ScalarField) -> Vec<RecordId> {
+        self.registers
+            .get(&field)
+            .into_iter()
+            .flat_map(BTreeMap::keys)
+            .copied()
+            .collect()
+    }
+
+    fn remove_register(&mut self, field: ScalarField, record_id: RecordId) {
+        if let Some(active) = self.registers.get_mut(&field) {
+            active.remove(&record_id);
+        }
+    }
+
+    fn insert_register(&mut self, field: ScalarField, record_id: RecordId, value: &ScalarValue) {
+        self.registers
+            .entry(field)
+            .or_default()
+            .insert(record_id, value.clone());
+    }
+
+    fn add_ids(&self, field: SetField, key: &str) -> Vec<RecordId> {
+        self.adds
+            .get(&(field, key.to_owned()))
+            .into_iter()
+            .flat_map(BTreeMap::keys)
+            .copied()
+            .collect()
+    }
+
+    fn remove_add(&mut self, field: SetField, key: &str, record_id: RecordId) {
+        if let Some(active) = self.adds.get_mut(&(field, key.to_owned())) {
+            active.remove(&record_id);
+        }
+    }
+
+    fn insert_add(&mut self, field: SetField, key: &str, record_id: RecordId, value: &SetValue) {
+        self.adds
+            .entry((field, key.to_owned()))
+            .or_default()
+            .insert(record_id, value.clone());
+    }
+}
+
+fn apply_operation<T: CausalNode, S: FoldAccumulator>(
+    graph: &CausalGraph<'_, T>,
+    operation: &DomainOperation,
+    state: &mut S,
+    reachability_budget: &mut usize,
+    reachability_exceeded: &mut bool,
+) -> Result<(), FoldError> {
+    let record_id = operation.record_id;
+    match &operation.kind {
+        OperationKind::ScalarSet { field, value } => {
+            let observed = state
+                .register_ids(*field)
+                .into_iter()
+                .filter(|candidate| {
+                    graph.observes_bounded(
+                        record_id,
+                        *candidate,
+                        reachability_budget,
+                        reachability_exceeded,
+                    )
+                })
+                .collect::<Vec<_>>();
+            ensure_reachability_budget(*reachability_exceeded)?;
+            for candidate in observed {
+                state.remove_register(*field, candidate);
+            }
+            state.insert_register(*field, record_id, value);
+        }
+        OperationKind::ScalarResolve {
+            field,
+            value,
+            candidates,
+        } => {
+            let observed = state
+                .register_ids(*field)
+                .into_iter()
+                .filter(|candidate| {
+                    graph.observes_bounded(
+                        record_id,
+                        *candidate,
+                        reachability_budget,
+                        reachability_exceeded,
+                    )
+                })
+                .collect::<Vec<_>>();
+            ensure_reachability_budget(*reachability_exceeded)?;
+            if &observed != candidates {
+                return Err(FoldError::InvalidResolution { record_id });
+            }
+            for candidate in candidates {
+                state.remove_register(*field, *candidate);
+            }
+            state.insert_register(*field, record_id, value);
+        }
+        OperationKind::Add { field, key, value } => {
+            state.insert_add(*field, key, record_id, value);
+        }
+        OperationKind::Remove { field, key, adds } => {
+            let observed = state
+                .add_ids(*field, key)
+                .into_iter()
+                .filter(|candidate| {
+                    graph.observes_bounded(
+                        record_id,
+                        *candidate,
+                        reachability_budget,
+                        reachability_exceeded,
+                    )
+                })
+                .collect::<Vec<_>>();
+            ensure_reachability_budget(*reachability_exceeded)?;
+            if &observed != adds {
+                return Err(FoldError::InvalidObservedRemove { record_id });
+            }
+            for add in adds {
+                state.remove_add(*field, key, *add);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn ensure_reachability_budget(exceeded: bool) -> Result<(), FoldError> {
+    if exceeded {
+        Err(CausalError::ReachabilityBudget {
+            maximum: crate::MAX_REACHABILITY_STEPS,
+        }
+        .into())
+    } else {
+        Ok(())
+    }
+}
+
 fn fold(operations: &[DomainOperation], expected_domain: &str) -> Result<FoldState, FoldError> {
     let graph = CausalGraph::new(operations)?;
     let entity = operations.first().map(|op| op.entity_id);
@@ -723,98 +907,125 @@ fn fold(operations: &[DomainOperation], expected_domain: &str) -> Result<FoldSta
     let mut reachability_budget = crate::MAX_REACHABILITY_STEPS;
     let mut reachability_exceeded = false;
     for operation in graph.ordered() {
-        match &operation.kind {
-            OperationKind::ScalarSet { field, value } => {
-                let active = state.registers.entry(*field).or_default();
-                active.retain(|candidate, _| {
-                    !graph.observes_bounded(
-                        operation.record_id,
-                        *candidate,
-                        &mut reachability_budget,
-                        &mut reachability_exceeded,
-                    )
-                });
-                if reachability_exceeded {
-                    return Err(CausalError::ReachabilityBudget {
-                        maximum: crate::MAX_REACHABILITY_STEPS,
-                    }
-                    .into());
-                }
-                active.insert(operation.record_id, value.clone());
-            }
-            OperationKind::ScalarResolve {
-                field,
-                value,
-                candidates,
-            } => {
-                let active = state.registers.entry(*field).or_default();
-                let observed = active
-                    .keys()
-                    .filter(|candidate| {
-                        graph.observes_bounded(
-                            operation.record_id,
-                            **candidate,
-                            &mut reachability_budget,
-                            &mut reachability_exceeded,
-                        )
-                    })
-                    .copied()
-                    .collect::<Vec<_>>();
-                if reachability_exceeded {
-                    return Err(CausalError::ReachabilityBudget {
-                        maximum: crate::MAX_REACHABILITY_STEPS,
-                    }
-                    .into());
-                }
-                if &observed != candidates {
-                    return Err(FoldError::InvalidResolution {
-                        record_id: operation.record_id,
-                    });
-                }
-                for candidate in candidates {
-                    active.remove(candidate);
-                }
-                active.insert(operation.record_id, value.clone());
-            }
-            OperationKind::Add { field, key, value } => {
-                state
-                    .adds
-                    .entry((*field, key.clone()))
-                    .or_default()
-                    .insert(operation.record_id, value.clone());
-            }
-            OperationKind::Remove { field, key, adds } => {
-                let active = state.adds.entry((*field, key.clone())).or_default();
-                let observed = active
-                    .keys()
-                    .filter(|candidate| {
-                        graph.observes_bounded(
-                            operation.record_id,
-                            **candidate,
-                            &mut reachability_budget,
-                            &mut reachability_exceeded,
-                        )
-                    })
-                    .copied()
-                    .collect::<Vec<_>>();
-                if reachability_exceeded {
-                    return Err(CausalError::ReachabilityBudget {
-                        maximum: crate::MAX_REACHABILITY_STEPS,
-                    }
-                    .into());
-                }
-                if &observed != adds {
-                    return Err(FoldError::InvalidObservedRemove {
-                        record_id: operation.record_id,
-                    });
-                }
-                for add in adds {
-                    active.remove(add);
-                }
-            }
-        }
+        apply_operation(
+            &graph,
+            operation,
+            &mut state,
+            &mut reachability_budget,
+            &mut reachability_exceeded,
+        )?;
     }
     Ok(state)
+}
+
+#[derive(Default)]
+struct ValidationFoldState {
+    registers: BTreeMap<ScalarField, BTreeSet<RecordId>>,
+    adds: BTreeMap<(SetField, String), BTreeSet<RecordId>>,
+}
+
+impl FoldAccumulator for ValidationFoldState {
+    fn register_ids(&self, field: ScalarField) -> Vec<RecordId> {
+        self.registers
+            .get(&field)
+            .into_iter()
+            .flat_map(BTreeSet::iter)
+            .copied()
+            .collect()
+    }
+
+    fn remove_register(&mut self, field: ScalarField, record_id: RecordId) {
+        if let Some(active) = self.registers.get_mut(&field) {
+            active.remove(&record_id);
+        }
+    }
+
+    fn insert_register(&mut self, field: ScalarField, record_id: RecordId, _: &ScalarValue) {
+        self.registers.entry(field).or_default().insert(record_id);
+    }
+
+    fn add_ids(&self, field: SetField, key: &str) -> Vec<RecordId> {
+        self.adds
+            .get(&(field, key.to_owned()))
+            .into_iter()
+            .flat_map(BTreeSet::iter)
+            .copied()
+            .collect()
+    }
+
+    fn remove_add(&mut self, field: SetField, key: &str, record_id: RecordId) {
+        if let Some(active) = self.adds.get_mut(&(field, key.to_owned())) {
+            active.remove(&record_id);
+        }
+    }
+
+    fn insert_add(&mut self, field: SetField, key: &str, record_id: RecordId, _: &SetValue) {
+        self.adds
+            .entry((field, key.to_owned()))
+            .or_default()
+            .insert(record_id);
+    }
+}
+
+pub(crate) enum FoldLoadError<E> {
+    Fold(FoldError),
+    Load(E),
+}
+
+/// Validates a built-in fold while loading only the current operation's payload.
+///
+/// The compact headers retain the complete causal graph, while scalar/set values and
+/// resolution/remove reference vectors can be discarded after each state transition.
+pub(crate) fn validate_loaded_builtin_fold<E>(
+    operations: &[DomainOperationHeader],
+    mut load: impl FnMut(usize) -> Result<DomainOperation, E>,
+) -> Result<(), FoldLoadError<E>> {
+    let Some(first) = operations.first() else {
+        return Ok(());
+    };
+    let expected_domain = first.domain.to_string();
+    if expected_domain == "wayjournal.catalog" {
+        let expected = first
+            .target
+            .clone()
+            .ok_or_else(|| FoldLoadError::Fold(FoldError::WrongEntity))?;
+        if let Some(actual) = operations
+            .iter()
+            .filter_map(|operation| operation.target.as_ref())
+            .find(|actual| **actual != expected)
+        {
+            return Err(FoldLoadError::Fold(FoldError::WrongTarget {
+                expected,
+                actual: actual.clone(),
+            }));
+        }
+    }
+
+    let graph = CausalGraph::new(operations)
+        .map_err(FoldError::from)
+        .map_err(FoldLoadError::Fold)?;
+    let entity = operations.first().map(|operation| operation.entity_id);
+    if operations.iter().any(|operation| {
+        operation.domain.as_str() != expected_domain || Some(operation.entity_id) != entity
+    }) {
+        return Err(FoldLoadError::Fold(FoldError::WrongEntity));
+    }
+
+    let mut state = ValidationFoldState::default();
+    let mut reachability_budget = crate::MAX_REACHABILITY_STEPS;
+    let mut reachability_exceeded = false;
+    for header in graph.ordered() {
+        let operation = load(header.source).map_err(FoldLoadError::Load)?;
+        apply_operation(
+            &graph,
+            &operation,
+            &mut state,
+            &mut reachability_budget,
+            &mut reachability_exceeded,
+        )
+        .map_err(FoldLoadError::Fold)?;
+    }
+    Ok(())
 }
 
 fn register<T: Ord>(

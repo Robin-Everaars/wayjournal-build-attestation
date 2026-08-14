@@ -11,10 +11,11 @@ use std::{
 
 use serde_json::json;
 use wayjournal_core::{
-    ActorId, ApprovedRef, ApprovedRemote, ApprovedRemoteLocator, GitQuarantineReason, GitSyncError,
-    GitSyncOutcome, GitSyncRequest, LegacyEntry, LegacyEntrySource, LegacyStoreAdapter,
-    LegacyStreamRequirement, LegacyStreamingError, LocalTrustBinding, Record, Store, prepare_batch,
-    wayjournal_domain_registry,
+    ActorId, ApprovedRef, ApprovedRemote, ApprovedRemoteLocator, DomainRegistration,
+    DomainRegistry, GitQuarantineReason, GitSyncError, GitSyncOutcome, GitSyncRequest, KindId,
+    LegacyEntry, LegacyEntrySource, LegacyStoreAdapter, LegacyStreamRequirement,
+    LegacyStreamingError, LocalTrustBinding, Record, Store, prepare_batch,
+    wayjournal_domain_registry, wayjournal_domain_registry_with,
 };
 
 use support::BoundedNoLegacy as NoLegacy;
@@ -160,6 +161,43 @@ fn genesis() -> Record {
     }
 }
 
+fn validate_bulk(kind: &KindId, payload: &serde_json::Value) -> Result<(), String> {
+    if kind.as_str() != "bulk.write"
+        || payload
+            .as_object()
+            .and_then(|value| value.get("blob"))
+            .and_then(serde_json::Value::as_str)
+            .is_none()
+        || payload.as_object().is_none_or(|value| value.len() != 1)
+    {
+        return Err("bulk payload must contain only a blob string".to_owned());
+    }
+    Ok(())
+}
+static BULK_KINDS: &[&str] = &["bulk.write"];
+static BULK_REGISTRATION: &[DomainRegistration] = &[DomainRegistration::new(
+    "example.bulk",
+    "example.bulk/v1",
+    BULK_KINDS,
+    validate_bulk,
+)];
+
+fn bulk_record(record: &str, batch: &str, entity: &str, blob_bytes: usize) -> Record {
+    Record {
+        record_schema: "example.bulk/v1".parse().expect("schema"),
+        domain: "example.bulk".parse().expect("domain"),
+        kind: "bulk.write".parse().expect("kind"),
+        record_id: record.parse().expect("record"),
+        entity_id: entity.parse().expect("entity"),
+        batch_id: batch.parse().expect("batch"),
+        actor: ActorId::parse("system:bulk-gate").expect("actor"),
+        occurred_at: "2026-08-12T13:01:00Z".parse().expect("time"),
+        recorded_at: "2026-08-12T13:02:00Z".parse().expect("time"),
+        parents: Vec::new(),
+        payload: json!({"blob":"x".repeat(blob_bytes)}),
+    }
+}
+
 fn profile(record: &str, batch: &str, value: &str, second: u8) -> Record {
     Record {
         record_schema: "wayjournal.profile/v1".parse().expect("schema"),
@@ -194,6 +232,18 @@ fn fixture(label: &str) -> Fixture {
 }
 
 fn fixture_with_legacy(label: &str, legacy: Arc<dyn LegacyStoreAdapter>) -> Fixture {
+    fixture_with_registry(
+        label,
+        wayjournal_domain_registry().expect("registry"),
+        legacy,
+    )
+}
+
+fn fixture_with_registry(
+    label: &str,
+    registry: DomainRegistry,
+    legacy: Arc<dyn LegacyStoreAdapter>,
+) -> Fixture {
     let root = TestDir::new(label);
     let remote = root.0.join("remote.git");
     run(
@@ -202,7 +252,6 @@ fn fixture_with_legacy(label: &str, legacy: Arc<dyn LegacyStoreAdapter>) -> Fixt
     );
     let local = root.0.join("local");
     fs::create_dir(&local).expect("local");
-    let registry = wayjournal_domain_registry().expect("registry");
     let store = Store::open(&local, registry, legacy).expect("store");
     let batch = prepare_batch(&[genesis()], "genesis", &registry).expect("batch");
     store
@@ -613,9 +662,336 @@ fn two_offline_clones_converge_by_set_and_revision() {
     );
 }
 
+fn process_high_water_bytes() -> u64 {
+    let status = fs::read_to_string("/proc/self/status").expect("procfs status");
+    status
+        .lines()
+        .find(|line| line.starts_with("VmHWM:"))
+        .and_then(|line| line.split_ascii_whitespace().nth(1))
+        .expect("VmHWM value")
+        .parse::<u64>()
+        .expect("VmHWM integer")
+        * 1024
+}
+
+fn write_prepared(root: &Path, prepared: &wayjournal_core::PreparedBatch) {
+    for record in prepared.records() {
+        let path = root.join(record.path());
+        fs::create_dir_all(path.parent().expect("record parent")).expect("record directory");
+        fs::write(path, record.bytes()).expect("record bytes");
+    }
+    fs::write(
+        root.join(prepared.manifest_path()),
+        prepared.manifest_bytes(),
+    )
+    .expect("manifest bytes");
+}
+
+#[test]
+fn journal_heavy_semantic_replay_stays_bounded() {
+    const RECORDS: usize = 512;
+    let fixture = fixture("journal-heavy-memory");
+    let clone = fixture.root.0.join("journal-heavy-clone");
+    run(
+        &fixture.root.0,
+        &[
+            "clone",
+            fixture.remote.to_str().expect("remote"),
+            clone.to_str().expect("clone"),
+        ],
+    );
+    configure(&clone);
+    let registry = wayjournal_domain_registry().expect("registry");
+    for ordinal in 0..RECORDS {
+        let record_id = format!(
+            "01913f1d-8e2a-7c30-8f4a-{:012x}",
+            0x5266_1417_4100 + ordinal * 3
+        );
+        let batch_id = format!(
+            "01913f1d-8e2a-7c30-8f4a-{:012x}",
+            0x5266_1417_4101 + ordinal * 3
+        );
+        let entity_id = format!(
+            "01913f1d-8e2a-7c30-8f4a-{:012x}",
+            0x5266_1417_4102 + ordinal * 3
+        );
+        let mut record = profile(
+            &record_id,
+            &batch_id,
+            &format!("profile-{ordinal:04}"),
+            u8::try_from(ordinal % 60).expect("second"),
+        );
+        record.entity_id = entity_id.parse().expect("entity");
+        let prepared = prepare_batch(&[record], &format!("journal-heavy-{ordinal}"), &registry)
+            .expect("journal-heavy batch");
+        write_prepared(&clone, &prepared);
+    }
+    run(&clone, &["add", "journal"]);
+    run(&clone, &["commit", "-m", "journal-heavy tip"]);
+    run(&clone, &["push", "origin", "HEAD:refs/heads/main"]);
+    let before = process_high_water_bytes();
+    assert!(matches!(
+        fixture
+            .store
+            .sync_git_union(&fixture.request)
+            .expect("sync"),
+        GitSyncOutcome::Advanced { .. }
+    ));
+    let growth = process_high_water_bytes().saturating_sub(before);
+    eprintln!("journal-heavy semantic replay VmHWM growth: {growth} bytes");
+    assert!(
+        growth < 256 * 1024 * 1024,
+        "journal-heavy replay retained {growth} bytes"
+    );
+}
+
 #[test]
 #[allow(clippy::too_many_lines)]
-#[ignore = "explicit exact-1-GiB Git-tip bounded-memory gate"]
+#[ignore = "exact-4096-operation valid built-in fold memory gate"]
+fn exact_large_builtin_fold_sync_stays_below_256_mib() {
+    const OPERATIONS: usize = wayjournal_core::MAX_CAUSAL_OPERATIONS;
+    const RECORDS_PER_BATCH: usize = 64;
+    const PREVIOUS_WORKING_SET_CAP: usize = 32 * 1024 * 1024;
+    let fixture = fixture("exact-large-built-in-fold");
+    let clone = fixture.root.0.join("exact-large-built-in-fold-clone");
+    run(
+        &fixture.root.0,
+        &[
+            "clone",
+            fixture.remote.to_str().expect("remote"),
+            clone.to_str().expect("clone"),
+        ],
+    );
+    configure(&clone);
+    let registry = wayjournal_domain_registry().expect("registry");
+    let entity = "01913f1d-8e2a-7c30-8f4a-426614176000"
+        .parse()
+        .expect("entity");
+    let value = "\u{10ffff}".repeat(2048);
+    let mut encoded_group_bytes = 0_usize;
+    for batch_start in (0..OPERATIONS).step_by(RECORDS_PER_BATCH) {
+        let batch_id = format!("01913f1d-8e2a-7c30-8f4a-426615{batch_start:06x}");
+        let records = (batch_start..batch_start + RECORDS_PER_BATCH)
+            .map(|ordinal| Record {
+                record_schema: "wayjournal.profile/v1".parse().expect("schema"),
+                domain: "wayjournal.profile".parse().expect("domain"),
+                kind: "profile.description.set".parse().expect("kind"),
+                record_id: format!("01913f1d-8e2a-7c30-8f4a-42661419{ordinal:04x}")
+                    .parse()
+                    .expect("record"),
+                entity_id: entity,
+                batch_id: batch_id.parse().expect("batch"),
+                actor: ActorId::parse("human:memory-gate").expect("actor"),
+                occurred_at: "2026-08-12T13:01:00Z".parse().expect("time"),
+                recorded_at: "2026-08-12T13:02:00Z".parse().expect("time"),
+                parents: Vec::new(),
+                payload: json!({"value": value}),
+            })
+            .collect::<Vec<_>>();
+        let prepared = prepare_batch(
+            &records,
+            &format!("exact-large-fold-{batch_start}"),
+            &registry,
+        )
+        .expect("large fold batch");
+        encoded_group_bytes += prepared
+            .records()
+            .iter()
+            .map(|record| record.bytes().len())
+            .sum::<usize>();
+        write_prepared(&clone, &prepared);
+    }
+    assert!(encoded_group_bytes > PREVIOUS_WORKING_SET_CAP);
+    run(&clone, &["add", "journal"]);
+    run(&clone, &["commit", "-m", "exact large built-in fold tip"]);
+    run(&clone, &["push", "origin", "HEAD:refs/heads/main"]);
+
+    let before = process_high_water_bytes();
+    let outcome = fixture
+        .store
+        .sync_git_union(&fixture.request)
+        .expect("sync");
+    let growth = process_high_water_bytes().saturating_sub(before);
+    let GitSyncOutcome::Advanced { revision, .. } = outcome else {
+        panic!("large valid fold did not advance")
+    };
+    eprintln!("exact large built-in fold VmHWM growth: {growth} bytes");
+    let reference = Store::open(&clone, registry, Arc::new(NoLegacy)).expect("reference store");
+    let reference_snapshot = reference.read().expect("collected reference");
+    assert_eq!(revision, reference_snapshot.revision());
+    assert_eq!(
+        fixture.store.read().expect("synced snapshot").identity(),
+        reference_snapshot.identity()
+    );
+    assert!(
+        growth < 256 * 1024 * 1024,
+        "exact large built-in fold retained {growth} bytes"
+    );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+#[ignore = "capacity-heavy hostile 4096-by-4096 same-entity fold memory gate"]
+fn hostile_same_entity_fold_rejection_stays_below_256_mib() {
+    const OPERATIONS: usize = wayjournal_core::MAX_CAUSAL_OPERATIONS;
+    const REFERENCES: usize = 4096;
+    const RECORDS_PER_BATCH: usize = 64;
+    let fixture = fixture("hostile-same-entity-memory");
+    let clone = fixture.root.0.join("hostile-same-entity-clone");
+    run(
+        &fixture.root.0,
+        &[
+            "clone",
+            fixture.remote.to_str().expect("remote"),
+            clone.to_str().expect("clone"),
+        ],
+    );
+    configure(&clone);
+    let registry = wayjournal_domain_registry().expect("registry");
+    let parents = (0..REFERENCES)
+        .map(|ordinal| {
+            format!("01913f1d-8e2a-7c30-8f4a-{ordinal:012x}")
+                .parse()
+                .expect("parent")
+        })
+        .collect::<Vec<_>>();
+    let entity = "01913f1d-8e2a-7c30-8f4a-426614176000"
+        .parse()
+        .expect("entity");
+    for batch_start in (0..OPERATIONS).step_by(RECORDS_PER_BATCH) {
+        let batch_id = format!(
+            "01913f1d-8e2a-7c30-8f4a-{:012x}",
+            0x7266_1417_4100 + batch_start
+        );
+        let records = (batch_start..batch_start + RECORDS_PER_BATCH)
+            .map(|ordinal| Record {
+                record_schema: "wayjournal.profile/v1".parse().expect("schema"),
+                domain: "wayjournal.profile".parse().expect("domain"),
+                kind: "profile.display_name.set".parse().expect("kind"),
+                record_id: format!(
+                    "01913f1d-8e2a-7c30-8f4a-{:012x}",
+                    0x7366_1417_4100 + ordinal
+                )
+                .parse()
+                .expect("record"),
+                entity_id: entity,
+                batch_id: batch_id.parse().expect("batch"),
+                actor: ActorId::parse("human:memory-gate").expect("actor"),
+                occurred_at: "2026-08-12T13:01:00Z".parse().expect("time"),
+                recorded_at: "2026-08-12T13:02:00Z".parse().expect("time"),
+                parents: parents.clone(),
+                payload: json!({"value":"hostile"}),
+            })
+            .collect::<Vec<_>>();
+        let prepared = prepare_batch(
+            &records,
+            &format!("hostile-same-entity-{batch_start}"),
+            &registry,
+        )
+        .expect("hostile batch");
+        write_prepared(&clone, &prepared);
+    }
+    assert!(canonical_payload_bytes(&clone) < 1024 * 1024 * 1024);
+    run(&clone, &["add", "journal"]);
+    run(&clone, &["commit", "-m", "hostile same-entity tip"]);
+    run(&clone, &["push", "origin", "HEAD:refs/heads/main"]);
+    let before = process_high_water_bytes();
+    assert!(matches!(
+        fixture
+            .store
+            .sync_git_union(&fixture.request)
+            .expect("typed rejection"),
+        GitSyncOutcome::Quarantined {
+            reason: GitQuarantineReason::InvalidCommitSnapshot,
+            ..
+        }
+    ));
+    let growth = process_high_water_bytes().saturating_sub(before);
+    eprintln!("hostile same-entity fold VmHWM growth: {growth} bytes");
+    assert!(
+        growth < 256 * 1024 * 1024,
+        "hostile same-entity replay retained {growth} bytes"
+    );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+#[ignore = "capacity-heavy 4096-by-4096 remove-reference fold memory gate"]
+fn hostile_same_entity_remove_references_stay_below_256_mib() {
+    const OPERATIONS: usize = wayjournal_core::MAX_CAUSAL_OPERATIONS;
+    const REFERENCES: usize = 4096;
+    const RECORDS_PER_BATCH: usize = 64;
+    let fixture = fixture("hostile-same-entity-remove-memory");
+    let clone = fixture.root.0.join("hostile-same-entity-remove-clone");
+    run(
+        &fixture.root.0,
+        &[
+            "clone",
+            fixture.remote.to_str().expect("remote"),
+            clone.to_str().expect("clone"),
+        ],
+    );
+    configure(&clone);
+    let registry = wayjournal_domain_registry().expect("registry");
+    let adds = (0..REFERENCES)
+        .map(|ordinal| format!("01913f1d-8e2a-7c30-8f4a-{ordinal:012x}"))
+        .collect::<Vec<_>>();
+    let entity = "01913f1d-8e2a-7c30-8f4a-426614176100"
+        .parse()
+        .expect("entity");
+    for batch_start in (0..OPERATIONS).step_by(RECORDS_PER_BATCH) {
+        let batch_id = format!("01913f1d-8e2a-7c30-8f4a-426616{batch_start:06x}");
+        let records = (batch_start..batch_start + RECORDS_PER_BATCH)
+            .map(|ordinal| Record {
+                record_schema: "wayjournal.profile/v1".parse().expect("schema"),
+                domain: "wayjournal.profile".parse().expect("domain"),
+                kind: "profile.alias.remove".parse().expect("kind"),
+                record_id: format!("01913f1d-8e2a-7c30-8f4a-42661719{ordinal:04x}")
+                    .parse()
+                    .expect("record"),
+                entity_id: entity,
+                batch_id: batch_id.parse().expect("batch"),
+                actor: ActorId::parse("human:memory-gate").expect("actor"),
+                occurred_at: "2026-08-12T13:01:00Z".parse().expect("time"),
+                recorded_at: "2026-08-12T13:02:00Z".parse().expect("time"),
+                parents: Vec::new(),
+                payload: json!({"adds": adds, "key": "hostile"}),
+            })
+            .collect::<Vec<_>>();
+        let prepared = prepare_batch(
+            &records,
+            &format!("hostile-remove-{batch_start}"),
+            &registry,
+        )
+        .expect("hostile remove batch");
+        write_prepared(&clone, &prepared);
+    }
+    assert!(canonical_payload_bytes(&clone) < 1024 * 1024 * 1024);
+    run(&clone, &["add", "journal"]);
+    run(&clone, &["commit", "-m", "hostile same-entity remove tip"]);
+    run(&clone, &["push", "origin", "HEAD:refs/heads/main"]);
+    let before = process_high_water_bytes();
+    assert!(matches!(
+        fixture
+            .store
+            .sync_git_union(&fixture.request)
+            .expect("typed rejection"),
+        GitSyncOutcome::Quarantined {
+            reason: GitQuarantineReason::InvalidCommitSnapshot,
+            ..
+        }
+    ));
+    let growth = process_high_water_bytes().saturating_sub(before);
+    eprintln!("hostile remove-reference fold VmHWM growth: {growth} bytes");
+    assert!(
+        growth < 256 * 1024 * 1024,
+        "hostile remove-reference replay retained {growth} bytes"
+    );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+#[ignore = "explicit exact-1-GiB legacy Git-tip compatibility gate"]
 fn exact_one_gib_git_tip_sync_stays_below_the_memory_budget() {
     const EXACT_BYTES: u64 = 1024 * 1024 * 1024;
     const FILE_BYTES: usize = wayjournal_core::MAX_LEGACY_FILE_BYTES;
@@ -710,5 +1086,117 @@ fn exact_one_gib_git_tip_sync_stays_below_the_memory_budget() {
     assert!(
         high_water_growth < 256 * 1024 * 1024,
         "exact-1-GiB Git sync retained {high_water_growth} bytes"
+    );
+}
+
+fn canonical_payload_bytes(root: &Path) -> u64 {
+    fn walk(path: &Path) -> u64 {
+        fs::read_dir(path)
+            .expect("canonical directory")
+            .map(|entry| entry.expect("canonical entry"))
+            .map(|entry| {
+                if entry.file_type().expect("canonical type").is_dir() {
+                    walk(&entry.path())
+                } else {
+                    entry.metadata().expect("canonical metadata").len()
+                }
+            })
+            .sum()
+    }
+    ["batches", "events", "journal"]
+        .into_iter()
+        .map(|name| root.join(name))
+        .filter(|path| path.exists())
+        .map(|path| walk(&path))
+        .sum()
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+#[ignore = "explicit exact-1-GiB valid journal-tip bounded-memory gate"]
+fn exact_one_gib_journal_tip_sync_stays_below_256_mib() {
+    const EXACT_BYTES: u64 = 1024 * 1024 * 1024;
+    let registry = wayjournal_domain_registry_with(BULK_REGISTRATION).expect("bulk registry");
+    let fixture = fixture_with_registry("exact-gib-journal-tip", registry, Arc::new(NoLegacy));
+    let clone = fixture.root.0.join("exact-gib-journal-clone");
+    run(
+        &fixture.root.0,
+        &[
+            "clone",
+            fixture.remote.to_str().expect("remote"),
+            clone.to_str().expect("clone"),
+        ],
+    );
+    configure(&clone);
+    let mut remaining = EXACT_BYTES
+        .checked_sub(canonical_payload_bytes(&clone))
+        .expect("genesis below capacity");
+    let mut ordinal = 0_usize;
+    while remaining > 0 {
+        let record_id = format!(
+            "01913f1d-8e2a-7c30-8f4a-{:012x}",
+            0x6266_1417_4100 + ordinal * 3
+        );
+        let batch_id = format!(
+            "01913f1d-8e2a-7c30-8f4a-{:012x}",
+            0x6266_1417_4101 + ordinal * 3
+        );
+        let entity_id = format!(
+            "01913f1d-8e2a-7c30-8f4a-{:012x}",
+            0x6266_1417_4102 + ordinal * 3
+        );
+        let empty = prepare_batch(
+            &[bulk_record(&record_id, &batch_id, &entity_id, 0)],
+            &format!("bulk-{ordinal}"),
+            &registry,
+        )
+        .expect("empty bulk shape");
+        let empty_bytes = empty.manifest_bytes().len() + empty.records()[0].bytes().len();
+        let maximum_blob = wayjournal_core::MAX_RECORD_BYTES - empty.records()[0].bytes().len();
+        let maximum = prepare_batch(
+            &[bulk_record(&record_id, &batch_id, &entity_id, maximum_blob)],
+            &format!("bulk-{ordinal}"),
+            &registry,
+        )
+        .expect("maximum bulk shape");
+        let maximum_bytes = maximum.manifest_bytes().len() + maximum.records()[0].bytes().len();
+        let chosen = if remaining > maximum_bytes as u64 + empty_bytes as u64 {
+            maximum
+        } else {
+            let blob = usize::try_from(remaining)
+                .expect("remaining usize")
+                .checked_sub(empty_bytes)
+                .expect("final bulk payload is representable");
+            prepare_batch(
+                &[bulk_record(&record_id, &batch_id, &entity_id, blob)],
+                &format!("bulk-{ordinal}"),
+                &registry,
+            )
+            .expect("final bulk shape")
+        };
+        let bytes = chosen.manifest_bytes().len() + chosen.records()[0].bytes().len();
+        assert!(bytes as u64 <= remaining);
+        write_prepared(&clone, &chosen);
+        remaining -= bytes as u64;
+        ordinal += 1;
+    }
+    assert_eq!(canonical_payload_bytes(&clone), EXACT_BYTES);
+    run(&clone, &["add", "journal"]);
+    run(&clone, &["commit", "-m", "exact 1 GiB valid journal tip"]);
+    run(&clone, &["push", "origin", "HEAD:refs/heads/main"]);
+    let before = process_high_water_bytes();
+    assert!(matches!(
+        fixture
+            .store
+            .sync_git_union(&fixture.request)
+            .expect("exact journal sync"),
+        GitSyncOutcome::Advanced { .. }
+    ));
+    assert_eq!(canonical_payload_bytes(&fixture.local), EXACT_BYTES);
+    let growth = process_high_water_bytes().saturating_sub(before);
+    eprintln!("exact-1-GiB journal-tip VmHWM growth: {growth} bytes");
+    assert!(
+        growth < 256 * 1024 * 1024,
+        "exact journal replay retained {growth} bytes"
     );
 }

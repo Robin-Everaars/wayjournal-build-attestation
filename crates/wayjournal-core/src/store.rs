@@ -2,7 +2,7 @@ use std::{
     collections::BTreeMap,
     ffi::OsStr,
     fs::{self, File, OpenOptions},
-    io::{self, Read, Seek, SeekFrom, Write},
+    io::{self, Read},
     os::{
         fd::AsRawFd,
         unix::{ffi::OsStrExt, fs::OpenOptionsExt},
@@ -15,6 +15,7 @@ use rustix::fs::{self as rfs, AtFlags, Dir, FileType, Mode, OFlags};
 use thiserror::Error;
 
 pub(crate) mod bulk;
+pub(super) mod streaming;
 mod transaction;
 
 #[cfg(test)]
@@ -57,8 +58,8 @@ use race_hooks::{Point as RacePoint, hit as race};
 use crate::{
     ActorId, BatchError, BatchId, BatchManifest, DomainRegistry, GenesisError, PathClass, Record,
     RecordId, RevisionEntry, StoreIdentity, StoreRevisionRef, StoredMember, classify_path,
-    compute_store_revision, decode_batch_manifest, decode_record,
-    revision::CanonicalRevisionAccumulator, validate_batch_ownership, validate_store_identity,
+    compute_store_revision, decode_batch_manifest, decode_record, validate_batch_ownership,
+    validate_store_identity,
 };
 
 const LOCAL_DIR: &str = ".wayjournal-local";
@@ -420,8 +421,10 @@ impl<'a> UnsnapshottedExclusive<'a> {
         scan_visible(self.store)
     }
 
-    pub(super) fn scan_visible_streaming_locked(&self) -> Result<StoreSnapshot, StoreError> {
-        scan_visible_streaming_legacy(self.store)
+    pub(super) fn validate_visible_s4b_locked(
+        &self,
+    ) -> Result<streaming::ValidatedStoreState, StoreError> {
+        validate_visible_s4b(self.store)
     }
 
     pub(super) fn into_recovered_snapshot(self) -> Result<ExclusiveSnapshot<'a>, StoreError> {
@@ -1311,220 +1314,12 @@ pub(super) fn read_file_bounded(
     }
     Ok(bytes)
 }
-struct VisibleSpoolEntry {
-    path: Vec<u8>,
-    offset: u64,
-    length: usize,
-}
-
-fn spool_visible_files(store: &Store) -> Result<(File, Vec<VisibleSpoolEntry>), StoreError> {
-    #[cfg(test)]
-    race(RacePoint::ScanRoot);
-    let mut spool = store.root_dir.temporary_file()?;
-    let mut entries = Vec::new();
-    let mut offset = 0_u64;
-    let mut budget = ScanBudget {
-        limits: active_scan_limits(),
-        entries: 0,
-        bytes: 0,
-    };
-    for (directory, prefix) in [
-        (&*store.batches_dir, b"batches".as_slice()),
-        (&*store.events_dir, b"events".as_slice()),
-        (&*store.journal_dir, b"journal".as_slice()),
-    ] {
-        spool_visible_directory(
-            directory,
-            prefix,
-            &mut spool,
-            &mut entries,
-            &mut offset,
-            &mut budget,
-        )?;
-    }
-    spool
-        .flush()
-        .map_err(|source| io_error("flush visible snapshot spool", &store.root, source))?;
-    entries.sort_by(|left, right| left.path.cmp(&right.path));
-    let mut canonical_entries = CanonicalEntryBudget::new();
-    for entry in &entries {
-        canonical_entries
-            .push_sorted_file(&entry.path, budget.limits.entries)
-            .map_err(|()| {
-                invalid_layout(&store.root, "canonical store exceeds entry-count limit")
-            })?;
-    }
-    Ok((spool, entries))
-}
-
-fn spool_visible_directory(
-    directory: &Directory,
-    prefix: &[u8],
-    spool: &mut File,
-    entries: &mut Vec<VisibleSpoolEntry>,
-    offset: &mut u64,
-    budget: &mut ScanBudget,
-) -> Result<(), StoreError> {
-    directory.for_each_name(
-        budget.limits.entries.saturating_sub(budget.entries),
-        |name| {
-            budget.entry(&directory.path)?;
-            let component = OsStr::from_bytes(name);
-            let mut relative = prefix.to_vec();
-            relative.push(b'/');
-            relative.extend(name);
-            match directory.kind(component)? {
-                FileType::Directory if valid_canonical_directory(&relative) => {
-                    let child = directory.open_dir(component)?;
-                    spool_visible_directory(&child, &relative, spool, entries, offset, budget)?;
-                }
-                FileType::RegularFile => {
-                    let Some(limit) = canonical_file_limit(classify_path(&relative)) else {
-                        return Err(StoreError::Corrupt {
-                            issue: StoreCorruption::InvalidCanonicalPath { path: relative },
-                        });
-                    };
-                    let file = directory.open_file(component)?;
-                    let length = directory.require_regular(&file, component)?;
-                    if length > limit as u64 {
-                        return Err(invalid_layout(
-                            &directory.path.join(component),
-                            "canonical file exceeds its byte limit",
-                        ));
-                    }
-                    budget.reserve_bytes(length, &directory.path.join(component))?;
-                    let bytes = read_file_bounded(
-                        file.try_clone().map_err(|source| {
-                            io_error(
-                                "clone visible spool descriptor",
-                                &directory.path.join(component),
-                                source,
-                            )
-                        })?,
-                        limit,
-                        &directory.path.join(component),
-                    )?;
-                    let stable_length = directory.require_regular(&file, component)?;
-                    if stable_length != length || stable_length != bytes.len() as u64 {
-                        return Err(invalid_layout(
-                            &directory.path.join(component),
-                            "canonical file changed while being spooled",
-                        ));
-                    }
-                    spool.write_all(&bytes).map_err(|source| {
-                        io_error("write visible snapshot spool", &directory.path, source)
-                    })?;
-                    let entry_offset = *offset;
-                    *offset = offset.checked_add(length).ok_or_else(|| {
-                        invalid_layout(&directory.path, "visible spool offset overflow")
-                    })?;
-                    entries.push(VisibleSpoolEntry {
-                        path: relative,
-                        offset: entry_offset,
-                        length: bytes.len(),
-                    });
-                }
-                FileType::Directory => {
-                    return Err(StoreError::Corrupt {
-                        issue: StoreCorruption::InvalidCanonicalPath { path: relative },
-                    });
-                }
-                _ => {
-                    return Err(StoreError::Corrupt {
-                        issue: StoreCorruption::NonRegularPath { path: relative },
-                    });
-                }
-            }
-            Ok(())
-        },
-    )
-}
-
 fn canonical_file_limit(class: PathClass) -> Option<usize> {
     match class {
         PathClass::LegacyEvent | PathClass::LegacyBatch => Some(MAX_LEGACY_FILE_BYTES),
         PathClass::JournalRecord => Some(crate::MAX_RECORD_BYTES),
         PathClass::JournalBatch => Some(crate::MAX_BATCH_BYTES),
         PathClass::InvalidReserved | PathClass::NonCanonical => None,
-    }
-}
-
-fn read_spooled_visible_file(
-    spool: &mut File,
-    entry: VisibleSpoolEntry,
-) -> Result<RawFile, StoreError> {
-    spool
-        .seek(SeekFrom::Start(entry.offset))
-        .map_err(|source| io_error("seek visible snapshot spool", Path::new("."), source))?;
-    let mut bytes = vec![0_u8; entry.length];
-    spool
-        .read_exact(&mut bytes)
-        .map_err(|source| io_error("read visible snapshot spool", Path::new("."), source))?;
-    Ok(RawFile {
-        path: entry.path,
-        bytes,
-    })
-}
-
-struct VisibleLegacySource<'a> {
-    spool: &'a mut File,
-    entries: std::vec::IntoIter<VisibleSpoolEntry>,
-    revision: &'a mut CanonicalRevisionAccumulator,
-    current: Option<RawFile>,
-    first_journal: Option<RawFile>,
-    source_error: Option<StoreError>,
-    reached_journal: bool,
-    total_bytes: u64,
-}
-
-impl LegacyEntrySource for VisibleLegacySource<'_> {
-    fn next_entry(&mut self) -> Result<Option<LegacyEntry<'_>>, String> {
-        if self.reached_journal {
-            return Ok(None);
-        }
-        self.current = None;
-        let Some(entry) = self.entries.next() else {
-            self.reached_journal = true;
-            return Ok(None);
-        };
-        let file = match read_spooled_visible_file(self.spool, entry) {
-            Ok(file) => file,
-            Err(error) => {
-                self.source_error = Some(error);
-                return Err("visible canonical source failed".to_owned());
-            }
-        };
-        if let Err(error) = reserve_streamed_visible_bytes(&mut self.total_bytes, file.bytes.len())
-        {
-            self.source_error = Some(error);
-            return Err("visible canonical byte budget failed".to_owned());
-        }
-        if let Err(error) = self.revision.push(&file.path, &file.bytes) {
-            self.source_error = Some(StoreError::Corrupt {
-                issue: StoreCorruption::InvalidCanonicalPath {
-                    path: error.to_string().into_bytes(),
-                },
-            });
-            return Err("visible canonical revision failed".to_owned());
-        }
-        match classify_path(&file.path) {
-            class @ (PathClass::LegacyEvent | PathClass::LegacyBatch) => {
-                self.current = Some(file);
-                let current = self.current.as_ref().expect("current legacy entry");
-                Ok(Some(LegacyEntry::new(&current.path, &current.bytes, class)))
-            }
-            PathClass::JournalRecord | PathClass::JournalBatch => {
-                self.first_journal = Some(file);
-                self.reached_journal = true;
-                Ok(None)
-            }
-            PathClass::InvalidReserved | PathClass::NonCanonical => {
-                self.source_error = Some(StoreError::Corrupt {
-                    issue: StoreCorruption::InvalidCanonicalPath { path: file.path },
-                });
-                Err("visible canonical path classification failed".to_owned())
-            }
-        }
     }
 }
 
@@ -1544,79 +1339,97 @@ fn reserve_streamed_visible_bytes(total: &mut u64, length: usize) -> Result<(), 
     Ok(())
 }
 
-fn scan_visible_streaming_legacy(store: &Store) -> Result<StoreSnapshot, StoreError> {
-    let (mut spool, entries) = spool_visible_files(store)?;
-    let mut revision = CanonicalRevisionAccumulator::new();
-    let mut source = VisibleLegacySource {
-        spool: &mut spool,
-        entries: entries.into_iter(),
-        revision: &mut revision,
-        current: None,
-        first_journal: None,
-        source_error: None,
-        reached_journal: false,
-        total_bytes: 0,
+fn validate_visible_s4b(store: &Store) -> Result<streaming::ValidatedStoreState, StoreError> {
+    #[cfg(test)]
+    race(RacePoint::ScanRoot);
+    let mut builder = streaming::replay_builder(store)?;
+    let mut budget = ScanBudget {
+        limits: active_scan_limits(),
+        entries: 0,
+        bytes: 0,
     };
-    let validation =
-        store.validate_legacy_stream(LegacyStreamRequirement::FullDomainBounded, &mut source);
-    if let Some(error) = source.source_error.take() {
-        return Err(error);
+    for (directory, prefix) in [
+        (&*store.batches_dir, b"batches".as_slice()),
+        (&*store.events_dir, b"events".as_slice()),
+        (&*store.journal_dir, b"journal".as_slice()),
+    ] {
+        spool_visible_replay_directory(directory, prefix, &mut builder, &mut budget)?;
     }
-    let mut unconsumed = false;
-    loop {
-        match source.next_entry() {
-            Ok(Some(_)) => unconsumed = true,
-            Ok(None) => break,
-            Err(_) => {
-                if let Some(error) = source.source_error.take() {
-                    return Err(error);
+    let replay = builder.finish()?;
+    streaming::validate_bounded_replay(store, &replay)
+}
+
+fn spool_visible_replay_directory(
+    directory: &Directory,
+    prefix: &[u8],
+    builder: &mut streaming::CanonicalReplayBuilder<'_>,
+    budget: &mut ScanBudget,
+) -> Result<(), StoreError> {
+    directory.for_each_name(
+        budget.limits.entries.saturating_sub(budget.entries),
+        |name| {
+            budget.entry(&directory.path)?;
+            let component = OsStr::from_bytes(name);
+            let mut relative = prefix.to_vec();
+            relative.push(b'/');
+            relative.extend(name);
+            match directory.kind(component)? {
+                FileType::Directory if valid_canonical_directory(&relative) => {
+                    let child = directory.open_dir(component)?;
+                    spool_visible_replay_directory(&child, &relative, builder, budget)?;
                 }
-                return Err(StoreError::Corrupt {
-                    issue: StoreCorruption::InvalidLegacy {
-                        message: "visible legacy source failed while checking exhaustion"
-                            .to_owned(),
-                    },
-                });
+                FileType::RegularFile => {
+                    let Some(limit) = canonical_file_limit(classify_path(&relative)) else {
+                        return Err(StoreError::Corrupt {
+                            issue: StoreCorruption::InvalidCanonicalPath { path: relative },
+                        });
+                    };
+                    let file = directory.open_file(component)?;
+                    let length = directory.require_regular(&file, component)?;
+                    if length > limit as u64 {
+                        return Err(invalid_layout(
+                            &directory.path.join(component),
+                            "canonical file exceeds its byte limit",
+                        ));
+                    }
+                    budget.reserve_bytes(length, &directory.path.join(component))?;
+                    let bytes = read_file_bounded(
+                        file.try_clone().map_err(|source| {
+                            io_error(
+                                "clone visible replay descriptor",
+                                &directory.path.join(component),
+                                source,
+                            )
+                        })?,
+                        limit,
+                        &directory.path.join(component),
+                    )?;
+                    let stable_length = directory.require_regular(&file, component)?;
+                    if stable_length != length || stable_length != bytes.len() as u64 {
+                        return Err(invalid_layout(
+                            &directory.path.join(component),
+                            "canonical file changed while being replayed",
+                        ));
+                    }
+                    builder.push(RawFile {
+                        path: relative,
+                        bytes,
+                    })?;
+                }
+                FileType::Directory => {
+                    return Err(StoreError::Corrupt {
+                        issue: StoreCorruption::InvalidCanonicalPath { path: relative },
+                    });
+                }
+                _ => {
+                    return Err(StoreError::Corrupt {
+                        issue: StoreCorruption::NonRegularPath { path: relative },
+                    });
+                }
             }
-        }
-    }
-    if validation.is_ok() && unconsumed {
-        return Err(StoreError::Corrupt {
-            issue: StoreCorruption::InvalidLegacy {
-                message: "bounded legacy adapter did not consume every legacy entry".to_owned(),
-            },
-        });
-    }
-    validation?;
-    let first_journal = source.first_journal.take();
-    let mut remaining_entries = std::mem::replace(&mut source.entries, Vec::new().into_iter());
-    let mut total_bytes = source.total_bytes;
-    drop(source);
-    let mut journal_files = Vec::new();
-    if let Some(file) = first_journal {
-        journal_files.push(file);
-    }
-    for entry in &mut remaining_entries {
-        let file = read_spooled_visible_file(&mut spool, entry)?;
-        if !matches!(
-            classify_path(&file.path),
-            PathClass::JournalRecord | PathClass::JournalBatch
-        ) {
-            return Err(StoreError::Corrupt {
-                issue: StoreCorruption::InvalidCanonicalPath { path: file.path },
-            });
-        }
-        reserve_streamed_visible_bytes(&mut total_bytes, file.bytes.len())?;
-        revision
-            .push(&file.path, &file.bytes)
-            .map_err(|error| StoreError::Corrupt {
-                issue: StoreCorruption::InvalidCanonicalPath {
-                    path: error.to_string().into_bytes(),
-                },
-            })?;
-        journal_files.push(file);
-    }
-    scan_after_streaming_legacy(store, &journal_files, revision.finish())
+            Ok(())
+        },
+    )
 }
 
 pub(super) fn scan_visible(store: &Store) -> Result<StoreSnapshot, StoreError> {
@@ -1759,23 +1572,9 @@ pub(super) fn scan_collected(
     )
 }
 
-pub(super) fn scan_after_streaming_legacy(
-    store: &Store,
-    journal_files: &[RawFile],
-    revision: StoreRevisionRef,
-) -> Result<StoreSnapshot, StoreError> {
-    scan_collected_with_legacy_mode(
-        store,
-        journal_files,
-        Vec::new(),
-        LegacyScanMode::Prevalidated(revision),
-    )
-}
-
 #[derive(Clone, Copy)]
 enum LegacyScanMode {
     Validate(LegacyStreamRequirement),
-    Prevalidated(StoreRevisionRef),
 }
 
 fn scan_collected_with_legacy_mode(
@@ -1885,16 +1684,6 @@ fn resolve_scanned_revision(
                     path: error.to_string().into_bytes(),
                 },
             })
-        }
-        LegacyScanMode::Prevalidated(revision) => {
-            if !legacy.is_empty() {
-                return Err(StoreError::Corrupt {
-                    issue: StoreCorruption::InvalidLegacy {
-                        message: "prevalidated legacy scan included legacy payloads".to_owned(),
-                    },
-                });
-            }
-            Ok(revision)
         }
     }
 }
@@ -2086,7 +1875,7 @@ mod hostile_tests {
     use super::{
         LegacyEntry, LegacyEntrySource, LegacyStoreAdapter, LegacyStreamRequirement,
         LegacyStreamingError, ScanLimits, Store, StoreError, collect_visible_with_limits,
-        race_hooks, scan_visible_streaming_legacy,
+        race_hooks, validate_visible_s4b,
     };
     use crate::{DomainRegistry, RevisionEntry, compute_store_revision};
     use std::{
@@ -2185,7 +1974,7 @@ mod hostile_tests {
         let expected = compute_store_revision([RevisionEntry::regular(path, b"original")])
             .expect("original revision");
 
-        let snapshot = scan_visible_streaming_legacy(&store).expect("streamed snapshot");
+        let snapshot = validate_visible_s4b(&store).expect("streamed snapshot");
 
         assert_eq!(snapshot.revision(), expected);
         fs::remove_dir_all(root).unwrap();

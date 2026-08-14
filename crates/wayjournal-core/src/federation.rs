@@ -636,7 +636,7 @@ impl crate::Store {
         }
         pending::clean_disposable_locked(self)?;
         guard.recover_transactions()?;
-        let current = guard.scan_visible_streaming_locked()?;
+        let current = guard.validate_visible_s4b_locked()?;
         match start_sync_operation(
             self,
             request,
@@ -861,7 +861,7 @@ fn start_sync_operation(
     request: &GitSyncRequest,
     original_base: &AdmissionCheckpoint,
     advance_from: &AdmissionCheckpoint,
-    current: &crate::StoreSnapshot,
+    current: &crate::store::streaming::ValidatedStoreState,
     predecessor: Option<GitSyncOperationId>,
     predecessor_pending: Option<&pending::DurablePending>,
 ) -> Result<StartOperation, GitSyncError> {
@@ -894,7 +894,7 @@ fn start_sync_operation(
     };
     git::require_local_commit(&runner, &local, &local.tip)?;
     let local_snapshot = git::local_tree_snapshot_streaming(store, &runner, &local, &local.tip)?;
-    require_same_store(&local_snapshot, current)?;
+    require_same_s4b_store(&local_snapshot, current)?;
     if local_snapshot.revision() != current.revision() {
         return Err(GitAdmissionError::CandidateRevisionMismatch.into());
     }
@@ -967,7 +967,7 @@ fn start_sync_operation(
         Err(error) => return Err(error.into()),
     };
     let candidate_snapshot = repository.tree_snapshot(store, &runner, &candidate)?;
-    require_same_store(&candidate_snapshot, current)?;
+    require_same_s4b_store(&candidate_snapshot, current)?;
     let candidate_parents = repository.commit_parents(&runner, &candidate)?;
     let mut document = pending::PendingDocument::new(
         operation_id.clone(),
@@ -1253,7 +1253,7 @@ fn recover_sync_operation(
     loop {
         // The phase is never authority. Re-derive every prerequisite from durable filesystem,
         // approved-ref and checkpoint truth, accepting only old or candidate at each surface.
-        let visible_before = guard.scan_visible_streaming_locked()?;
+        let visible_before = guard.validate_visible_s4b_locked()?;
         if visible_before.revision() == base_snapshot.revision() {
             let mut publication_failed = false;
             for rank in 0..=1 {
@@ -1271,7 +1271,7 @@ fn recover_sync_operation(
                 }
             }
             if publication_failed
-                || guard.scan_visible_streaming_locked()?.revision()
+                || guard.validate_visible_s4b_locked()?.revision()
                     != active.document.candidate_revision
             {
                 return quarantine_publication(
@@ -1379,7 +1379,7 @@ fn recover_sync_operation(
                         GitQuarantineReason::HostilePublicationState,
                     );
                 }
-                let visible = guard.scan_visible_streaming_locked()?;
+                let visible = guard.validate_visible_s4b_locked()?;
                 if visible.revision() != active.document.candidate_revision {
                     return quarantine_publication(
                         store,
@@ -1492,7 +1492,7 @@ fn recover_sync_operation(
                 }
             }
             GitSyncPendingPhase::RemoteCasStale => {
-                let current = guard.scan_visible_streaming_locked()?;
+                let current = guard.validate_visible_s4b_locked()?;
                 let original = AdmissionCheckpoint {
                     logical_store_id: active.document.logical_store_id.clone(),
                     local_trust_binding: active.document.local_trust_binding,
@@ -1523,7 +1523,7 @@ fn recover_sync_operation(
                 }
             }
             GitSyncPendingPhase::RemoteCasConfirmed => {
-                let visible = guard.scan_visible_streaming_locked()?;
+                let visible = guard.validate_visible_s4b_locked()?;
                 let local = git::inspect_local(store, &runner, request)?;
                 let durable = checkpoint::read(store)?.ok_or(GitSyncError::BootstrapRequired)?;
                 let remote = git::observe_remote_ref(
@@ -1596,6 +1596,22 @@ fn quarantine_publication(
 fn require_same_store(
     candidate: &crate::StoreSnapshot,
     current: &crate::StoreSnapshot,
+) -> Result<(), GitAdmissionError> {
+    let candidate = candidate
+        .identity()
+        .ok_or(GitAdmissionError::MissingIdentity)?;
+    let current = current
+        .identity()
+        .ok_or(GitAdmissionError::MissingIdentity)?;
+    if candidate.logical_id() != current.logical_id() {
+        return Err(GitAdmissionError::IdentityMismatch);
+    }
+    Ok(())
+}
+
+fn require_same_s4b_store(
+    candidate: &crate::store::streaming::ValidatedStoreState,
+    current: &crate::store::streaming::ValidatedStoreState,
 ) -> Result<(), GitAdmissionError> {
     let candidate = candidate
         .identity()
