@@ -8,8 +8,8 @@ use std::{
 };
 
 use crate::{
-    BatchError, BatchId, Digest, GenesisError, PathClass, RecordId, StoreIdentity,
-    StoreRevisionRef, classify_path, decode_batch_manifest, decode_record,
+    BatchError, BatchId, Digest, DomainId, EntityId, GenesisError, PathClass, RecordId,
+    StoreIdentity, StoreRevisionRef, classify_path, decode_batch_manifest, decode_record,
 };
 
 use super::{
@@ -77,6 +77,11 @@ impl ValidatedStoreState {
     pub(crate) const fn identity(&self) -> Option<&StoreIdentity> {
         self.identity.as_ref()
     }
+}
+
+pub(crate) struct ValidatedRecordSubject {
+    pub(crate) domain: DomainId,
+    pub(crate) entity_id: EntityId,
 }
 
 type Fact = (Vec<u8>, Vec<u8>);
@@ -516,14 +521,31 @@ struct ReplayFacts {
     genesis_count: usize,
     genesis: Option<(Vec<u8>, Location)>,
     reserved_builtin: bool,
+    queried_record_subject: Option<ValidatedRecordSubject>,
 }
 
 pub(crate) fn validate_bounded_replay(
     store: &Store,
     replay: &CanonicalReplay,
 ) -> Result<ValidatedStoreState, StoreError> {
+    validate_bounded_replay_inner(store, replay, None).map(|(state, _)| state)
+}
+
+pub(crate) fn validate_bounded_replay_for_record(
+    store: &Store,
+    replay: &CanonicalReplay,
+    record_id: RecordId,
+) -> Result<(ValidatedStoreState, Option<ValidatedRecordSubject>), StoreError> {
+    validate_bounded_replay_inner(store, replay, Some(record_id))
+}
+
+fn validate_bounded_replay_inner(
+    store: &Store,
+    replay: &CanonicalReplay,
+    record_query: Option<RecordId>,
+) -> Result<(ValidatedStoreState, Option<ValidatedRecordSubject>), StoreError> {
     validate_legacy(store, replay)?;
-    let facts = collect_facts(store, replay)?;
+    let facts = collect_facts(store, replay, record_query)?;
     validate_duplicate_record_ids(&facts.record_ids)?;
     validate_duplicate_idempotency(&facts.idempotency)?;
     validate_ownership_and_batches(store, replay, &facts)?;
@@ -571,10 +593,13 @@ pub(crate) fn validate_bounded_replay(
     } else {
         None
     };
-    Ok(ValidatedStoreState {
-        revision: facts.revision,
-        identity,
-    })
+    Ok((
+        ValidatedStoreState {
+            revision: facts.revision,
+            identity,
+        },
+        facts.queried_record_subject,
+    ))
 }
 
 fn validate_legacy(store: &Store, replay: &CanonicalReplay) -> Result<(), StoreError> {
@@ -619,7 +644,11 @@ fn validate_legacy(store: &Store, replay: &CanonicalReplay) -> Result<(), StoreE
 }
 
 #[allow(clippy::too_many_lines)]
-fn collect_facts(store: &Store, replay: &CanonicalReplay) -> Result<ReplayFacts, StoreError> {
+fn collect_facts(
+    store: &Store,
+    replay: &CanonicalReplay,
+    record_query: Option<RecordId>,
+) -> Result<ReplayFacts, StoreError> {
     let directory = &store.root_dir;
     let mut record_ids = ExternalSorter::new(directory, replay.budget.clone());
     let mut records = ExternalSorter::new(directory, replay.budget.clone());
@@ -635,6 +664,7 @@ fn collect_facts(store: &Store, replay: &CanonicalReplay) -> Result<ReplayFacts,
     let mut genesis_count = 0;
     let mut genesis = None;
     let mut reserved_builtin = false;
+    let mut queried_record_subject = None;
     while let Some((file, offset)) = cursor.next_file()? {
         revision
             .push(&file.path, &file.bytes)
@@ -701,6 +731,12 @@ fn collect_facts(store: &Store, replay: &CanonicalReplay) -> Result<ReplayFacts,
                 }
                 record_count += 1;
                 record_ids.push(record.record_id.to_string().into_bytes(), file.path.clone())?;
+                if record_query == Some(record.record_id) {
+                    queried_record_subject = Some(ValidatedRecordSubject {
+                        domain: record.domain.clone(),
+                        entity_id: record.entity_id,
+                    });
+                }
                 let mut location = Vec::with_capacity(12);
                 location.extend_from_slice(&offset.to_be_bytes());
                 location.extend_from_slice(
@@ -755,6 +791,7 @@ fn collect_facts(store: &Store, replay: &CanonicalReplay) -> Result<ReplayFacts,
         genesis_count,
         genesis,
         reserved_builtin,
+        queried_record_subject,
     })
 }
 

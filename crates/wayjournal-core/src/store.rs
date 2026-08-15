@@ -431,6 +431,19 @@ impl<'a> UnsnapshottedExclusive<'a> {
         validate_visible_s4b(self.store)
     }
 
+    pub(super) fn validate_visible_s4b_for_record_locked(
+        &self,
+        record_id: RecordId,
+    ) -> Result<
+        (
+            streaming::ValidatedStoreState,
+            Option<streaming::ValidatedRecordSubject>,
+        ),
+        StoreError,
+    > {
+        validate_visible_s4b_for_record(self.store, record_id)
+    }
+
     pub(super) fn into_recovered_snapshot(self) -> Result<ExclusiveSnapshot<'a>, StoreError> {
         self.recover_transactions()?;
         let snapshot = self.scan_visible_locked()?;
@@ -1112,7 +1125,7 @@ impl Store {
         guard.recover_transactions()?;
         let checkpoint = crate::federation::admission_checkpoint_locked(&guard)?
             .ok_or(crate::ProofError::MissingCheckpoint)?;
-        let snapshot = guard.scan_visible_locked()?;
+        let (snapshot, record_subject) = guard.validate_visible_s4b_for_record_locked(record_id)?;
         let identity = snapshot
             .identity()
             .ok_or(crate::ProofError::MissingIdentity)?;
@@ -1124,12 +1137,9 @@ impl Store {
         if checkpoint.accepted_revision() != snapshot.revision() {
             return Err(crate::ProofError::RevisionMismatch);
         }
-        let record = snapshot
-            .records()
-            .iter()
-            .find(|record| record.record_id == record_id)
-            .ok_or(crate::ProofError::RecordNotFound)?;
-        if record.domain != subject.domain || record.entity_id != subject.entity_id {
+        let record_subject = record_subject.ok_or(crate::ProofError::RecordNotFound)?;
+        if record_subject.domain != subject.domain || record_subject.entity_id != subject.entity_id
+        {
             return Err(crate::ProofError::SubjectMismatch);
         }
         Ok(crate::VerifiedProof::from_checkpoint(
@@ -1505,6 +1515,25 @@ fn reserve_streamed_visible_bytes(total: &mut u64, length: usize) -> Result<(), 
 }
 
 fn validate_visible_s4b(store: &Store) -> Result<streaming::ValidatedStoreState, StoreError> {
+    let replay = visible_s4b_replay(store)?;
+    streaming::validate_bounded_replay(store, &replay)
+}
+
+fn validate_visible_s4b_for_record(
+    store: &Store,
+    record_id: RecordId,
+) -> Result<
+    (
+        streaming::ValidatedStoreState,
+        Option<streaming::ValidatedRecordSubject>,
+    ),
+    StoreError,
+> {
+    let replay = visible_s4b_replay(store)?;
+    streaming::validate_bounded_replay_for_record(store, &replay, record_id)
+}
+
+fn visible_s4b_replay(store: &Store) -> Result<streaming::CanonicalReplay, StoreError> {
     #[cfg(test)]
     race(RacePoint::ScanRoot);
     let mut builder = streaming::replay_builder(store)?;
@@ -1520,8 +1549,7 @@ fn validate_visible_s4b(store: &Store) -> Result<streaming::ValidatedStoreState,
     ] {
         spool_visible_replay_directory(directory, prefix, &mut builder, &mut budget)?;
     }
-    let replay = builder.finish()?;
-    streaming::validate_bounded_replay(store, &replay)
+    builder.finish()
 }
 
 fn spool_visible_replay_directory(

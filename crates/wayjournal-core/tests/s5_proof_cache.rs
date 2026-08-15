@@ -1,3 +1,6 @@
+#[allow(dead_code)]
+mod support;
+
 use std::{
     fs::{self, File},
     os::unix::fs::PermissionsExt,
@@ -9,20 +12,14 @@ use std::{
 
 use serde_json::{Value, json};
 use wayjournal_core::{
-    ActorId, DependencyStore, LegacyEntry, LegacyStoreAdapter, LogicalStoreId, ProofCache,
-    ProofCacheDisposition, ProofCacheError, ProofCacheInsert, ProofCacheLookup, QualifiedEntityRef,
-    Record, Store, StoreRevisionRef, prepare_batch, wayjournal_domain_registry,
+    ActorId, DependencyStore, LogicalStoreId, ProofCache, ProofCacheDisposition, ProofCacheError,
+    ProofCacheInsert, ProofCacheLookup, QualifiedEntityRef, Record, Store, StoreRevisionRef,
+    prepare_batch, wayjournal_domain_registry,
 };
 
-const TRUST: &str = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+use support::BoundedNoLegacy as NoLegacy;
 
-#[derive(Debug)]
-struct NoLegacy;
-impl LegacyStoreAdapter for NoLegacy {
-    fn validate(&self, _: &[LegacyEntry<'_>]) -> Result<(), String> {
-        Ok(())
-    }
-}
+const TRUST: &str = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
 
 struct TestDir(PathBuf);
 impl TestDir {

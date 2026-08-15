@@ -1,3 +1,6 @@
+#[allow(dead_code)]
+mod support;
+
 use std::{
     fs,
     os::unix::fs::PermissionsExt,
@@ -7,14 +10,15 @@ use std::{
 
 use serde_json::{Value, json};
 use wayjournal_core::{
-    ActorId, ContradictionRef, LegacyEntry, LegacyStoreAdapter, LocalTrustBinding, LogicalStoreId,
-    MAX_PROJECTION_BYTES, MAX_PROOFS, MAX_VECTOR_STORES, PROOF_VECTOR_SCHEMA_V1, ProofError,
-    ProofVector, QualifiedEntityRef, REVISION_ALGORITHM_V1, REVISION_VECTOR_SCHEMA_V1, Record,
-    RevisionVector, RevisionVectorEntry, Store, StoreRevisionRef, StoreUuid,
-    VERIFIED_PROOF_SCHEMA_V1, decode_proof_vector, decode_revision_vector, decode_verified_proof,
-    encode_proof_vector, encode_revision_vector, encode_verified_proof, prepare_batch,
-    wayjournal_domain_registry,
+    ActorId, ContradictionRef, LocalTrustBinding, LogicalStoreId, MAX_PROJECTION_BYTES, MAX_PROOFS,
+    MAX_VECTOR_STORES, PROOF_VECTOR_SCHEMA_V1, ProofError, ProofVector, QualifiedEntityRef,
+    REVISION_ALGORITHM_V1, REVISION_VECTOR_SCHEMA_V1, Record, RevisionVector, RevisionVectorEntry,
+    Store, StoreRevisionRef, StoreUuid, VERIFIED_PROOF_SCHEMA_V1, decode_proof_vector,
+    decode_revision_vector, decode_verified_proof, encode_proof_vector, encode_revision_vector,
+    encode_verified_proof, prepare_batch, wayjournal_domain_registry,
 };
+
+use support::BoundedNoLegacy as NoLegacy;
 
 const STORE_UUID: &str = "01913f1d-8e2a-7c30-8f4a-426614174010";
 const STORE_UUID_2: &str = "01913f1d-8e2a-7c30-8f4a-426614174020";
@@ -25,14 +29,6 @@ const FIXTURE_PROOF_ID: &str = "99bf2caf35a7b5e12d6b82ae2948ec627098e9a11152533c
 const RECORD_ID: &str = "01913f1d-8e2a-7c30-8f4a-426614174011";
 const ENTITY_ID: &str = "123e4567-e89b-42d3-a456-426614174000";
 const OBSERVED_AT: &str = "2026-08-12T13:00:01Z";
-
-#[derive(Debug)]
-struct NoLegacy;
-impl LegacyStoreAdapter for NoLegacy {
-    fn validate(&self, _: &[LegacyEntry<'_>]) -> Result<(), String> {
-        Ok(())
-    }
-}
 
 struct TestDir(PathBuf);
 impl TestDir {

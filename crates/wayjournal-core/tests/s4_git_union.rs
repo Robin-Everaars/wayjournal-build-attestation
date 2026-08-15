@@ -13,10 +13,11 @@ use std::{
 
 use serde_json::json;
 use wayjournal_core::{
-    ActorId, ApprovedRef, ApprovedRemote, ApprovedRemoteLocator, DomainRegistration,
-    DomainRegistry, GitQuarantineReason, GitSyncError, GitSyncOutcome, GitSyncRequest, KindId,
-    LegacyEntry, LegacyEntrySource, LegacyStoreAdapter, LegacyStreamRequirement,
-    LegacyStreamingError, LocalTrustBinding, MAX_RECORD_BYTES, Record, Store, prepare_batch,
+    ActorId, ApprovedRef, ApprovedRemote, ApprovedRemoteLocator, DependencyStore,
+    DomainRegistration, DomainRegistry, GitQuarantineReason, GitSyncError, GitSyncOutcome,
+    GitSyncRequest, KindId, LegacyEntry, LegacyEntrySource, LegacyStoreAdapter,
+    LegacyStreamRequirement, LegacyStreamingError, LocalTrustBinding, MAX_RECORD_BYTES, ProofCache,
+    ProofCacheInsert, ProofCacheLookup, QualifiedEntityRef, Record, Store, prepare_batch,
     wayjournal_domain_registry, wayjournal_domain_registry_with,
 };
 
@@ -338,6 +339,15 @@ fn fixture_with_registry(
     registry: DomainRegistry,
     legacy: Arc<dyn LegacyStoreAdapter>,
 ) -> Fixture {
+    fixture_with_registry_and_genesis(label, registry, legacy, genesis())
+}
+
+fn fixture_with_registry_and_genesis(
+    label: &str,
+    registry: DomainRegistry,
+    legacy: Arc<dyn LegacyStoreAdapter>,
+    genesis: Record,
+) -> Fixture {
     let root = TestDir::new(label);
     let remote = root.0.join("remote.git");
     run(
@@ -347,7 +357,7 @@ fn fixture_with_registry(
     let local = root.0.join("local");
     fs::create_dir(&local).expect("local");
     let store = Store::open(&local, registry, legacy).expect("store");
-    let batch = prepare_batch(&[genesis()], "genesis", &registry).expect("batch");
+    let batch = prepare_batch(&[genesis], "genesis", &registry).expect("batch");
     store
         .append(&batch, store.read().expect("read").revision())
         .expect("append");
@@ -1884,8 +1894,18 @@ fn canonical_payload_bytes(root: &Path) -> u64 {
 #[ignore = "explicit exact-1-GiB valid journal-tip bounded-memory gate"]
 fn exact_one_gib_journal_tip_sync_stays_below_256_mib() {
     const EXACT_BYTES: u64 = 1024 * 1024 * 1024;
+    const FIRST_RECORD: &str = "01913f1d-8e2a-7c30-8f4a-626614174100";
+    const FIRST_ENTITY: &str = "01913f1d-8e2a-7c30-8f4a-626614174102";
     let registry = wayjournal_domain_registry_with(BULK_REGISTRATION).expect("bulk registry");
     let fixture = fixture_with_registry("exact-gib-journal-tip", registry, Arc::new(NoLegacy));
+    let logical_store = fixture
+        .store
+        .read()
+        .expect("initial snapshot")
+        .identity()
+        .expect("identity")
+        .logical_id()
+        .clone();
     let clone = fixture.root.0.join("exact-gib-journal-clone");
     run(
         &fixture.root.0,
@@ -1961,10 +1981,103 @@ fn exact_one_gib_journal_tip_sync_stays_below_256_mib() {
         GitSyncOutcome::Advanced { .. }
     ));
     assert_eq!(canonical_payload_bytes(&fixture.local), EXACT_BYTES);
+
+    let subject = QualifiedEntityRef {
+        store: logical_store.clone(),
+        domain: "example.bulk".parse().expect("domain"),
+        entity_id: FIRST_ENTITY.parse().expect("entity"),
+    };
+    let proof = fixture
+        .store
+        .verified_proof(
+            &subject,
+            FIRST_RECORD.parse().expect("record"),
+            "2026-08-12T13:03:00Z".parse().expect("time"),
+        )
+        .expect("exact-capacity proof");
+    let cache = ProofCache::open(fixture.root.0.join("exact-gib-proof-cache")).expect("cache");
+    let mut small_genesis = genesis();
+    small_genesis.record_id = "01913f1d-8e2a-7c30-8f4a-426614174a11"
+        .parse()
+        .expect("small genesis record");
+    small_genesis.entity_id = "01913f1d-8e2a-7c30-8f4a-426614174a10"
+        .parse()
+        .expect("small genesis entity");
+    small_genesis.batch_id = "01913f1d-8e2a-7c30-8f4a-426614174a12"
+        .parse()
+        .expect("small genesis batch");
+    small_genesis.payload = json!({
+        "store_kind":"wayjournal.personal",
+        "store_uuid":"01913f1d-8e2a-7c30-8f4a-426614174a10"
+    });
+    let small = fixture_with_registry_and_genesis(
+        "exact-gib-cache-small-authority",
+        wayjournal_domain_registry_with(BULK_REGISTRATION).expect("small registry"),
+        Arc::new(NoLegacy),
+        small_genesis,
+    );
+    let small_store = small
+        .store
+        .read()
+        .expect("small snapshot")
+        .identity()
+        .expect("small identity")
+        .logical_id()
+        .clone();
+    let mut authorities = vec![
+        DependencyStore {
+            expected_store: logical_store,
+            store: &fixture.store,
+        },
+        DependencyStore {
+            expected_store: small_store,
+            store: &small.store,
+        },
+    ];
+    authorities.sort_by(|left, right| left.expected_store.cmp(&right.expected_store));
+    assert_eq!(
+        cache.insert(&proof, &authorities).expect("cache insert"),
+        ProofCacheInsert::Inserted
+    );
+    assert_eq!(
+        cache
+            .lookup(&proof.proof_id(), &authorities)
+            .expect("cache lookup"),
+        ProofCacheLookup::Hit(proof.clone())
+    );
+
     let growth = process_high_water_bytes().saturating_sub(before);
-    eprintln!("exact-1-GiB journal-tip VmHWM growth: {growth} bytes");
+    eprintln!("exact-1-GiB journal/proof/cache VmHWM growth: {growth} bytes");
     assert!(
         growth < 256 * 1024 * 1024,
-        "exact journal replay retained {growth} bytes"
+        "exact journal/proof/cache replay retained {growth} bytes"
+    );
+
+    let plus_one = fixture
+        .local
+        .join("events/123e4567-e89b-42d3-a456-426614174999");
+    fs::create_dir_all(&plus_one).expect("plus-one parent");
+    fs::write(
+        plus_one.join("01913f1d-8e2a-7c30-8f4a-426614174999.json"),
+        b"x",
+    )
+    .expect("plus-one byte");
+    assert!(
+        fixture
+            .store
+            .verified_proof(
+                &subject,
+                FIRST_RECORD.parse().expect("record"),
+                "2026-08-12T13:03:01Z".parse().expect("time"),
+            )
+            .is_err(),
+        "aggregate limit +1 must not produce a proof"
+    );
+    assert_eq!(
+        cache
+            .lookup(&proof.proof_id(), &authorities)
+            .expect("plus-one cache lookup"),
+        ProofCacheLookup::Unavailable,
+        "aggregate limit +1 must not supply cache authority"
     );
 }

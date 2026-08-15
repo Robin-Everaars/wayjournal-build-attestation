@@ -563,7 +563,9 @@ fn lock_authorities<'a>(
                     "current durable admission checkpoint is missing".to_owned(),
                 )
             })?;
-        let snapshot = guard.scan_visible_locked().map_err(authority_error)?;
+        let snapshot = guard
+            .validate_visible_s4b_locked()
+            .map_err(authority_error)?;
         let identity = snapshot.identity().ok_or_else(|| {
             ProofCacheError::AuthorityUnavailable(
                 "strict initialized store identity is missing".to_owned(),
