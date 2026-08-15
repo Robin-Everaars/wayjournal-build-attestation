@@ -1,0 +1,41 @@
+name: Foreign native release attestation
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    name: ${{ matrix.system }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04-arm
+            system: aarch64-linux
+          - runner: macos-14
+            system: aarch64-darwin
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Check out attested Wayjournal commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: 1979b158fb2ee8b869800c49510fcffc4713e9bc
+          persist-credentials: false
+      - name: Bind source commit
+        shell: bash
+        run: test "$(git rev-parse HEAD)" = 1979b158fb2ee8b869800c49510fcffc4713e9bc
+      - name: Install Nix
+        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and test every native flake check
+        shell: bash
+        run: nix flake check --print-build-logs
+      - name: Build native release package
+        shell: bash
+        run: nix build ".#packages.${{ matrix.system }}.default" --no-link --print-build-logs
