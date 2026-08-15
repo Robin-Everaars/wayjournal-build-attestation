@@ -24,11 +24,11 @@ jobs:
       - name: Check out attested Wayjournal commit
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: 1979b158fb2ee8b869800c49510fcffc4713e9bc
+          ref: 0724690354f5d8c88e0aff53dc2c9b6d77ac5fe7
           persist-credentials: false
       - name: Bind source commit
         shell: bash
-        run: test "$(git rev-parse HEAD)" = 1979b158fb2ee8b869800c49510fcffc4713e9bc
+        run: test "$(git rev-parse HEAD)" = 0724690354f5d8c88e0aff53dc2c9b6d77ac5fe7
       - name: Install Nix
         uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24
         with:
