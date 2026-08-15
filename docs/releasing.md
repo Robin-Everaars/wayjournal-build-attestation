@@ -19,12 +19,24 @@ Wayjournal releases are source-only. Cargo packages remain `publish = false`; Fo
 
 1. Confirm the candidate has only reviewed release metadata on top of the exact reviewed S5 implementation commit. Record both commit and tree IDs.
 
+1. Verify the exact candidate commit against the configured SSH allowed-signers policy and the release maintainer identity:
+
+   ```console
+   candidate=$(git rev-parse HEAD)
+   git verify-commit "$candidate"
+   expected_signature='G SHA256:lY3cNt8mrdV5ueO4FqErIN1SotpFVBdLw2ER7DSdRkU robineveraars@pm.me'
+   actual_signature=$(git log -1 --format='%G? %GF %GS' "$candidate")
+   test "$actual_signature" = "$expected_signature"
+   ```
+
+   Stop if verification fails, the trust status is not `G`, the fingerprint differs, or the allowed signer is not `robineveraars@pm.me`. Signature presence without this exact trust binding is insufficient. Repeat this block against the merged release commit before tagging.
+
 ## 2. Run source and contract gates
 
 Resolve the native Git executable once and retain it for every Git-executing test:
 
 ```console
-export WAYJOURNAL_TEST_GIT="$(readlink -f "$(command -v git)")"
+export WAYJOURNAL_TEST_GIT="$(python3 -c 'import os, shutil; path = shutil.which("git"); assert path; print(os.path.realpath(path))')"
 test -x "$WAYJOURNAL_TEST_GIT"
 ```
 
@@ -63,7 +75,9 @@ Evaluation is not a native build. On a trusted clean runner whose native Nix sys
 - `aarch64-linux`
 - `x86_64-linux`
 
-check out the exact candidate commit by full object ID, disable credential persistence, verify `git rev-parse HEAD`, and run:
+Linux runners execute the full runtime test suite except the separately invoked explicit ignored capacity/RSS gates. Darwin compiles every target and feature, then executes only `store::non_linux_tests::secure_unnamed_temporary_staging_fails_closed` to prove that secure unnamed staging rejects rather than substituting a weaker named file. The Darwin gate does not claim Linux filesystem, procfs, or Git admission behavior.
+
+On each system, check out the exact candidate commit by full object ID, set checkout `persist-credentials: false`, verify `git rev-parse HEAD`, and run:
 
 ```console
 nix flake check --print-build-logs

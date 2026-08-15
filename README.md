@@ -14,7 +14,8 @@ crates.io. See the [changelog](CHANGELOG.md) for the candidate contract.
 ## Install and inspect safely
 
 Install Nix with flakes enabled, clone the repository, and inspect the CLI version without
-opening a store, contacting a remote, or mutating journal state:
+opening a Wayjournal store, contacting a Wayjournal or Git remote, or mutating journal
+state. Nix may still fetch locked inputs or substitutes that are absent locally:
 
 ```console
 nix run . -- --version

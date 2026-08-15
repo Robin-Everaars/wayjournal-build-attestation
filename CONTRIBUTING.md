@@ -13,7 +13,7 @@ nix develop
 Tests that execute Git must receive the resolved native executable, not an alias, script, or ambient `PATH` lookup:
 
 ```console
-export WAYJOURNAL_TEST_GIT="$(readlink -f "$(command -v git)")"
+export WAYJOURNAL_TEST_GIT="$(python3 -c 'import os, shutil; path = shutil.which("git"); assert path; print(os.path.realpath(path))')"
 ```
 
 Use disposable repositories and state. Tests must not contact production remotes, reuse credentials, or mutate an operator's journal.
@@ -25,8 +25,7 @@ Run the focused regression first, including an observed failing test before prod
 ```console
 nix develop -c cargo fmt --all -- --check
 nix develop -c cargo clippy --locked --workspace --all-targets --all-features -- --deny warnings
-WAYJOURNAL_TEST_GIT="$(readlink -f "$(command -v git)")" \
-  nix develop -c cargo test --locked --release --workspace --all-targets --all-features --no-fail-fast
+nix develop -c cargo test --locked --release --workspace --all-targets --all-features --no-fail-fast
 nix develop -c cargo run --locked --package wayjournal-core --example generate-artifacts -- --check
 nix develop -c reuse lint
 python3 nix/check-release-policy.py
@@ -34,11 +33,10 @@ nix flake check --all-systems --no-build
 nix flake check --print-build-logs
 ```
 
-The normal Nix gate deliberately skips explicit capacity/RSS tests. Security-sensitive or release work must also run every ignored test serially with the resolved Git executable:
+On Linux, `nix flake check` runs the full non-ignored runtime suite. On Darwin, it compiles the workspace with every target and feature, then executes only `store::non_linux_tests::secure_unnamed_temporary_staging_fails_closed`; it does not claim Linux store or Git admission behavior. The normal Linux gate deliberately skips explicit capacity/RSS tests. Security-sensitive or release work must also run every ignored test serially on Linux with the resolved Git executable:
 
 ```console
-WAYJOURNAL_TEST_GIT="$(readlink -f "$(command -v git)")" \
-  nix develop -c cargo test --locked --release --workspace --all-targets --all-features \
+nix develop -c cargo test --locked --release --workspace --all-targets --all-features \
   -- --ignored --test-threads=1
 ```
 

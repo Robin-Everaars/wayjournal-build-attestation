@@ -142,8 +142,11 @@
                   commonArgs
                   // {
                     inherit cargoArtifacts;
-                    pname = "wayjournal-test-compile";
-                    buildPhaseCargoCommand = "cargo check --locked --release --workspace --all-targets --all-features";
+                    pname = "wayjournal-non-linux-check";
+                    buildPhaseCargoCommand = ''
+                      cargo check --locked --release --workspace --all-targets --all-features
+                      cargo test --locked --release --package wayjournal-core --lib --all-features store::non_linux_tests::secure_unnamed_temporary_staging_fails_closed -- --exact
+                    '';
                     installPhaseCommand = ''
                       mkdir -p "$out"
                       touch "$out/passed"
