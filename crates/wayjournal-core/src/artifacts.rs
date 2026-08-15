@@ -1,6 +1,6 @@
 use crate::{
     BATCH_SCHEMA_V1, CATALOG_SCHEMA_V1, IDENTITY_SCHEMA_V1, JSON_CODEC_V1, PROFILE_SCHEMA_V1,
-    RECORD_SCHEMA_V1, REVISION_ALGORITHM_V1,
+    RECORD_SCHEMA_V1, REVISION_ALGORITHM_V1, S5_CAPABILITIES,
 };
 
 pub struct CapabilityManifest {
@@ -23,6 +23,22 @@ pub const CAPABILITY_MANIFEST: CapabilityManifest = CapabilityManifest {
         "waytask.store/blake3-framed-v1",
     ],
 };
+
+/// Additive S5 capability manifest, separate from the frozen ten-entry v1 manifest.
+pub struct S5CapabilityManifest {
+    pub schema: &'static str,
+    pub capabilities: [&'static str; 16],
+}
+
+pub const S5_CAPABILITY_MANIFEST: S5CapabilityManifest = S5CapabilityManifest {
+    schema: "wayjournal.capabilities/v2",
+    capabilities: S5_CAPABILITIES,
+};
+
+// These assignments intentionally fail to compile if the legacy fixed public API changes.
+const _: CapabilityManifest = CAPABILITY_MANIFEST;
+const _: [&str; 10] = CAPABILITY_MANIFEST.capabilities;
+const _: fn() -> [(&'static str, &'static str); 5] = generated_schemas;
 
 const RECORD_SCHEMA: &str = r##"{
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -95,6 +111,12 @@ const BATCH_SCHEMA: &str = r#"{
 const IDENTITY_SCHEMA: &str = include_str!("schemas/wayjournal.identity.v1.json");
 const PROFILE_SCHEMA: &str = include_str!("schemas/wayjournal.profile.v1.json");
 const CATALOG_SCHEMA: &str = include_str!("schemas/wayjournal.catalog.v1.json");
+const REVISION_VECTOR_SCHEMA: &str = include_str!("schemas/wayjournal.revision-vector.v1.json");
+const VERIFIED_PROOF_SCHEMA: &str = include_str!("schemas/wayjournal.verified-proof.v1.json");
+const PROOF_VECTOR_SCHEMA: &str = include_str!("schemas/wayjournal.proof-vector.v1.json");
+const CAPABILITY_OFFER_SCHEMA: &str = include_str!("schemas/wayjournal.capability-offer.v1.json");
+const PROJECTION_CACHE_ENTRY_SCHEMA: &str =
+    include_str!("schemas/wayjournal.projection-cache-entry.v1.json");
 
 #[must_use]
 pub fn generated_schemas() -> [(&'static str, &'static str); 5] {
@@ -105,4 +127,29 @@ pub fn generated_schemas() -> [(&'static str, &'static str); 5] {
         ("wayjournal.profile.v1.json", PROFILE_SCHEMA),
         ("wayjournal.catalog.v1.json", CATALOG_SCHEMA),
     ]
+}
+
+/// Returns the five additive S5 schemas without changing the legacy fixed array.
+#[must_use]
+pub fn generated_s5_schemas() -> [(&'static str, &'static str); 5] {
+    [
+        ("wayjournal.revision-vector.v1.json", REVISION_VECTOR_SCHEMA),
+        ("wayjournal.verified-proof.v1.json", VERIFIED_PROOF_SCHEMA),
+        ("wayjournal.proof-vector.v1.json", PROOF_VECTOR_SCHEMA),
+        (
+            "wayjournal.capability-offer.v1.json",
+            CAPABILITY_OFFER_SCHEMA,
+        ),
+        (
+            "wayjournal.projection-cache-entry.v1.json",
+            PROJECTION_CACHE_ENTRY_SCHEMA,
+        ),
+    ]
+}
+
+/// Iterates the unchanged five legacy schemas followed by the five additive S5 schemas.
+pub fn all_generated_schemas() -> impl Iterator<Item = (&'static str, &'static str)> {
+    generated_schemas()
+        .into_iter()
+        .chain(generated_s5_schemas())
 }

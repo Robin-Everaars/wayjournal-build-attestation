@@ -1,7 +1,14 @@
 use wayjournal_core::{
-    BATCH_SCHEMA_V1, CAPABILITY_MANIFEST, CATALOG_SCHEMA_V1, IDENTITY_SCHEMA_V1, JSON_CODEC_V1,
-    PROFILE_SCHEMA_V1, RECORD_SCHEMA_V1, REVISION_ALGORITHM_V1,
+    BATCH_SCHEMA_V1, CAPABILITY_MANIFEST, CATALOG_SCHEMA_V1, CapabilityManifest,
+    IDENTITY_SCHEMA_V1, JSON_CODEC_V1, PROFILE_SCHEMA_V1, RECORD_SCHEMA_V1, REVISION_ALGORITHM_V1,
+    S5_CAPABILITIES, S5_CAPABILITY_MANIFEST, S5CapabilityManifest,
 };
+
+const _: CapabilityManifest = CAPABILITY_MANIFEST;
+const _: [&str; 10] = CAPABILITY_MANIFEST.capabilities;
+const _: fn() -> [(&'static str, &'static str); 5] = wayjournal_core::generated_schemas;
+const _: S5CapabilityManifest = S5_CAPABILITY_MANIFEST;
+const _: [&str; 16] = S5_CAPABILITY_MANIFEST.capabilities;
 
 #[test]
 fn capability_manifest_is_exactly_the_s3_surface() {
@@ -697,4 +704,130 @@ fn uuid_version_and_variant_matrix_matches_entity_and_store_types() {
             );
         }
     }
+}
+
+#[test]
+fn additive_s5_manifest_schema_arrays_and_checked_artifacts_are_exact() {
+    assert_eq!(S5_CAPABILITY_MANIFEST.schema, "wayjournal.capabilities/v2");
+    assert_eq!(S5_CAPABILITY_MANIFEST.capabilities, S5_CAPABILITIES);
+    let manifest: serde_json::Value = serde_json::from_slice(include_bytes!(
+        "../../../fixtures/wayjournal.capabilities.v2.json"
+    ))
+    .expect("S5 manifest fixture");
+    assert_eq!(manifest["schema"], S5_CAPABILITY_MANIFEST.schema);
+    assert_eq!(
+        manifest["capabilities"],
+        serde_json::to_value(S5_CAPABILITIES).expect("capabilities")
+    );
+
+    let s5 = wayjournal_core::generated_s5_schemas();
+    assert_eq!(s5.len(), 5);
+    for (name, generated) in s5 {
+        let checked = match name {
+            "wayjournal.revision-vector.v1.json" => {
+                include_str!("../../../schemas/wayjournal.revision-vector.v1.json")
+            }
+            "wayjournal.verified-proof.v1.json" => {
+                include_str!("../../../schemas/wayjournal.verified-proof.v1.json")
+            }
+            "wayjournal.proof-vector.v1.json" => {
+                include_str!("../../../schemas/wayjournal.proof-vector.v1.json")
+            }
+            "wayjournal.capability-offer.v1.json" => {
+                include_str!("../../../schemas/wayjournal.capability-offer.v1.json")
+            }
+            "wayjournal.projection-cache-entry.v1.json" => {
+                include_str!("../../../schemas/wayjournal.projection-cache-entry.v1.json")
+            }
+            other => panic!("unexpected S5 schema {other}"),
+        };
+        assert_eq!(checked, generated, "S5 schema drift for {name}");
+    }
+
+    let names = wayjournal_core::all_generated_schemas()
+        .map(|(name, _)| name)
+        .collect::<Vec<_>>();
+    assert_eq!(names.len(), 10);
+    assert_eq!(
+        &names[..5],
+        &wayjournal_core::generated_schemas().map(|(name, _)| name)
+    );
+    assert_eq!(
+        &names[5..],
+        &wayjournal_core::generated_s5_schemas().map(|(name, _)| name)
+    );
+    assert!(names.iter().all(|name| !name.contains("contradiction")));
+}
+
+#[test]
+fn s5_schemas_accept_goldens_enforce_closed_bounds_and_leave_runtime_invariants_to_codecs() {
+    let artifacts = [
+        (
+            include_str!("../../../schemas/wayjournal.revision-vector.v1.json"),
+            include_str!("../../../fixtures/wayjournal.revision-vector.v1.json"),
+        ),
+        (
+            include_str!("../../../schemas/wayjournal.verified-proof.v1.json"),
+            include_str!("../../../fixtures/wayjournal.verified-proof.v1.json"),
+        ),
+        (
+            include_str!("../../../schemas/wayjournal.proof-vector.v1.json"),
+            include_str!("../../../fixtures/wayjournal.proof-vector.v1.json"),
+        ),
+        (
+            include_str!("../../../schemas/wayjournal.capability-offer.v1.json"),
+            include_str!("../../../fixtures/wayjournal.capability-offer.v1.json"),
+        ),
+        (
+            include_str!("../../../schemas/wayjournal.projection-cache-entry.v1.json"),
+            include_str!("../../../fixtures/wayjournal.projection-cache-entry.v1.json"),
+        ),
+    ];
+    for (schema, fixture) in artifacts {
+        let schema: serde_json::Value = serde_json::from_str(schema).expect("S5 schema");
+        let validator = jsonschema::validator_for(&schema).expect("S5 validator");
+        let fixture: serde_json::Value = serde_json::from_str(fixture).expect("S5 fixture");
+        assert!(
+            validator.is_valid(&fixture),
+            "invalid golden for {}",
+            schema["title"]
+        );
+        let mut open = fixture.clone();
+        open["unknown"] = serde_json::json!(true);
+        assert!(
+            !validator.is_valid(&open),
+            "open root for {}",
+            schema["title"]
+        );
+    }
+
+    let schema: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../schemas/wayjournal.revision-vector.v1.json"
+    ))
+    .expect("revision schema");
+    let validator = jsonschema::validator_for(&schema).expect("revision validator");
+    let fixture: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../fixtures/wayjournal.revision-vector.v1.json"
+    ))
+    .expect("revision fixture");
+    let entry = fixture["entries"][0].clone();
+    let mut property_duplicate = fixture.clone();
+    let mut changed = entry.clone();
+    changed["revision"]["digest"] = serde_json::json!("4".repeat(64));
+    property_duplicate["entries"] = serde_json::json!([entry.clone(), changed]);
+    assert!(
+        validator.is_valid(&property_duplicate),
+        "standard JSON Schema uniqueItems only detects identical array items"
+    );
+    let bytes = serde_json::to_vec_pretty(&property_duplicate)
+        .map(|mut bytes| {
+            bytes.push(b'\n');
+            bytes
+        })
+        .expect("canonical hostile vector");
+    assert!(wayjournal_core::decode_revision_vector(&bytes).is_err());
+
+    let mut identical = fixture;
+    identical["entries"] = serde_json::json!([entry.clone(), entry]);
+    assert!(!validator.is_valid(&identical));
 }

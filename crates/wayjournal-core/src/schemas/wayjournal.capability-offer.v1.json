@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://wayjournal.dev/schemas/wayjournal.capability-offer.v1.json",
+  "title": "wayjournal.capability-offer/v1",
+  "$defs": {
+    "logicalStoreId": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["genesis_fingerprint", "store_uuid"],
+      "properties": {
+        "genesis_fingerprint": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "store_uuid": {"type": "string", "format": "uuid", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"}
+      }
+    },
+    "identifier": {
+      "type": "string",
+      "maxLength": 128,
+      "pattern": "^[a-z][a-z0-9_-]{0,62}(?:\\.[a-z][a-z0-9_-]{0,62})+/[a-z0-9][a-z0-9._-]{0,63}$"
+    },
+    "identifierSet": {
+      "type": "array",
+      "maxItems": 64,
+      "uniqueItems": true,
+      "x-wayjournal-sorted": true,
+      "items": {"$ref": "#/$defs/identifier"}
+    }
+  },
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["logical_store_id", "required_capabilities", "required_projections", "schema", "supported_capabilities", "supported_projections"],
+  "properties": {
+    "logical_store_id": {"$ref": "#/$defs/logicalStoreId"},
+    "required_capabilities": {"$ref": "#/$defs/identifierSet"},
+    "required_projections": {"$ref": "#/$defs/identifierSet"},
+    "schema": {"const": "wayjournal.capability-offer/v1"},
+    "supported_capabilities": {"$ref": "#/$defs/identifierSet"},
+    "supported_projections": {"$ref": "#/$defs/identifierSet"}
+  },
+  "x-wayjournal-maxBytes": 65536
+}

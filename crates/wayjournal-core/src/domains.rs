@@ -141,7 +141,6 @@ pub(crate) struct DomainOperationHeader {
     entity_id: EntityId,
     parents: Vec<RecordId>,
     domain: DomainId,
-    target: Option<LogicalStoreId>,
 }
 
 impl CausalNode for DomainOperationHeader {
@@ -155,10 +154,6 @@ impl CausalNode for DomainOperationHeader {
 }
 
 impl DomainOperation {
-    pub(crate) fn target(&self) -> Option<&LogicalStoreId> {
-        self.target.as_ref()
-    }
-
     pub(crate) fn into_header(self, source: usize) -> DomainOperationHeader {
         DomainOperationHeader {
             source,
@@ -166,7 +161,6 @@ impl DomainOperation {
             entity_id: self.entity_id,
             parents: self.parents,
             domain: self.domain,
-            target: self.target,
         }
     }
 }
@@ -894,6 +888,23 @@ fn ensure_reachability_budget(exceeded: bool) -> Result<(), FoldError> {
     }
 }
 
+fn apply_catalog_operation<T: CausalNode, S: FoldAccumulator + Default>(
+    graph: &CausalGraph<'_, T>,
+    operation: &DomainOperation,
+    states: &mut BTreeMap<LogicalStoreId, S>,
+    reachability_budget: &mut usize,
+    reachability_exceeded: &mut bool,
+) -> Result<(), FoldError> {
+    let target = operation.target.clone().ok_or(FoldError::WrongEntity)?;
+    apply_operation(
+        graph,
+        operation,
+        states.entry(target).or_default(),
+        reachability_budget,
+        reachability_exceeded,
+    )
+}
+
 fn fold(operations: &[DomainOperation], expected_domain: &str) -> Result<FoldState, FoldError> {
     let graph = CausalGraph::new(operations)?;
     let entity = operations.first().map(|op| op.entity_id);
@@ -984,23 +995,6 @@ pub(crate) fn validate_loaded_builtin_fold<E>(
         return Ok(());
     };
     let expected_domain = first.domain.to_string();
-    if expected_domain == "wayjournal.catalog" {
-        let expected = first
-            .target
-            .clone()
-            .ok_or_else(|| FoldLoadError::Fold(FoldError::WrongEntity))?;
-        if let Some(actual) = operations
-            .iter()
-            .filter_map(|operation| operation.target.as_ref())
-            .find(|actual| **actual != expected)
-        {
-            return Err(FoldLoadError::Fold(FoldError::WrongTarget {
-                expected,
-                actual: actual.clone(),
-            }));
-        }
-    }
-
     let graph = CausalGraph::new(operations)
         .map_err(FoldError::from)
         .map_err(FoldLoadError::Fold)?;
@@ -1011,19 +1005,31 @@ pub(crate) fn validate_loaded_builtin_fold<E>(
         return Err(FoldLoadError::Fold(FoldError::WrongEntity));
     }
 
-    let mut state = ValidationFoldState::default();
+    let mut profile_state = ValidationFoldState::default();
+    let mut catalog_states = BTreeMap::<LogicalStoreId, ValidationFoldState>::new();
     let mut reachability_budget = crate::MAX_REACHABILITY_STEPS;
     let mut reachability_exceeded = false;
     for header in graph.ordered() {
         let operation = load(header.source).map_err(FoldLoadError::Load)?;
-        apply_operation(
-            &graph,
-            &operation,
-            &mut state,
-            &mut reachability_budget,
-            &mut reachability_exceeded,
-        )
-        .map_err(FoldLoadError::Fold)?;
+        if expected_domain == "wayjournal.catalog" {
+            apply_catalog_operation(
+                &graph,
+                &operation,
+                &mut catalog_states,
+                &mut reachability_budget,
+                &mut reachability_exceeded,
+            )
+            .map_err(FoldLoadError::Fold)?;
+        } else {
+            apply_operation(
+                &graph,
+                &operation,
+                &mut profile_state,
+                &mut reachability_budget,
+                &mut reachability_exceeded,
+            )
+            .map_err(FoldLoadError::Fold)?;
+        }
     }
     Ok(())
 }
@@ -1128,75 +1134,118 @@ pub fn fold_profile(operations: &[DomainOperation]) -> Result<AdvisoryProfile, F
     })
 }
 
-/// Deterministically folds one target's closed catalog operations.
-/// # Errors
-/// Rejects mixed targets/entities, invalid causal graphs, resolutions, and removes.
-pub fn fold_catalog(operations: &[DomainOperation]) -> Result<CatalogEntry, FoldError> {
-    let target = operations
-        .first()
-        .and_then(|op| op.target.clone())
-        .ok_or(FoldError::WrongEntity)?;
-    if let Some(actual) = operations
-        .iter()
-        .filter_map(|op| op.target.as_ref())
-        .find(|value| **value != target)
-    {
-        return Err(FoldError::WrongTarget {
-            expected: target,
-            actual: actual.clone(),
-        });
-    }
-    let state = fold(operations, "wayjournal.catalog")?;
-    Ok(CatalogEntry {
+fn catalog_entry(target: LogicalStoreId, state: &FoldState) -> CatalogEntry {
+    CatalogEntry {
         target,
-        entry_name: register(&state, ScalarField::EntryName, |v| {
+        entry_name: register(state, ScalarField::EntryName, |v| {
             if let ScalarValue::Text(v) = v {
                 Some(v.clone())
             } else {
                 None
             }
         }),
-        enabled: register(&state, ScalarField::Enabled, |v| {
+        enabled: register(state, ScalarField::Enabled, |v| {
             if let ScalarValue::Bool(v) = v {
                 Some(*v)
             } else {
                 None
             }
         }),
-        contextual_default_store: register(&state, ScalarField::DefaultStore, |v| {
+        contextual_default_store: register(state, ScalarField::DefaultStore, |v| {
             if let ScalarValue::Store(v) = v {
                 Some(v.clone())
             } else {
                 None
             }
         }),
-        aliases: values(&state, SetField::Alias, |v| {
+        aliases: values(state, SetField::Alias, |v| {
             if let SetValue::Text(v) = v {
                 Some(v.clone())
             } else {
                 None
             }
         }),
-        candidate_remotes: values(&state, SetField::Remote, |v| {
+        candidate_remotes: values(state, SetField::Remote, |v| {
             if let SetValue::Remote(v) = v {
                 Some(v.clone())
             } else {
                 None
             }
         }),
-        groups: values(&state, SetField::Group, |v| {
+        groups: values(state, SetField::Group, |v| {
             if let SetValue::Text(v) = v {
                 Some(v.clone())
             } else {
                 None
             }
         }),
-        store_relations: values(&state, SetField::Relation, |v| {
+        store_relations: values(state, SetField::Relation, |v| {
             if let SetValue::Relation(v) = v {
                 Some(v.clone())
             } else {
                 None
             }
         }),
-    })
+    }
+}
+
+/// Deterministically folds a complete catalog entity into target-partitioned advisory state.
+///
+/// The causal graph spans every target, so cross-target parents are valid ancestry. Register
+/// resolutions and observed removes affect only the active values of the addressed target.
+/// # Errors
+/// Rejects mixed entities, invalid causal graphs, fake/partial resolutions, and invalid removes.
+pub fn fold_catalogs(
+    operations: &[DomainOperation],
+) -> Result<BTreeMap<LogicalStoreId, CatalogEntry>, FoldError> {
+    let graph = CausalGraph::new(operations)?;
+    let entity = operations.first().map(|operation| operation.entity_id);
+    if operations.iter().any(|operation| {
+        operation.domain.as_str() != "wayjournal.catalog" || Some(operation.entity_id) != entity
+    }) {
+        return Err(FoldError::WrongEntity);
+    }
+
+    let mut states = BTreeMap::<LogicalStoreId, FoldState>::new();
+    let mut reachability_budget = crate::MAX_REACHABILITY_STEPS;
+    let mut reachability_exceeded = false;
+    for operation in graph.ordered() {
+        apply_catalog_operation(
+            &graph,
+            operation,
+            &mut states,
+            &mut reachability_budget,
+            &mut reachability_exceeded,
+        )?;
+    }
+    Ok(states
+        .into_iter()
+        .map(|(target, state)| {
+            let entry = catalog_entry(target.clone(), &state);
+            (target, entry)
+        })
+        .collect())
+}
+
+/// Deterministically folds one target's closed catalog operations.
+/// # Errors
+/// Rejects mixed targets/entities, invalid causal graphs, resolutions, and removes.
+pub fn fold_catalog(operations: &[DomainOperation]) -> Result<CatalogEntry, FoldError> {
+    let target = operations
+        .first()
+        .and_then(|operation| operation.target.clone())
+        .ok_or(FoldError::WrongEntity)?;
+    if let Some(actual) = operations
+        .iter()
+        .filter_map(|operation| operation.target.as_ref())
+        .find(|actual| **actual != target)
+    {
+        return Err(FoldError::WrongTarget {
+            expected: target,
+            actual: actual.clone(),
+        });
+    }
+    fold_catalogs(operations)?
+        .remove(&target)
+        .ok_or(FoldError::WrongEntity)
 }

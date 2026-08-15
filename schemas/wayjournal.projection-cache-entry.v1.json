@@ -1,0 +1,82 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://wayjournal.dev/schemas/wayjournal.projection-cache-entry.v1.json",
+  "title": "wayjournal.projection-cache-entry/v1",
+  "$defs": {
+    "logicalStoreId": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["genesis_fingerprint", "store_uuid"],
+      "properties": {
+        "genesis_fingerprint": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "store_uuid": {"type": "string", "format": "uuid", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"}
+      }
+    },
+    "storeRevision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["algorithm", "digest"],
+      "properties": {
+        "algorithm": {"const": "wayjournal.store/blake3-framed-v1"},
+        "digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "revisionVector": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["entries", "schema"],
+      "properties": {
+        "entries": {
+          "type": "array",
+          "maxItems": 256,
+          "uniqueItems": true,
+          "x-wayjournal-sorted-by": "store",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["revision", "store"],
+            "properties": {
+              "revision": {"$ref": "#/$defs/storeRevision"},
+              "store": {"$ref": "#/$defs/logicalStoreId"}
+            }
+          }
+        },
+        "schema": {"const": "wayjournal.revision-vector/v1"}
+      }
+    },
+    "qualifiedEntityRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["domain", "entity_id", "store"],
+      "properties": {
+        "domain": {"type": "string", "maxLength": 128, "pattern": "^[a-z][a-z0-9_-]{0,62}(\\.[a-z][a-z0-9_-]{0,62})+$"},
+        "entity_id": {"type": "string", "format": "uuid", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1345678][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"},
+        "store": {"$ref": "#/$defs/logicalStoreId"}
+      }
+    },
+    "verifiedProof": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["local_trust_binding", "observed_at", "proof_id", "record_id", "schema", "source_revision", "subject"],
+      "properties": {
+        "local_trust_binding": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "observed_at": {"type": "string", "format": "date-time", "maxLength": 33, "pattern": "^(?:[0-9]{4}|[+-][0-9]{6})-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]{0,8}[1-9])?Z$"},
+        "proof_id": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "record_id": {"type": "string", "format": "uuid", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"},
+        "schema": {"const": "wayjournal.verified-proof/v1"},
+        "source_revision": {"$ref": "#/$defs/storeRevision"},
+        "subject": {"$ref": "#/$defs/qualifiedEntityRef"}
+      }
+    }
+  },
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["dependencies", "proof", "schema"],
+  "properties": {
+    "dependencies": {"$ref": "#/$defs/revisionVector"},
+    "proof": {"$ref": "#/$defs/verifiedProof"},
+    "schema": {"const": "wayjournal.projection-cache-entry/v1"}
+  },
+  "x-wayjournal-maxBytes": 65536,
+  "x-wayjournal-runtimeCrossBinding": "exactly one dependency must name proof.subject.store and equal proof.source_revision"
+}

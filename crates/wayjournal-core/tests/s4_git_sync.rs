@@ -1165,7 +1165,6 @@ fn hostile_inherited_and_global_git_configuration_is_inert() {
 
     let status = Command::new(std::env::current_exe().expect("test executable"))
         .args([
-            "--exact",
             "hostile_inherited_and_global_git_configuration_is_inert",
             "--nocapture",
         ])
@@ -1323,7 +1322,7 @@ fn restrictive_umask_still_creates_a_private_reopenable_checkpoint() {
     let status = Command::new("/bin/sh")
         .args([
             "-c",
-            "umask 0777; exec \"$WAYJOURNAL_TEST_BINARY\" --exact restrictive_umask_still_creates_a_private_reopenable_checkpoint --nocapture",
+            "umask 0777; exec \"$WAYJOURNAL_TEST_BINARY\" restrictive_umask_still_creates_a_private_reopenable_checkpoint --nocapture",
         ])
         .env(CHILD, "1")
         .env("WAYJOURNAL_UMASK_LOCAL", fixture.local.path())

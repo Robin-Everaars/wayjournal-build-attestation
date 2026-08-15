@@ -4,18 +4,16 @@ Wayjournal is a generic, federated substrate for immutable journals stored in
 ordinary Git repositories. It is intended to provide domain-neutral journal
 primitives that independent applications can build on.
 
-The wire slice, the Linux filesystem store, identity/profile/catalog domains, and
-read-only Git admission bootstrap are implemented. They provide strict canonical JSON,
-closed generic record and batch envelopes, typed immutable logical store identity,
-deterministic causal folds for advisory profiles and catalogs, canonical path
-classification, deterministic revisions, and checked protocol artifacts. The local
-store uses descriptor-relative publication and explicit durability barriers; recovery
-is tested at those modeled barriers, not against arbitrary device, kernel, or filesystem
-failures. S4b adds retained pending/quarantine roots, closed bounded pending and
-quarantine codecs, full-capacity chunk metadata, pending-aware Store access, complete
-monotonic history validation, immutable exact union, descriptor-safe bulk recovery,
-expected-old local-ref/checkpoint transitions, one-ref lease push with observation,
-and two-slot stale-successor recovery.
+The wire slice, Linux filesystem store, identity/profile/catalog domains, Git union
+admission, and S5 federation projections are implemented. They provide strict canonical
+JSON, closed generic record and batch envelopes, typed immutable logical store identity,
+deterministic causal folds for advisory profiles and multi-target catalogs, canonical
+path classification, deterministic revisions, checked protocol artifacts, locally
+verified presence proofs, capability negotiation, disposable proof caching, and
+preflighted multi-store synchronization. The local store uses descriptor-relative
+publication and explicit durability barriers; recovery is tested at those modeled
+barriers, not against arbitrary device, kernel, or filesystem failures. S4b supplies the
+retained pending/quarantine roots and exact union/CAS authority on which S5 relies.
 
 ## Product boundaries
 
@@ -65,10 +63,53 @@ and two-slot stale-successor recovery.
   Git settings before transfer.
 - Git CLI fetch cannot portably impose a hard pack-byte cap before Git writes received
   objects. Concurrent hostile rewriting of Git metadata is outside the cooperative
-  locking boundary. Proofs, projections, and consumer semantics remain out of scope.
+  locking boundary. S5 proofs are exact local presence projections created only from a
+  current durable checkpoint and matching canonical snapshot under one retained lock.
+  They are integrity identifiers, not signatures, remote attestations, claims, or
+  independent freshness authority.
 - `Store::open` is the secure S3 default and requires a sealed built-in registry from
   `wayjournal_domain_registry[_with]`. Existing S1/S2 callers must migrate explicitly
   to `Store::open_legacy_s1_s2`; that compatibility API refuses S3 built-in records.
+
+## Three authority planes
+
+Wayjournal keeps three planes separate:
+
+1. **Canonical Git journal state.** Immutable records, batches, identity, advisory
+   profile/catalog operations, and their deterministic store revision are the portable
+   journal. Catalog remotes, aliases, groups, defaults, enabled flags, and capability
+   hints remain advisory and cannot authorize synchronization or proof freshness.
+1. **Durable local authority state.** Admission checkpoints bind the logical identity,
+   accepted Git commit/revision, local trust, approved remote, and approved ref. Pending
+   recovery and quarantine are local durable safety state. This plane alone authorizes
+   Git admission and supplies the current revision used by S5 projections.
+1. **Disposable local proofs, projections, and cache.** A `VerifiedProof` records that an
+   exact record was present in the canonical snapshot matching the current checkpoint
+   when observed. Its BLAKE3 identifier is not a signature. Revision/proof vectors are
+   bounded serialized data, never statements that their revisions are current. The
+   proof cache has no fsync promise and no journal, checkpoint, trust, quarantine, or Git
+   authority; deleting it changes no durable meaning.
+
+Cache lookup and insertion resolve every dependency only from current durable admission
+checkpoints while retaining all dependency-store locks in logical-store order. A
+serialized or caller-retained revision vector can never enter that freshness-authority
+path. Missing, malformed, pending-blocked, identity-confused, changed, or reset authority
+returns no hit, and cache-root replacement permanently latches the opened cache handle as
+reset.
+
+`sync_stores` first performs a complete ordered, duplicate-free, at-most-256-target
+preflight. It checks every current checkpoint, store identity, request authority, sealed
+handshake checkpoint, and negotiated Git union/CAS capability before any transfer-capable
+operation. After preflight, each target must repeat the complete checkpoint/handshake,
+identity, trust, approved remote/ref, and sync-capability checks while continuously
+holding that target's exact transfer lock through Git, pending, and CAS work. Stores then
+complete independently in input order; one runtime error never rolls back another store.
+Per-target authorization and legacy synchronization failures use the additive
+`AuthorizedGitSyncError`; the finalized S4 `GitSyncError` surface remains unchanged.
+
+Consumers own publication and folding of invalidation records, the meaning of
+contradictions, TTL/expiry policy, and every task, workflow, readiness, claim, routing,
+recipient, and scheduler semantic. S5 exposes no such consumer policy.
 
 ## Repository layout
 

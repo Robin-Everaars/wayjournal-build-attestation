@@ -1,0 +1,37 @@
+{
+  "dependencies": {
+    "entries": [
+      {
+        "revision": {
+          "algorithm": "wayjournal.store/blake3-framed-v1",
+          "digest": "3c4835897266c2b72f1ad9528309c6002f388071b0e9c780827bedbfaa35ce15"
+        },
+        "store": {
+          "genesis_fingerprint": "7b9565665e24d18788f1a681d7cea3e2a07da23bea8f9861911f0e84023a9447",
+          "store_uuid": "01913f1d-8e2a-7c30-8f4a-426614174010"
+        }
+      }
+    ],
+    "schema": "wayjournal.revision-vector/v1"
+  },
+  "proof": {
+    "local_trust_binding": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "observed_at": "2026-08-12T13:00:01Z",
+    "proof_id": "99bf2caf35a7b5e12d6b82ae2948ec627098e9a11152533cfdfcd711fd214922",
+    "record_id": "01913f1d-8e2a-7c30-8f4a-426614174011",
+    "schema": "wayjournal.verified-proof/v1",
+    "source_revision": {
+      "algorithm": "wayjournal.store/blake3-framed-v1",
+      "digest": "3c4835897266c2b72f1ad9528309c6002f388071b0e9c780827bedbfaa35ce15"
+    },
+    "subject": {
+      "domain": "wayjournal.profile",
+      "entity_id": "123e4567-e89b-42d3-a456-426614174000",
+      "store": {
+        "genesis_fingerprint": "7b9565665e24d18788f1a681d7cea3e2a07da23bea8f9861911f0e84023a9447",
+        "store_uuid": "01913f1d-8e2a-7c30-8f4a-426614174010"
+      }
+    }
+  },
+  "schema": "wayjournal.projection-cache-entry/v1"
+}

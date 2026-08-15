@@ -413,6 +413,10 @@ pub(super) struct UnsnapshottedExclusive<'a> {
     local_guard: RwLockWriteGuard<'a, ()>,
 }
 impl<'a> UnsnapshottedExclusive<'a> {
+    pub(crate) const fn store(&self) -> &Store {
+        self.store
+    }
+
     pub(super) fn recover_transactions(&self) -> Result<(), StoreError> {
         transaction::recover_locked_default(self.store)
     }
@@ -813,6 +817,26 @@ impl Directory {
             && entry.st_ino == retained.st_ino
             && FileType::from_raw_mode(entry.st_mode) == FileType::Directory)
     }
+    pub(crate) fn file_entry_is(&self, name: &OsStr, file: &File) -> Result<bool, StoreError> {
+        validate_component(name, &self.path)?;
+        let entry = rfs::statat(&self.file, name, AtFlags::SYMLINK_NOFOLLOW).map_err(|error| {
+            io_error(
+                "inspect retained file entry",
+                &self.path.join(name),
+                error.into(),
+            )
+        })?;
+        let retained = rfs::fstat(file).map_err(|error| {
+            io_error(
+                "inspect retained file descriptor",
+                &self.path.join(name),
+                error.into(),
+            )
+        })?;
+        Ok(entry.st_dev == retained.st_dev
+            && entry.st_ino == retained.st_ino
+            && FileType::from_raw_mode(entry.st_mode) == FileType::RegularFile)
+    }
     pub fn lock_file(&self) -> Result<File, StoreError> {
         let fd = rfs::openat(
             &self.file,
@@ -1058,6 +1082,65 @@ impl Store {
     pub fn exclusive_snapshot(&self) -> Result<ExclusiveSnapshot<'_>, StoreError> {
         transaction::exclusive_snapshot(self)
     }
+
+    /// Creates a local presence proof from the current durable checkpoint and canonical snapshot.
+    ///
+    /// The checkpoint is read while the retained-root exclusive lock is held. Its identity and
+    /// revision must equal the validated snapshot and requested subject, and the requested record
+    /// must be present at that subject. The caller supplies only provenance time, never trust,
+    /// remote/ref approval, checkpoint identity, or revision authority.
+    ///
+    /// # Errors
+    /// Fails closed for pending/recovery state, missing or malformed checkpoint authority,
+    /// identity/revision disagreement, an absent record, or a record/subject mismatch.
+    pub fn verified_proof(
+        &self,
+        subject: &crate::QualifiedEntityRef,
+        record_id: RecordId,
+        observed_at: crate::RecordTimestamp,
+    ) -> Result<crate::VerifiedProof, crate::ProofError> {
+        let guard = self.lock_exclusive_unsnapshotted()?;
+        crate::federation::pending::clean_disposable_locked(self)?;
+        if crate::federation::pending::gate_without_git(self)?
+            != crate::federation::pending::GateAction::Allow
+        {
+            return Err(StoreError::InvalidGitSyncState {
+                message: "disposable pending cleanup did not converge".to_owned(),
+            }
+            .into());
+        }
+        guard.recover_transactions()?;
+        let checkpoint = crate::federation::admission_checkpoint_locked(&guard)?
+            .ok_or(crate::ProofError::MissingCheckpoint)?;
+        let snapshot = guard.scan_visible_locked()?;
+        let identity = snapshot
+            .identity()
+            .ok_or(crate::ProofError::MissingIdentity)?;
+        if checkpoint.logical_store_id() != identity.logical_id()
+            || checkpoint.logical_store_id() != &subject.store
+        {
+            return Err(crate::ProofError::IdentityMismatch);
+        }
+        if checkpoint.accepted_revision() != snapshot.revision() {
+            return Err(crate::ProofError::RevisionMismatch);
+        }
+        let record = snapshot
+            .records()
+            .iter()
+            .find(|record| record.record_id == record_id)
+            .ok_or(crate::ProofError::RecordNotFound)?;
+        if record.domain != subject.domain || record.entity_id != subject.entity_id {
+            return Err(crate::ProofError::SubjectMismatch);
+        }
+        Ok(crate::VerifiedProof::from_checkpoint(
+            subject.clone(),
+            record_id,
+            checkpoint.accepted_revision(),
+            *checkpoint.local_trust_binding(),
+            observed_at,
+        ))
+    }
+
     /// Publishes one prepared generic batch at exactly `expected`.
     /// # Errors
     /// Returns stale revision, collision, recovery, validation, or I/O failures.
@@ -1603,7 +1686,7 @@ fn validate_builtin_folds<'a>(
         let result = if domain == "wayjournal.profile" {
             crate::fold_profile(&operations).map(|_| ())
         } else {
-            crate::fold_catalog(&operations).map(|_| ())
+            crate::fold_catalogs(&operations).map(|_| ())
         };
         result.map_err(|error| StoreError::Corrupt {
             issue: StoreCorruption::InvalidDomainFold {

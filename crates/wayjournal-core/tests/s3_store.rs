@@ -206,10 +206,6 @@ fn hostile_histories() -> Vec<(&'static str, Vec<Record>)> {
         "genesis_fingerprint":"3c4835897266c2b72f1ad9528309c6002f388071b0e9c780827bedbfaa35ce15",
         "store_uuid":"01913f1d-8e2a-7c30-8f4a-426614174010"
     });
-    let other = json!({
-        "genesis_fingerprint":"3c4835897266c2b72f1ad9528309c6002f388071b0e9c780827bedbfaa35ce15",
-        "store_uuid":"01913f1d-8e2a-7c30-8f4a-426614174020"
-    });
     vec![
         (
             "dangling",
@@ -332,27 +328,6 @@ fn hostile_histories() -> Vec<(&'static str, Vec<Record>)> {
                     batch,
                     &[one],
                     json!({"adds":[one,three],"key":"me"}),
-                ),
-            ],
-        ),
-        (
-            "mixed-catalog-target",
-            vec![
-                record(
-                    "wayjournal.catalog",
-                    "catalog.name.set",
-                    one,
-                    batch,
-                    &[],
-                    json!({"target":target,"value":"one"}),
-                ),
-                record(
-                    "wayjournal.catalog",
-                    "catalog.enabled.set",
-                    two,
-                    batch,
-                    &[],
-                    json!({"target":other,"value":true}),
                 ),
             ],
         ),

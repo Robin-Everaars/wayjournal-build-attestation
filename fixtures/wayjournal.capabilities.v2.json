@@ -1,0 +1,21 @@
+{
+  "capabilities": [
+    "wayjournal.json/v1",
+    "wayjournal.record/v1",
+    "wayjournal.batch/v1",
+    "wayjournal.layout/v1",
+    "wayjournal.store/blake3-framed-v1",
+    "wayjournal.identity/v1",
+    "wayjournal.profile/v1",
+    "wayjournal.catalog/v1",
+    "wayjournal.admission-checkpoint/v1",
+    "wayjournal.sync/git-union-cas-v1",
+    "wayjournal.verified-proof/v1",
+    "wayjournal.revision-vector/v1",
+    "wayjournal.proof-vector/v1",
+    "wayjournal.projection-cache/v1",
+    "waytask.layout/v1",
+    "waytask.store/blake3-framed-v1"
+  ],
+  "schema": "wayjournal.capabilities/v2"
+}

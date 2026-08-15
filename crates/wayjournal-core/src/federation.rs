@@ -22,11 +22,22 @@ mod checkpoint;
 mod fault;
 mod git;
 mod history;
+mod multi;
 pub(crate) mod pending;
 mod quarantine;
 pub use checkpoint::CheckpointError;
 pub use git::GitCommandError;
+pub use multi::{
+    AuthorizedGitSyncError, CheckpointObservationError, MAX_MULTI_SYNC_TARGETS,
+    MultiStoreSyncError, PerStoreSyncResult, StoreSyncTarget, sync_stores,
+};
 pub use quarantine::QuarantineError;
+
+pub(crate) fn admission_checkpoint_locked(
+    guard: &crate::store::UnsnapshottedExclusive<'_>,
+) -> Result<Option<AdmissionCheckpoint>, CheckpointError> {
+    checkpoint::read(guard.store())
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum GitObjectFormat {
@@ -605,10 +616,59 @@ impl crate::Store {
     /// Explicitly advances the approved Git replica after a checkpoint has been bootstrapped.
     /// # Errors
     /// Fails closed when bootstrap or advancing synchronization is required.
-    #[allow(clippy::too_many_lines)]
     pub fn sync_git_union(&self, request: &GitSyncRequest) -> Result<GitSyncOutcome, GitSyncError> {
         self.require_legacy_streaming(crate::LegacyStreamRequirement::FullDomainBounded)?;
         let guard = self.lock_exclusive_unsnapshotted()?;
+        self.sync_git_union_locked(request, &guard, None)
+    }
+
+    /// Enters the S4 union core only after revalidating a sealed handshake while continuously
+    /// retaining the exact lock used by every transfer-capable operation.
+    pub(crate) fn sync_git_union_authorized(
+        &self,
+        request: &GitSyncRequest,
+        handshake: &crate::NegotiatedHandshake,
+    ) -> Result<GitSyncOutcome, AuthorizedGitSyncError> {
+        self.require_legacy_streaming(crate::LegacyStreamRequirement::FullDomainBounded)
+            .map_err(GitSyncError::from)?;
+        let guard = self
+            .lock_exclusive_unsnapshotted()
+            .map_err(GitSyncError::from)?;
+        let checkpoint = admission_checkpoint_locked(&guard)
+            .map_err(GitSyncError::from)?
+            .ok_or(GitSyncError::BootstrapRequired)?;
+        if handshake.logical_store_id() != checkpoint.logical_store_id() {
+            return Err(AuthorizedGitSyncError::HandshakeIdentityMismatch);
+        }
+        if handshake.bound_checkpoint() != &checkpoint {
+            return Err(AuthorizedGitSyncError::StaleHandshake);
+        }
+        let current = guard
+            .validate_visible_s4b_locked()
+            .map_err(GitSyncError::from)?;
+        if current
+            .identity()
+            .is_none_or(|identity| identity.logical_id() != checkpoint.logical_store_id())
+        {
+            return Err(
+                GitSyncError::Admission(GitAdmissionError::CheckpointIdentityMismatch).into(),
+            );
+        }
+        require_checkpoint_authority(&checkpoint, request)?;
+        if !handshake.supports_git_union_cas() {
+            return Err(AuthorizedGitSyncError::MissingNegotiatedSyncCapability);
+        }
+        self.sync_git_union_locked(request, &guard, Some(checkpoint))
+            .map_err(Into::into)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn sync_git_union_locked(
+        &self,
+        request: &GitSyncRequest,
+        guard: &crate::store::UnsnapshottedExclusive<'_>,
+        authorized_checkpoint: Option<AdmissionCheckpoint>,
+    ) -> Result<GitSyncOutcome, GitSyncError> {
         if let Some(incident) = quarantine::active(self, request)? {
             return Ok(GitSyncOutcome::Quarantined {
                 incident_id: incident.incident_id,
@@ -616,8 +676,14 @@ impl crate::Store {
             });
         }
         quarantine::ensure_capacity(self)?;
-        let checkpoint = checkpoint::read(self)?.ok_or(GitSyncError::BootstrapRequired)?;
-        require_checkpoint_authority(&checkpoint, request)?;
+        let checkpoint = if let Some(checkpoint) = authorized_checkpoint {
+            checkpoint
+        } else {
+            let checkpoint =
+                admission_checkpoint_locked(guard)?.ok_or(GitSyncError::BootstrapRequired)?;
+            require_checkpoint_authority(&checkpoint, request)?;
+            checkpoint
+        };
         let discovery = pending::discover(self)?;
         if discovery.active.is_some() && self.has_transaction_residue_locked()? {
             return Err(crate::StoreError::ConflictingRecoveryState.into());
@@ -631,7 +697,7 @@ impl crate::Store {
             return recover_sync_operation(
                 self,
                 request,
-                &guard,
+                guard,
                 checkpoint,
                 active,
                 discovery.predecessor,
@@ -650,7 +716,7 @@ impl crate::Store {
             None,
         )? {
             StartOperation::Pending(active) => {
-                recover_sync_operation(self, request, &guard, checkpoint, *active, None)
+                recover_sync_operation(self, request, guard, checkpoint, *active, None)
             }
             StartOperation::Quarantined(outcome) => Ok(outcome),
         }

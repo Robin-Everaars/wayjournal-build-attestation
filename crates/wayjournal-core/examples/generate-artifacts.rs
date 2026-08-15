@@ -2,13 +2,25 @@ use std::{env, fs, path::Path};
 
 use serde_json::{Value, json};
 use wayjournal_core::{
-    ActorId, DomainRegistration, DomainRegistry, KindId, Record, encode_record, generated_schemas,
-    prepare_batch, wayjournal_domain_registry,
+    ActorId, CapabilityId, CapabilityOffer, DomainRegistration, DomainRegistry, KindId,
+    LogicalStoreId, PROJECTION_CACHE_ENTRY_SCHEMA_V1, PROOF_VECTOR_PROJECTION_ID, ProofVector,
+    REVISION_ALGORITHM_V1, REVISION_VECTOR_PROJECTION_ID, Record, RevisionVector,
+    RevisionVectorEntry, S5_CAPABILITIES, S5_CAPABILITY_MANIFEST, S5_PROJECTIONS, StoreRevisionRef,
+    StoreUuid, VERIFIED_PROOF_PROJECTION_ID, VERIFIED_PROOF_SCHEMA_V1, all_generated_schemas,
+    decode_verified_proof, encode_capability_offer, encode_proof_vector, encode_record,
+    encode_revision_vector, prepare_batch, wayjournal_domain_registry,
 };
 
 const RECORD_A: &str = "01913f1d-8e2a-7c30-8f4a-426614174001";
 const RECORD_B: &str = "01913f1d-8e2a-7c30-8f4a-426614174002";
 const BATCH: &str = "01913f1d-8e2a-7c30-8f4a-426614174099";
+const S5_STORE_UUID: &str = "01913f1d-8e2a-7c30-8f4a-426614174010";
+const S5_GENESIS: &str = "7b9565665e24d18788f1a681d7cea3e2a07da23bea8f9861911f0e84023a9447";
+const S5_REVISION: &str = "3c4835897266c2b72f1ad9528309c6002f388071b0e9c780827bedbfaa35ce15";
+const S5_TRUST: &str = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+const S5_ENTITY: &str = "123e4567-e89b-42d3-a456-426614174000";
+const S5_RECORD: &str = "01913f1d-8e2a-7c30-8f4a-426614174011";
+const S5_OBSERVED: &str = "2026-08-12T13:00:01Z";
 
 fn validate_note(kind: &KindId, payload: &Value) -> Result<(), String> {
     if kind.as_str() != "note.created" {
@@ -30,6 +42,180 @@ static DOMAINS: &[DomainRegistration] = &[DomainRegistration::new(
     KINDS,
     validate_note,
 )];
+
+fn canonical(value: &Value) -> Vec<u8> {
+    serde_json::to_vec_pretty(value)
+        .map(|mut bytes| {
+            bytes.push(b'\n');
+            bytes
+        })
+        .expect("canonical fixture")
+}
+
+fn proof_preimage() -> Vec<u8> {
+    let fields = [
+        VERIFIED_PROOF_SCHEMA_V1.as_bytes(),
+        S5_STORE_UUID.as_bytes(),
+        S5_GENESIS.as_bytes(),
+        b"wayjournal.profile".as_slice(),
+        S5_ENTITY.as_bytes(),
+        S5_RECORD.as_bytes(),
+        REVISION_ALGORITHM_V1.as_bytes(),
+        S5_REVISION.as_bytes(),
+        S5_TRUST.as_bytes(),
+        S5_OBSERVED.as_bytes(),
+    ];
+    let mut bytes = b"wayjournal-proof-v1\0".to_vec();
+    for field in fields {
+        bytes.extend_from_slice(
+            &u64::try_from(field.len())
+                .expect("bounded proof field")
+                .to_be_bytes(),
+        );
+        bytes.extend_from_slice(field);
+    }
+    bytes
+}
+
+fn hex(bytes: &[u8]) -> Vec<u8> {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut output = Vec::with_capacity(bytes.len() * 2 + 1);
+    for byte in bytes {
+        output.push(DIGITS[usize::from(byte >> 4)]);
+        output.push(DIGITS[usize::from(byte & 0x0f)]);
+    }
+    output.push(b'\n');
+    output
+}
+
+fn s5_store() -> LogicalStoreId {
+    LogicalStoreId::new(
+        S5_STORE_UUID.parse::<StoreUuid>().expect("S5 store UUID"),
+        S5_GENESIS.parse().expect("S5 genesis fingerprint"),
+    )
+}
+
+fn s5_revision() -> StoreRevisionRef {
+    StoreRevisionRef::parse(REVISION_ALGORITHM_V1, S5_REVISION).expect("S5 revision")
+}
+
+#[allow(clippy::too_many_lines)]
+fn s5_artifacts() -> Vec<(String, Vec<u8>)> {
+    let preimage = proof_preimage();
+    let proof_id = blake3::hash(&preimage).to_hex().to_string();
+    assert_eq!(
+        proof_id, "99bf2caf35a7b5e12d6b82ae2948ec627098e9a11152533cfdfcd711fd214922",
+        "frozen proof preimage"
+    );
+    let proof_bytes = canonical(&json!({
+        "local_trust_binding": S5_TRUST,
+        "observed_at": S5_OBSERVED,
+        "proof_id": proof_id,
+        "record_id": S5_RECORD,
+        "schema": VERIFIED_PROOF_SCHEMA_V1,
+        "source_revision": {
+            "algorithm": REVISION_ALGORITHM_V1,
+            "digest": S5_REVISION
+        },
+        "subject": {
+            "domain": "wayjournal.profile",
+            "entity_id": S5_ENTITY,
+            "store": {
+                "genesis_fingerprint": S5_GENESIS,
+                "store_uuid": S5_STORE_UUID
+            }
+        }
+    }));
+    let proof = decode_verified_proof(&proof_bytes).expect("generated proof");
+    let revision_vector =
+        RevisionVector::new(vec![RevisionVectorEntry::new(s5_store(), s5_revision())])
+            .expect("revision vector");
+    let revision_vector_bytes = encode_revision_vector(&revision_vector).expect("revision vector");
+    let proof_vector = ProofVector::new(vec![proof.clone()]).expect("proof vector");
+    let proof_vector_bytes = encode_proof_vector(&proof_vector).expect("proof vector");
+
+    let mut capabilities = S5_CAPABILITIES
+        .into_iter()
+        .map(|value| CapabilityId::parse(value).expect("S5 capability"))
+        .collect::<Vec<_>>();
+    capabilities.sort();
+    let mut projections = S5_PROJECTIONS
+        .into_iter()
+        .map(|value| value.parse().expect("S5 projection"))
+        .collect::<Vec<_>>();
+    projections.sort();
+    let offer = CapabilityOffer::new(
+        s5_store(),
+        vec![CapabilityId::parse("wayjournal.sync/git-union-cas-v1").expect("sync")],
+        vec![
+            REVISION_VECTOR_PROJECTION_ID
+                .parse()
+                .expect("revision projection"),
+        ],
+        capabilities,
+        projections,
+    )
+    .expect("capability offer");
+    let offer_bytes = encode_capability_offer(&offer).expect("capability offer");
+
+    let dependencies: Value =
+        serde_json::from_slice(&revision_vector_bytes).expect("revision-vector value");
+    let proof_value: Value = serde_json::from_slice(&proof_bytes).expect("proof value");
+    let cache_entry_bytes = canonical(&json!({
+        "dependencies": dependencies,
+        "proof": proof_value,
+        "schema": PROJECTION_CACHE_ENTRY_SCHEMA_V1
+    }));
+    let manifest_bytes = canonical(&json!({
+        "capabilities": S5_CAPABILITY_MANIFEST.capabilities,
+        "schema": S5_CAPABILITY_MANIFEST.schema
+    }));
+
+    // Keep the exact public projection IDs visible in this independently generated offer fixture.
+    assert!(
+        [
+            PROOF_VECTOR_PROJECTION_ID,
+            REVISION_VECTOR_PROJECTION_ID,
+            VERIFIED_PROOF_PROJECTION_ID,
+        ]
+        .iter()
+        .all(|projection| offer
+            .supported_projections()
+            .iter()
+            .any(|id| id.as_str() == *projection))
+    );
+
+    vec![
+        (
+            "fixtures/wayjournal.revision-vector.v1.json".to_owned(),
+            revision_vector_bytes,
+        ),
+        (
+            "fixtures/wayjournal.verified-proof.v1.json".to_owned(),
+            proof_bytes,
+        ),
+        (
+            "fixtures/wayjournal.proof-vector.v1.json".to_owned(),
+            proof_vector_bytes,
+        ),
+        (
+            "fixtures/wayjournal.capability-offer.v1.json".to_owned(),
+            offer_bytes,
+        ),
+        (
+            "fixtures/wayjournal.projection-cache-entry.v1.json".to_owned(),
+            cache_entry_bytes,
+        ),
+        (
+            "fixtures/wayjournal.verified-proof.v1.preimage.hex".to_owned(),
+            hex(&preimage),
+        ),
+        (
+            "fixtures/wayjournal.capabilities.v2.json".to_owned(),
+            manifest_bytes,
+        ),
+    ]
+}
 
 fn note(record_id: &str, entity_id: &str, title: &str) -> Record {
     Record {
@@ -66,8 +252,7 @@ fn main() {
     )
     .expect("batch");
 
-    let mut artifacts = generated_schemas()
-        .into_iter()
+    let mut artifacts = all_generated_schemas()
         .map(|(name, contents)| (format!("schemas/{name}"), contents.as_bytes().to_vec()))
         .collect::<Vec<_>>();
     artifacts.push((
@@ -139,6 +324,7 @@ fn main() {
         .map(|mut bytes| { bytes.push(b'\n'); bytes })
         .expect("catalog fixture"),
     ));
+    artifacts.extend(s5_artifacts());
 
     let mut drift = false;
     for (path, contents) in artifacts {

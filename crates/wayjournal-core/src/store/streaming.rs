@@ -1112,28 +1112,14 @@ struct FoldSource {
 struct FoldSummary {
     count: usize,
     edges: usize,
-    catalog_target: Option<crate::LogicalStoreId>,
-    catalog_wrong_target: Option<crate::LogicalStoreId>,
 }
 
 impl FoldSummary {
-    fn observe(&mut self, domain: &str, operation: &crate::DomainOperation) {
+    fn observe(&mut self, operation: &crate::DomainOperation) {
         self.count = self.count.saturating_add(1);
         self.edges = self
             .edges
             .saturating_add(crate::CausalNode::parents(operation).len());
-        if domain != "wayjournal.catalog" {
-            return;
-        }
-        if let Some(expected) = self.catalog_target.as_ref() {
-            if self.catalog_wrong_target.is_none()
-                && operation.target().is_some_and(|actual| actual != expected)
-            {
-                self.catalog_wrong_target = operation.target().cloned();
-            }
-        } else {
-            self.catalog_target = operation.target().cloned();
-        }
     }
 
     const fn within_causal_limits(&self) -> bool {
@@ -1173,14 +1159,15 @@ fn validate_builtin_folds_bounded(
                 group.take().expect("fold group"),
                 &operations,
                 &sources,
-                std::mem::take(&mut summary),
+                &summary,
             )?;
             operations.clear();
             sources.clear();
+            summary = FoldSummary::default();
         }
         group = Some(key.clone());
         let operation = operation_from_record(record, &key)?;
-        summary.observe(&key.0, &operation);
+        summary.observe(&operation);
         if summary.within_causal_limits() {
             let source = sources.len();
             operations.push(operation.into_header(source));
@@ -1196,7 +1183,7 @@ fn validate_builtin_folds_bounded(
         }
     }
     if let Some(group) = group {
-        finish_fold(store, replay, group, &operations, &sources, summary)?;
+        finish_fold(store, replay, group, &operations, &sources, &summary)?;
     }
     Ok(())
 }
@@ -1251,28 +1238,8 @@ fn finish_fold(
     (domain, entity): (String, String),
     operations: &[crate::domains::DomainOperationHeader],
     sources: &[FoldSource],
-    summary: FoldSummary,
+    summary: &FoldSummary,
 ) -> Result<(), StoreError> {
-    if domain == "wayjournal.catalog" {
-        let Some(expected) = summary.catalog_target else {
-            return Err(StoreError::Corrupt {
-                issue: StoreCorruption::InvalidDomainFold {
-                    domain,
-                    entity,
-                    message: crate::FoldError::WrongEntity.to_string(),
-                },
-            });
-        };
-        if let Some(actual) = summary.catalog_wrong_target {
-            return Err(StoreError::Corrupt {
-                issue: StoreCorruption::InvalidDomainFold {
-                    domain,
-                    entity,
-                    message: crate::FoldError::WrongTarget { expected, actual }.to_string(),
-                },
-            });
-        }
-    }
     let causal_limit = if summary.count > crate::MAX_CAUSAL_OPERATIONS {
         Some(crate::CausalError::TooManyOperations {
             maximum: crate::MAX_CAUSAL_OPERATIONS,
@@ -1878,34 +1845,6 @@ mod semantic_parity_tests {
             &registry,
         )
         .unwrap();
-        let wrong_catalog_target = prepare_batch(
-            &[
-                catalog(
-                    "01913f1d-8e2a-7c30-8f4a-4266141740b0",
-                    "01913f1d-8e2a-7c30-8f4a-4266141740b2",
-                    &[],
-                ),
-                record(
-                    "wayjournal.catalog",
-                    "catalog.name.set",
-                    "01913f1d-8e2a-7c30-8f4a-4266141740b1",
-                    "01913f1d-8e2a-7c30-8f4a-426614174010",
-                    "01913f1d-8e2a-7c30-8f4a-4266141740b2",
-                    &[],
-                    json!({
-                        "target": {
-                            "store_uuid":"01913f1d-8e2a-7c30-8f4a-426614174099",
-                            "genesis_fingerprint":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-                        },
-                        "value":"other"
-                    }),
-                ),
-            ],
-            "wrong-catalog-target",
-            &registry,
-        )
-        .unwrap();
-
         let mut cases = Vec::<(&str, bool, Vec<RawFile>)>::new();
         let extend = |extra: &PreparedBatch| {
             let mut files = base.clone();
@@ -1944,7 +1883,6 @@ mod semantic_parity_tests {
             extend(&invalid_resolution),
         ));
         cases.push(("invalid-profile-remove", true, extend(&invalid_remove)));
-        cases.push(("wrong-catalog-target", true, extend(&wrong_catalog_target)));
 
         for (name, strict, mut files) in cases {
             files.sort_by(|left, right| left.path.cmp(&right.path));
