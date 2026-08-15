@@ -1,8 +1,12 @@
 use std::{
+    collections::HashSet,
     ffi::{OsStr, OsString},
     fs::File,
     io::{self, BufRead, Read, Seek, SeekFrom, Write},
-    os::unix::{ffi::OsStrExt, process::CommandExt},
+    os::unix::{
+        ffi::{OsStrExt, OsStringExt},
+        process::CommandExt,
+    },
     process::{Command, Stdio},
     sync::{
         Arc,
@@ -19,7 +23,8 @@ use thiserror::Error;
 use crate::{
     MAX_BATCH_BYTES, MAX_RECORD_BYTES, PathClass, Store, classify_path,
     store::{
-        Directory, MAX_CANONICAL_ENTRIES, MAX_TOTAL_CANONICAL_BYTES, RawFile, scan_collected,
+        Directory, MAX_CANONICAL_ENTRIES, MAX_TOTAL_CANONICAL_BYTES, OpenedEntry, RawFile,
+        scan_collected,
         streaming::{ValidatedStoreState, replay_builder, validate_bounded_replay},
     },
 };
@@ -51,7 +56,8 @@ impl GitCommandError {
     pub(super) fn is_hostile_repository_state(&self) -> bool {
         matches!(
             self.operation,
-            "audit repository metadata"
+            "resolve local Git layout"
+                | "audit repository metadata"
                 | "audit local config"
                 | "bound fetched repository"
                 | "read local branch"
@@ -140,6 +146,89 @@ impl<'a> GitRunner<'a> {
             .arg("transfer.fsckObjects=true")
             .args(args);
         command
+    }
+
+    fn layout_command(&self, layout: &LocalRepositoryLayout, args: &[OsString]) -> Command {
+        let mut command = self.command(&layout.work_tree, args);
+        command
+            .env("GIT_DIR", layout.admin_dir.child_proc_path())
+            .env("GIT_COMMON_DIR", layout.common_dir.child_proc_path())
+            .env("GIT_WORK_TREE", layout.work_tree.child_proc_path());
+        command
+    }
+
+    fn local_command(&self, local: &LocalRepository, args: &[OsString]) -> Command {
+        self.layout_command(&local.layout, args)
+    }
+
+    fn layout_output(
+        &self,
+        operation: &'static str,
+        layout: &LocalRepositoryLayout,
+        args: &[OsString],
+        stdout_limit: usize,
+    ) -> Result<Vec<u8>, GitCommandError> {
+        let captured = run_bounded_command_with_input(
+            self.layout_command(layout, args),
+            operation,
+            None,
+            stdout_limit,
+            MAX_SMALL_OUTPUT,
+            self.timeout,
+        )?;
+        if captured.status.success() {
+            Ok(captured.stdout)
+        } else {
+            Err(status_error(operation, captured.status))
+        }
+    }
+
+    fn local_status(
+        &self,
+        operation: &'static str,
+        local: &LocalRepository,
+        args: &[OsString],
+        input: Option<&[u8]>,
+        stdout_limit: usize,
+    ) -> Result<CapturedOutput, GitCommandError> {
+        run_bounded_command_with_input(
+            self.local_command(local, args),
+            operation,
+            input,
+            stdout_limit,
+            MAX_SMALL_OUTPUT,
+            self.timeout,
+        )
+    }
+
+    fn local_output(
+        &self,
+        operation: &'static str,
+        local: &LocalRepository,
+        args: &[OsString],
+        stdout_limit: usize,
+    ) -> Result<Vec<u8>, GitCommandError> {
+        let captured = self.local_status(operation, local, args, None, stdout_limit)?;
+        if captured.status.success() {
+            return Ok(captured.stdout);
+        }
+        Err(status_error(operation, captured.status))
+    }
+
+    fn local_succeeds(
+        &self,
+        operation: &'static str,
+        local: &LocalRepository,
+        args: &[OsString],
+    ) -> Result<bool, GitCommandError> {
+        let captured = self.local_status(operation, local, args, None, MAX_SMALL_OUTPUT)?;
+        if captured.status.success() {
+            Ok(true)
+        } else if captured.status.code().is_some() {
+            Ok(false)
+        } else {
+            Err(status_error(operation, captured.status))
+        }
     }
 
     pub(super) fn output(
@@ -643,8 +732,171 @@ fn args(values: &[&str]) -> Vec<OsString> {
     values.iter().map(OsString::from).collect()
 }
 
+const MAX_GIT_CONTROL_PATH_BYTES: usize = 4 * 1024;
+const MAX_GIT_CONTROL_COMPONENTS: usize = 256;
+
+struct RetainedAncestry {
+    directories: Vec<Directory>,
+    components: Vec<OsString>,
+}
+
+impl RetainedAncestry {
+    fn try_clone(&self) -> Result<Self, GitCommandError> {
+        Ok(Self {
+            directories: self
+                .directories
+                .iter()
+                .map(Directory::try_clone)
+                .collect::<Result<_, _>>()
+                .map_err(|error| command_error("resolve local Git layout", error))?,
+            components: self.components.clone(),
+        })
+    }
+
+    fn last(&self) -> &Directory {
+        self.directories.last().expect("retained root ancestry")
+    }
+
+    fn root_only(&self) -> Result<Self, GitCommandError> {
+        Ok(Self {
+            directories: vec![
+                self.directories[0]
+                    .try_clone()
+                    .map_err(|error| command_error("resolve local Git layout", error))?,
+            ],
+            components: Vec::new(),
+        })
+    }
+
+    fn resolve_directory(&self, raw: &[u8]) -> Result<Self, GitCommandError> {
+        let (absolute, components) = parse_control_path(raw)?;
+        let mut resolved = if absolute {
+            self.root_only()?
+        } else {
+            self.try_clone()?
+        };
+        for component in components {
+            if component == b".." {
+                if resolved.directories.len() == 1 {
+                    return Err(GitCommandError {
+                        operation: "resolve local Git layout",
+                        message: "Git control path escapes the filesystem root".to_owned(),
+                    });
+                }
+                resolved.directories.pop();
+                resolved.components.pop();
+                continue;
+            }
+            let name = OsString::from_vec(component);
+            let child = resolved
+                .last()
+                .open_dir_any_device(&name)
+                .map_err(|error| command_error("resolve local Git layout", error))?;
+            resolved.components.push(name);
+            resolved.directories.push(child);
+        }
+        Ok(resolved)
+    }
+
+    fn resolve_file(&self, raw: &[u8]) -> Result<(Self, OsString, File), GitCommandError> {
+        let (absolute, mut components) = parse_control_path(raw)?;
+        let name = components.pop().ok_or_else(|| GitCommandError {
+            operation: "resolve local Git layout",
+            message: "Git control file path has no basename".to_owned(),
+        })?;
+        if name == b".." {
+            return Err(GitCommandError {
+                operation: "resolve local Git layout",
+                message: "Git control file path has no ordinary basename".to_owned(),
+            });
+        }
+        let mut parent_bytes = Vec::new();
+        if absolute {
+            parent_bytes.push(b'/');
+        }
+        for (index, component) in components.iter().enumerate() {
+            if index > 0 {
+                parent_bytes.push(b'/');
+            }
+            parent_bytes.extend_from_slice(component);
+        }
+        let parent = if components.is_empty() {
+            if absolute {
+                self.root_only()?
+            } else {
+                self.try_clone()?
+            }
+        } else {
+            self.resolve_directory(&parent_bytes)?
+        };
+        let name = OsString::from_vec(name);
+        let file = match parent
+            .last()
+            .open_entry(&name)
+            .map_err(|error| command_error("resolve local Git layout", error))?
+        {
+            OpenedEntry::Regular(file) => file,
+            OpenedEntry::Directory(_) => {
+                return Err(GitCommandError {
+                    operation: "resolve local Git layout",
+                    message: "Git control path is not a regular file".to_owned(),
+                });
+            }
+        };
+        Ok((parent, name, file))
+    }
+}
+
+fn parse_control_path(raw: &[u8]) -> Result<(bool, Vec<Vec<u8>>), GitCommandError> {
+    if raw.is_empty()
+        || raw.len() > MAX_GIT_CONTROL_PATH_BYTES
+        || raw.contains(&0)
+        || raw.ends_with(b"/")
+    {
+        return Err(GitCommandError {
+            operation: "resolve local Git layout",
+            message: "Git control path is empty, oversized, NUL-containing, or slash-terminated"
+                .to_owned(),
+        });
+    }
+    let absolute = raw[0] == b'/';
+    let body = if absolute { &raw[1..] } else { raw };
+    if body.is_empty() {
+        return Err(GitCommandError {
+            operation: "resolve local Git layout",
+            message: "Git control path may not name the filesystem root".to_owned(),
+        });
+    }
+    let mut components = Vec::new();
+    for component in body.split(|byte| *byte == b'/') {
+        if component.is_empty() || component == b"." {
+            return Err(GitCommandError {
+                operation: "resolve local Git layout",
+                message: "Git control path is not lexically canonical".to_owned(),
+            });
+        }
+        components.push(component.to_vec());
+        if components.len() > MAX_GIT_CONTROL_COMPONENTS {
+            return Err(GitCommandError {
+                operation: "resolve local Git layout",
+                message: "Git control path has too many components".to_owned(),
+            });
+        }
+    }
+    Ok((absolute, components))
+}
+
+struct LocalRepositoryLayout {
+    work_tree: Directory,
+    gitfile: Option<File>,
+    admin_dir: Directory,
+    common_dir: Directory,
+    common_worktrees_dir: Option<Directory>,
+    admin_entry_name: Option<OsString>,
+}
+
 pub(super) struct LocalRepository {
-    git_dir: Directory,
+    layout: LocalRepositoryLayout,
     pub format: GitObjectFormat,
     pub tip: GitOid,
 }
@@ -905,29 +1157,308 @@ fn repository_args(tail: impl IntoIterator<Item = OsString>) -> Vec<OsString> {
     values
 }
 
+fn internal_file_args(tail: impl IntoIterator<Item = OsString>) -> Vec<OsString> {
+    let mut values = vec![
+        OsString::from("-c"),
+        OsString::from("protocol.file.allow=always"),
+    ];
+    values.extend(tail);
+    values
+}
+
+fn internal_file_repository_args(tail: impl IntoIterator<Item = OsString>) -> Vec<OsString> {
+    let mut values = vec![
+        OsString::from("--git-dir=."),
+        OsString::from("-c"),
+        OsString::from("protocol.file.allow=always"),
+    ];
+    values.extend(tail);
+    values
+}
+
+fn read_control_file(file: &File, prefix: Option<&[u8]>) -> Result<Vec<u8>, GitCommandError> {
+    let mut bytes = Vec::new();
+    file.try_clone()
+        .map_err(|error| command_error("resolve local Git layout", error))?
+        .take((MAX_GIT_CONTROL_PATH_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|error| command_error("resolve local Git layout", error))?;
+    if bytes.len() > MAX_GIT_CONTROL_PATH_BYTES || bytes.contains(&0) || bytes.contains(&b'\r') {
+        return Err(GitCommandError {
+            operation: "resolve local Git layout",
+            message: "Git control file is oversized or contains forbidden bytes".to_owned(),
+        });
+    }
+    if bytes.ends_with(b"\n") {
+        bytes.pop();
+    }
+    if bytes.is_empty() || bytes.contains(&b'\n') {
+        return Err(GitCommandError {
+            operation: "resolve local Git layout",
+            message: "Git control file is empty or contains multiple lines".to_owned(),
+        });
+    }
+    if let Some(prefix) = prefix {
+        bytes = bytes
+            .strip_prefix(prefix)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| GitCommandError {
+                operation: "resolve local Git layout",
+                message: "Git gitfile has an invalid prefix or empty target".to_owned(),
+            })?
+            .to_vec();
+    }
+    Ok(bytes)
+}
+
+fn retained_store_ancestry(store: &Store) -> Result<RetainedAncestry, GitCommandError> {
+    let root = Directory::open_ambient(std::path::Path::new("/"))
+        .map_err(|error| command_error("resolve local Git layout", error))?;
+    let ancestry = RetainedAncestry {
+        directories: vec![root],
+        components: Vec::new(),
+    }
+    .resolve_directory(store.root_dir.path.as_os_str().as_bytes())?;
+    if !ancestry
+        .last()
+        .same_identity(&store.root_dir)
+        .map_err(|error| command_error("resolve local Git layout", error))?
+    {
+        return Err(GitCommandError {
+            operation: "resolve local Git layout",
+            message: "ambient store ancestry no longer names the retained root".to_owned(),
+        });
+    }
+    Ok(ancestry)
+}
+
+fn require_directory_authority(
+    store: &Store,
+    directory: &Directory,
+) -> Result<(), GitCommandError> {
+    if directory
+        .same_authority(&store.root_dir)
+        .map_err(|error| command_error("resolve local Git layout", error))?
+    {
+        Ok(())
+    } else {
+        Err(GitCommandError {
+            operation: "resolve local Git layout",
+            message: "Git directory owner or device differs from the store root".to_owned(),
+        })
+    }
+}
+
+fn require_file_authority(store: &Store, file: &File) -> Result<(), GitCommandError> {
+    if store
+        .root_dir
+        .file_same_authority(file)
+        .map_err(|error| command_error("resolve local Git layout", error))?
+    {
+        Ok(())
+    } else {
+        Err(GitCommandError {
+            operation: "resolve local Git layout",
+            message: "Git control-file owner or device differs from the store root".to_owned(),
+        })
+    }
+}
+
+fn entry_absent(directory: &Directory, name: &OsStr) -> Result<bool, GitCommandError> {
+    match directory.open_entry(name) {
+        Ok(_) => Ok(false),
+        Err(crate::StoreError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => {
+            Ok(true)
+        }
+        Err(error) => Err(command_error("resolve local Git layout", error)),
+    }
+}
+
+fn linked_local_repository(
+    store: &Store,
+    ancestry: &RetainedAncestry,
+    gitfile: File,
+) -> Result<LocalRepositoryLayout, GitCommandError> {
+    require_file_authority(store, &gitfile)?;
+    let admin_path = read_control_file(&gitfile, Some(b"gitdir: "))?;
+    let admin_ancestry = ancestry.resolve_directory(&admin_path)?;
+    let admin_dir = admin_ancestry
+        .last()
+        .try_clone()
+        .map_err(|error| command_error("resolve local Git layout", error))?;
+    require_directory_authority(store, &admin_dir)?;
+
+    let backlink = admin_dir
+        .open_file(OsStr::new("gitdir"))
+        .map_err(|error| command_error("resolve local Git layout", error))?;
+    require_file_authority(store, &backlink)?;
+    let backlink_path = read_control_file(&backlink, None)?;
+    let (backlink_parent, backlink_name, retained_backlink) =
+        admin_ancestry.resolve_file(&backlink_path)?;
+    require_file_authority(store, &retained_backlink)?;
+    if backlink_name.as_bytes() != b".git"
+        || !backlink_parent
+            .last()
+            .same_identity(&store.root_dir)
+            .map_err(|error| command_error("resolve local Git layout", error))?
+        || !Directory::file_is_same(&gitfile, &retained_backlink)
+            .map_err(|error| command_error("resolve local Git layout", error))?
+    {
+        return Err(GitCommandError {
+            operation: "resolve local Git layout",
+            message: "linked-worktree admin backlink does not name the retained gitfile".to_owned(),
+        });
+    }
+
+    let commondir_file = admin_dir
+        .open_file(OsStr::new("commondir"))
+        .map_err(|error| command_error("resolve local Git layout", error))?;
+    require_file_authority(store, &commondir_file)?;
+    let common_path = read_control_file(&commondir_file, None)?;
+    let common_ancestry = admin_ancestry.resolve_directory(&common_path)?;
+    let common_dir = common_ancestry
+        .last()
+        .try_clone()
+        .map_err(|error| command_error("resolve local Git layout", error))?;
+    require_directory_authority(store, &common_dir)?;
+    if common_dir
+        .same_identity(&admin_dir)
+        .map_err(|error| command_error("resolve local Git layout", error))?
+        || !entry_absent(&common_dir, OsStr::new("commondir"))?
+    {
+        return Err(GitCommandError {
+            operation: "resolve local Git layout",
+            message: "linked worktree has no distinct self-contained common directory".to_owned(),
+        });
+    }
+
+    let admin_name = admin_ancestry
+        .components
+        .last()
+        .ok_or_else(|| GitCommandError {
+            operation: "resolve local Git layout",
+            message: "linked-worktree admin directory has no basename".to_owned(),
+        })?
+        .clone();
+    let admin_parent = &admin_ancestry.directories[admin_ancestry.directories.len() - 2];
+    let common_worktrees = common_dir
+        .open_dir(OsStr::new("worktrees"))
+        .map_err(|error| command_error("resolve local Git layout", error))?;
+    if !admin_parent
+        .same_identity(&common_worktrees)
+        .map_err(|error| command_error("resolve local Git layout", error))?
+        || !common_worktrees
+            .entry_is(&admin_name, &admin_dir)
+            .map_err(|error| command_error("resolve local Git layout", error))?
+    {
+        return Err(GitCommandError {
+            operation: "resolve local Git layout",
+            message: "linked-worktree admin directory is outside common/worktrees".to_owned(),
+        });
+    }
+
+    Ok(LocalRepositoryLayout {
+        work_tree: store
+            .root_dir
+            .try_clone()
+            .map_err(|error| command_error("resolve local Git layout", error))?,
+        gitfile: Some(gitfile),
+        admin_dir,
+        common_dir,
+        common_worktrees_dir: Some(common_worktrees),
+        admin_entry_name: Some(admin_name),
+    })
+}
+
+fn classify_git_entry_open(error: crate::StoreError) -> GitCommandError {
+    match &error {
+        crate::StoreError::Io { source, .. }
+            if matches!(
+                source.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied
+            ) =>
+        {
+            command_error("open local Git directory", error)
+        }
+        _ => command_error("resolve local Git layout", error),
+    }
+}
+
 pub(super) fn inspect_local(
     store: &Store,
     runner: &GitRunner<'_>,
     request: &GitSyncRequest,
 ) -> Result<LocalRepository, GitCommandError> {
-    let git_dir = store
+    let repository = match store
         .root_dir
-        .open_dir(OsStr::new(".git"))
-        .map_err(|error| command_error("open local Git directory", error))?;
-    inspect_local_anchored(runner, request, git_dir)
+        .open_entry(OsStr::new(".git"))
+        .map_err(classify_git_entry_open)?
+    {
+        OpenedEntry::Directory(git_dir) => {
+            require_directory_authority(store, &git_dir)?;
+            if !entry_absent(&git_dir, OsStr::new("commondir"))? {
+                return Err(GitCommandError {
+                    operation: "resolve local Git layout",
+                    message: "ordinary repository unexpectedly contains commondir".to_owned(),
+                });
+            }
+            LocalRepositoryLayout {
+                work_tree: store
+                    .root_dir
+                    .try_clone()
+                    .map_err(|error| command_error("resolve local Git layout", error))?,
+                gitfile: None,
+                admin_dir: git_dir
+                    .try_clone()
+                    .map_err(|error| command_error("resolve local Git layout", error))?,
+                common_dir: git_dir,
+                common_worktrees_dir: None,
+                admin_entry_name: None,
+            }
+        }
+        OpenedEntry::Regular(gitfile) => {
+            let ancestry = retained_store_ancestry(store)?;
+            linked_local_repository(store, &ancestry, gitfile)?
+        }
+    };
+    finish_inspect_local(runner, request, repository)
 }
 
+#[cfg(test)]
 pub(super) fn inspect_local_anchored(
+    store: &Store,
     runner: &GitRunner<'_>,
     request: &GitSyncRequest,
     git_dir: Directory,
 ) -> Result<LocalRepository, GitCommandError> {
-    audit_local_config(runner, &git_dir)?;
-    audit_repository_metadata(&git_dir)?;
-    let branch = runner.output(
+    let layout = LocalRepositoryLayout {
+        work_tree: store
+            .root_dir
+            .try_clone()
+            .map_err(|error| command_error("resolve local Git layout", error))?,
+        gitfile: None,
+        admin_dir: git_dir
+            .try_clone()
+            .map_err(|error| command_error("resolve local Git layout", error))?,
+        common_dir: git_dir,
+        common_worktrees_dir: None,
+        admin_entry_name: None,
+    };
+    finish_inspect_local(runner, request, layout)
+}
+
+fn finish_inspect_local(
+    runner: &GitRunner<'_>,
+    request: &GitSyncRequest,
+    layout: LocalRepositoryLayout,
+) -> Result<LocalRepository, GitCommandError> {
+    audit_local_repository_metadata(&layout)?;
+    audit_local_repository_physical_bounds(&layout)?;
+    audit_local_config(runner, &layout)?;
+    let branch = runner.layout_output(
         "read local branch",
-        &git_dir,
-        &repository_args(args(&["symbolic-ref", "-q", "HEAD"])),
+        &layout,
+        &args(&["symbolic-ref", "-q", "HEAD"]),
         MAX_SMALL_OUTPUT,
     )?;
     if branch.strip_suffix(b"\n") != Some(request.approved_remote().reference().as_str().as_bytes())
@@ -937,10 +1468,10 @@ pub(super) fn inspect_local_anchored(
             message: "checked-out branch is not the approved ref".to_owned(),
         });
     }
-    let format_text = runner.output(
+    let format_text = runner.layout_output(
         "read object format",
-        &git_dir,
-        &repository_args(args(&["rev-parse", "--show-object-format"])),
+        &layout,
+        &args(&["rev-parse", "--show-object-format"]),
         MAX_SMALL_OUTPUT,
     )?;
     let format = std::str::from_utf8(&format_text)
@@ -951,15 +1482,15 @@ pub(super) fn inspect_local_anchored(
             operation: "read object format",
             message: "unsupported object format".to_owned(),
         })?;
-    let local_tip_bytes = runner.output(
+    let local_tip_bytes = runner.layout_output(
         "read local tip",
-        &git_dir,
-        &repository_args(args(&["rev-parse", "HEAD"])),
+        &layout,
+        &args(&["rev-parse", "HEAD"]),
         MAX_SMALL_OUTPUT,
     )?;
     let tip = parse_oid_output(format, &local_tip_bytes)?;
     Ok(LocalRepository {
-        git_dir,
+        layout,
         format,
         tip,
     })
@@ -1044,11 +1575,11 @@ pub(super) fn create_sync_repository(
     runner.output(
         "fetch local synchronization tip",
         &fetched,
-        &repository_args(vec![
+        &internal_file_repository_args(vec![
             OsString::from("fetch"),
             OsString::from("--no-tags"),
             OsString::from("--no-write-fetch-head"),
-            local.git_dir.child_proc_path().into_os_string(),
+            local.layout.common_dir.child_proc_path().into_os_string(),
             OsString::from(local_refspec),
         ]),
         MAX_SMALL_OUTPUT,
@@ -1097,7 +1628,7 @@ pub(super) fn create_sync_repository(
         runner.output(
             "compact reachable synchronization objects",
             &bare,
-            &repository_args(vec![
+            &internal_file_repository_args(vec![
                 OsString::from("fetch"),
                 OsString::from("--no-tags"),
                 OsString::from("--no-write-fetch-head"),
@@ -1280,7 +1811,7 @@ pub(super) fn advance_local_ref(
 ) -> Result<(), GitCommandError> {
     let current = inspect_local_ref(runner, local, request)?;
     if current == *candidate {
-        sync_directory_tree(&local.git_dir, 0)?;
+        sync_local_repository_durable(local)?;
         require_local_commit(runner, local, candidate)?;
         return Ok(());
     }
@@ -1290,10 +1821,10 @@ pub(super) fn advance_local_ref(
             message: "approved local ref is neither expected old nor candidate".to_owned(),
         });
     }
-    runner.output(
+    runner.local_output(
         "import synchronization candidate",
-        &local.git_dir,
-        &repository_args(vec![
+        local,
+        &internal_file_args(vec![
             OsString::from("fetch"),
             OsString::from("--no-tags"),
             OsString::from("--no-write-fetch-head"),
@@ -1303,21 +1834,21 @@ pub(super) fn advance_local_ref(
         MAX_SMALL_OUTPUT,
     )?;
     require_local_commit(runner, local, candidate)?;
-    runner.output(
+    runner.local_output(
         "advance approved local ref",
-        &local.git_dir,
-        &repository_args(vec![
+        local,
+        &[
             OsString::from("update-ref"),
             OsString::from(request.approved_remote().reference().as_str()),
             OsString::from(candidate.as_hex()),
             OsString::from(expected.as_hex()),
-        ]),
+        ],
         MAX_SMALL_OUTPUT,
     )?;
     super::fault::hit("local-ref-updated");
-    // Git may update loose refs, packed refs, reflogs and object packs. Sync every retained
-    // descendant and the repository root, then reopen the approved ref and candidate object.
-    sync_directory_tree(&local.git_dir, 0)?;
+    // Git may update common refs, common objects and per-worktree state. Sync both retained roots,
+    // then reopen the approved ref and candidate through the same bound descriptor triple.
+    sync_local_repository_durable(local)?;
     super::fault::hit("local-git-durable");
     if inspect_local_ref(runner, local, request)? != *candidate {
         return Err(GitCommandError {
@@ -1334,14 +1865,14 @@ fn inspect_local_ref(
     local: &LocalRepository,
     request: &GitSyncRequest,
 ) -> Result<GitOid, GitCommandError> {
-    let output = runner.output(
+    let output = runner.local_output(
         "observe approved local ref",
-        &local.git_dir,
-        &repository_args(vec![
+        local,
+        &[
             OsString::from("rev-parse"),
             OsString::from("--verify"),
             OsString::from(request.approved_remote().reference().as_str()),
-        ]),
+        ],
         MAX_SMALL_OUTPUT,
     )?;
     parse_oid_output(local.format, &output)
@@ -1432,11 +1963,22 @@ pub(super) fn remove_internal_local_candidate(
     runner: &GitRunner<'_>,
     local: &LocalRepository,
 ) -> Result<(), GitCommandError> {
-    let _ = runner.succeeds(
+    let _ = runner.local_succeeds(
         "remove internal candidate ref",
-        &local.git_dir,
-        &repository_args(args(&["update-ref", "-d", "refs/wayjournal/candidate"])),
+        local,
+        &args(&["update-ref", "-d", "refs/wayjournal/candidate"]),
     )?;
+    sync_local_repository_durable(local)?;
+    if runner.local_succeeds(
+        "verify internal candidate ref removal",
+        local,
+        &args(&["rev-parse", "--verify", "refs/wayjournal/candidate"]),
+    )? {
+        return Err(GitCommandError {
+            operation: "remove internal candidate ref",
+            message: "internal candidate ref remained after durable removal".to_owned(),
+        });
+    }
     Ok(())
 }
 
@@ -1588,25 +2130,79 @@ pub(super) fn sync_repository_durable(
     Ok(())
 }
 
+#[derive(Default)]
+struct SyncWalkState {
+    entries: usize,
+    bytes: u64,
+    visited: HashSet<(u64, u64)>,
+}
+
 fn sync_directory_tree(directory: &Directory, depth: usize) -> Result<(), GitCommandError> {
+    sync_directory_tree_shared(directory, depth, None, &mut SyncWalkState::default())
+}
+
+fn sync_directory_tree_shared(
+    directory: &Directory,
+    depth: usize,
+    layout: Option<&LocalRepositoryLayout>,
+    state: &mut SyncWalkState,
+) -> Result<(), GitCommandError> {
     if depth > MAX_PENDING_REPO_DEPTH {
         return Err(GitCommandError {
             operation: "durably sync Git repository",
             message: "repository depth limit exceeded".to_owned(),
         });
     }
+    let identity = directory
+        .identity_key()
+        .map_err(|error| command_error("durably sync Git repository", error))?;
+    if !state.visited.insert(identity) {
+        return Ok(());
+    }
+    let remaining = MAX_PENDING_REPO_FS_ENTRIES.saturating_sub(state.entries);
     directory
-        .for_each_name(MAX_PENDING_REPO_FS_ENTRIES, |name| {
+        .for_each_name(remaining.saturating_add(1), |name| {
+            state.entries = state.entries.checked_add(1).ok_or_else(|| {
+                crate::store::invalid_layout(&directory.path, "repository entry count overflow")
+            })?;
+            if state.entries > MAX_PENDING_REPO_FS_ENTRIES {
+                return Err(crate::store::invalid_layout(
+                    &directory.path,
+                    "repository entry limit exceeded",
+                ));
+            }
+            if skip_selected_admin_entry(layout, directory, name).map_err(|error| {
+                crate::store::invalid_layout(&directory.path, &error.to_string())
+            })? {
+                return Ok(());
+            }
             let os_name = OsStr::from_bytes(name);
             match directory.kind(os_name)? {
                 rustix::fs::FileType::Directory => {
                     let child = directory.open_dir(os_name)?;
-                    sync_directory_tree(&child, depth + 1).map_err(|error| {
-                        crate::store::invalid_layout(&child.path, &error.to_string())
-                    })?;
+                    sync_directory_tree_shared(&child, depth + 1, layout, state).map_err(
+                        |error| crate::store::invalid_layout(&child.path, &error.to_string()),
+                    )?;
                 }
                 rustix::fs::FileType::RegularFile => {
                     let file = directory.open_file(os_name)?;
+                    let identity = Directory::file_identity_key(&file)?;
+                    if !state.visited.insert(identity) {
+                        return Ok(());
+                    }
+                    let length = directory.require_regular(&file, os_name)?;
+                    state.bytes = state.bytes.checked_add(length).ok_or_else(|| {
+                        crate::store::invalid_layout(
+                            &directory.path,
+                            "repository byte count overflow",
+                        )
+                    })?;
+                    if state.bytes > MAX_PENDING_REPO_BYTES {
+                        return Err(crate::store::invalid_layout(
+                            &directory.path,
+                            "repository byte limit exceeded",
+                        ));
+                    }
                     file.sync_all().map_err(|error| {
                         crate::store::io_error(
                             "sync Git repository file",
@@ -1627,6 +2223,20 @@ fn sync_directory_tree(directory: &Directory, depth: usize) -> Result<(), GitCom
         .map_err(|error| command_error("durably sync Git repository", error))?;
     directory
         .sync()
+        .map_err(|error| command_error("durably sync Git repository", error))
+}
+
+fn sync_local_repository_durable(local: &LocalRepository) -> Result<(), GitCommandError> {
+    audit_local_repository_metadata(&local.layout)?;
+    audit_local_repository_physical_bounds(&local.layout)?;
+    let mut state = SyncWalkState::default();
+    sync_directory_tree_shared(&local.layout.common_dir, 0, Some(&local.layout), &mut state)?;
+    sync_directory_tree_shared(&local.layout.admin_dir, 2, Some(&local.layout), &mut state)?;
+    local
+        .layout
+        .common_dir
+        .sync()
+        .and_then(|()| local.layout.admin_dir.sync())
         .map_err(|error| command_error("durably sync Git repository", error))
 }
 
@@ -1682,94 +2292,195 @@ fn remove_directory_tree(
     }
 }
 
-fn audit_repository_physical_bounds(git_dir: &Directory) -> Result<(), GitCommandError> {
-    fn walk(
-        directory: &Directory,
-        depth: usize,
-        entries: &mut usize,
-        bytes: &mut u64,
-        objects: &mut usize,
-        below_objects: bool,
-    ) -> Result<(), GitCommandError> {
-        if depth > MAX_PENDING_REPO_DEPTH {
-            return Err(GitCommandError {
-                operation: "bound fetched repository",
-                message: "repository depth limit exceeded".to_owned(),
-            });
-        }
-        let remaining = MAX_PENDING_REPO_FS_ENTRIES.saturating_sub(*entries);
-        directory
-            .for_each_name(remaining.saturating_add(1), |name| {
-                *entries = entries.checked_add(1).ok_or_else(|| {
-                    crate::store::invalid_layout(&directory.path, "repository entry count overflow")
-                })?;
-                if *entries > MAX_PENDING_REPO_FS_ENTRIES {
-                    return Err(crate::store::invalid_layout(
-                        &directory.path,
-                        "repository entry limit exceeded",
-                    ));
-                }
-                let os_name = OsStr::from_bytes(name);
-                match directory.kind(os_name)? {
-                    rustix::fs::FileType::Directory => {
-                        let child = directory.open_dir(os_name)?;
-                        let is_objects = below_objects || (depth == 0 && name == b"objects");
-                        walk(&child, depth + 1, entries, bytes, objects, is_objects).map_err(
-                            |error| crate::store::invalid_layout(&child.path, &error.to_string()),
-                        )?;
-                    }
-                    rustix::fs::FileType::RegularFile => {
-                        let file = directory.open_file(os_name)?;
-                        let length = directory.require_regular(&file, os_name)?;
-                        *bytes = bytes.checked_add(length).ok_or_else(|| {
-                            crate::store::invalid_layout(
-                                &directory.path,
-                                "repository byte count overflow",
-                            )
-                        })?;
-                        if *bytes > MAX_PENDING_REPO_BYTES {
-                            return Err(crate::store::invalid_layout(
-                                &directory.path,
-                                "repository byte limit exceeded",
-                            ));
-                        }
-                        if below_objects {
-                            *objects = objects.checked_add(1).ok_or_else(|| {
-                                crate::store::invalid_layout(
-                                    &directory.path,
-                                    "repository object count overflow",
-                                )
-                            })?;
-                            if *objects > MAX_PENDING_REPO_OBJECTS {
-                                return Err(crate::store::invalid_layout(
-                                    &directory.path,
-                                    "repository object limit exceeded",
-                                ));
-                            }
-                        }
-                    }
-                    _ => {
-                        return Err(crate::store::invalid_layout(
-                            &directory.path,
-                            "repository contains a non-regular entry",
-                        ));
-                    }
-                }
-                Ok(())
-            })
-            .map_err(|error| command_error("bound fetched repository", error))
-    }
-    let mut entries = 0;
-    let mut bytes = 0;
-    let mut objects = 0;
-    walk(git_dir, 0, &mut entries, &mut bytes, &mut objects, false)
+#[derive(Default)]
+struct RepositoryWalkState {
+    entries: usize,
+    bytes: u64,
+    objects: usize,
+    visited: HashSet<(u64, u64)>,
 }
 
-fn audit_local_config(runner: &GitRunner<'_>, git_dir: &Directory) -> Result<(), GitCommandError> {
-    let output = runner.output(
+fn skip_selected_admin_entry(
+    layout: Option<&LocalRepositoryLayout>,
+    directory: &Directory,
+    name: &[u8],
+) -> Result<bool, GitCommandError> {
+    let Some(layout) = layout else {
+        return Ok(false);
+    };
+    let (Some(worktrees), Some(selected)) = (
+        layout.common_worktrees_dir.as_ref(),
+        layout.admin_entry_name.as_ref(),
+    ) else {
+        return Ok(false);
+    };
+    Ok(name == selected.as_bytes()
+        && directory
+            .same_identity(worktrees)
+            .map_err(|error| command_error("bound fetched repository", error))?)
+}
+
+fn audit_repository_walk(
+    directory: &Directory,
+    depth: usize,
+    below_objects: bool,
+    layout: Option<&LocalRepositoryLayout>,
+    state: &mut RepositoryWalkState,
+) -> Result<(), GitCommandError> {
+    if depth > MAX_PENDING_REPO_DEPTH {
+        return Err(GitCommandError {
+            operation: "bound fetched repository",
+            message: "repository depth limit exceeded".to_owned(),
+        });
+    }
+    let identity = directory
+        .identity_key()
+        .map_err(|error| command_error("bound fetched repository", error))?;
+    if !state.visited.insert(identity) {
+        return Ok(());
+    }
+    let remaining = MAX_PENDING_REPO_FS_ENTRIES.saturating_sub(state.entries);
+    directory
+        .for_each_name(remaining.saturating_add(1), |name| {
+            state.entries = state.entries.checked_add(1).ok_or_else(|| {
+                crate::store::invalid_layout(&directory.path, "repository entry count overflow")
+            })?;
+            if state.entries > MAX_PENDING_REPO_FS_ENTRIES {
+                return Err(crate::store::invalid_layout(
+                    &directory.path,
+                    "repository entry limit exceeded",
+                ));
+            }
+            if skip_selected_admin_entry(layout, directory, name).map_err(|error| {
+                crate::store::invalid_layout(&directory.path, &error.to_string())
+            })? {
+                return Ok(());
+            }
+            let os_name = OsStr::from_bytes(name);
+            match directory.kind(os_name)? {
+                rustix::fs::FileType::Directory => {
+                    let child = directory.open_dir(os_name)?;
+                    let is_objects = below_objects || (depth == 0 && name == b"objects");
+                    audit_repository_walk(&child, depth + 1, is_objects, layout, state).map_err(
+                        |error| crate::store::invalid_layout(&child.path, &error.to_string()),
+                    )?;
+                }
+                rustix::fs::FileType::RegularFile => {
+                    let file = directory.open_file(os_name)?;
+                    let identity = Directory::file_identity_key(&file)?;
+                    if !state.visited.insert(identity) {
+                        return Ok(());
+                    }
+                    let length = directory.require_regular(&file, os_name)?;
+                    state.bytes = state.bytes.checked_add(length).ok_or_else(|| {
+                        crate::store::invalid_layout(
+                            &directory.path,
+                            "repository byte count overflow",
+                        )
+                    })?;
+                    if state.bytes > MAX_PENDING_REPO_BYTES {
+                        return Err(crate::store::invalid_layout(
+                            &directory.path,
+                            "repository byte limit exceeded",
+                        ));
+                    }
+                    if below_objects {
+                        state.objects = state.objects.checked_add(1).ok_or_else(|| {
+                            crate::store::invalid_layout(
+                                &directory.path,
+                                "repository object count overflow",
+                            )
+                        })?;
+                        if state.objects > MAX_PENDING_REPO_OBJECTS {
+                            return Err(crate::store::invalid_layout(
+                                &directory.path,
+                                "repository object limit exceeded",
+                            ));
+                        }
+                    }
+                }
+                _ => {
+                    return Err(crate::store::invalid_layout(
+                        &directory.path,
+                        "repository contains a non-regular entry",
+                    ));
+                }
+            }
+            Ok(())
+        })
+        .map_err(|error| command_error("bound fetched repository", error))
+}
+
+fn audit_repository_physical_bounds(git_dir: &Directory) -> Result<(), GitCommandError> {
+    audit_repository_walk(git_dir, 0, false, None, &mut RepositoryWalkState::default())
+}
+
+fn audit_local_repository_physical_bounds(
+    layout: &LocalRepositoryLayout,
+) -> Result<(), GitCommandError> {
+    let mut state = RepositoryWalkState::default();
+    audit_repository_walk(&layout.common_dir, 0, false, Some(layout), &mut state)?;
+    audit_repository_walk(&layout.admin_dir, 2, false, Some(layout), &mut state)
+}
+
+fn audit_local_repository_metadata(layout: &LocalRepositoryLayout) -> Result<(), GitCommandError> {
+    audit_repository_metadata(&layout.common_dir)?;
+    let config = layout
+        .common_dir
+        .open_file(OsStr::new("config"))
+        .map_err(|error| command_error("audit repository metadata", error))?;
+    let config_bytes = layout
+        .common_dir
+        .require_regular(&config, OsStr::new("config"))
+        .map_err(|error| command_error("audit repository metadata", error))?;
+    if config_bytes > MAX_SMALL_OUTPUT as u64 {
+        return Err(GitCommandError {
+            operation: "audit repository metadata",
+            message: "repository config exceeds byte limit".to_owned(),
+        });
+    }
+    let head = layout
+        .admin_dir
+        .open_file(OsStr::new("HEAD"))
+        .map_err(|error| command_error("audit repository metadata", error))?;
+    let head_bytes = layout
+        .admin_dir
+        .require_regular(&head, OsStr::new("HEAD"))
+        .map_err(|error| command_error("audit repository metadata", error))?;
+    if head_bytes > MAX_SMALL_OUTPUT as u64 {
+        return Err(GitCommandError {
+            operation: "audit repository metadata",
+            message: "worktree HEAD exceeds byte limit".to_owned(),
+        });
+    }
+    if layout.gitfile.is_some() {
+        for name in ["config", "config.worktree"] {
+            if !entry_absent(&layout.admin_dir, OsStr::new(name))? {
+                return Err(GitCommandError {
+                    operation: "audit repository metadata",
+                    message: "per-worktree config is not allowed".to_owned(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn audit_local_config(
+    runner: &GitRunner<'_>,
+    layout: &LocalRepositoryLayout,
+) -> Result<(), GitCommandError> {
+    let output = runner.layout_output(
         "audit local config",
-        git_dir,
-        &repository_args(args(&["config", "--local", "--name-only", "-z", "--list"])),
+        layout,
+        &args(&[
+            "config",
+            "--no-includes",
+            "--local",
+            "--name-only",
+            "-z",
+            "--list",
+        ]),
         MAX_SMALL_OUTPUT,
     )?;
     for raw in output
@@ -1839,7 +2550,23 @@ pub(super) fn require_local_commit(
     repository: &LocalRepository,
     oid: &GitOid,
 ) -> Result<(), GitCommandError> {
-    require_commit_object(runner, &repository.git_dir, oid)
+    let object_type = runner.local_output(
+        "validate commit object",
+        repository,
+        &[
+            OsString::from("cat-file"),
+            OsString::from("-t"),
+            OsString::from(oid.as_hex()),
+        ],
+        MAX_SMALL_OUTPUT,
+    )?;
+    if object_type != b"commit\n" {
+        return Err(GitCommandError {
+            operation: "validate commit object",
+            message: "approved object is not a commit".to_owned(),
+        });
+    }
+    Ok(())
 }
 
 pub(super) fn require_fetched_commit(
@@ -1864,7 +2591,8 @@ pub(super) fn local_tree_snapshot(
     repository: &LocalRepository,
     oid: &GitOid,
 ) -> Result<crate::StoreSnapshot, super::GitAdmissionError> {
-    tree_snapshot(store, runner, &repository.git_dir, repository.format, oid)
+    let files = tree_files_local(runner, repository, oid)?;
+    scan_collected(store, &files, Vec::new()).map_err(Into::into)
 }
 
 pub(super) fn local_tree_snapshot_streaming(
@@ -1873,7 +2601,8 @@ pub(super) fn local_tree_snapshot_streaming(
     repository: &LocalRepository,
     oid: &GitOid,
 ) -> Result<ValidatedStoreState, super::GitAdmissionError> {
-    tree_snapshot_streaming(store, runner, &repository.git_dir, repository.format, oid)
+    let source = tree_file_source_local(runner, repository, oid)?;
+    scan_streamed_tree(store, source)
 }
 
 pub(super) fn fetched_tree_snapshot(
@@ -1949,6 +2678,49 @@ fn tree_file_source(
         })?;
     let blob_command = runner.command(git_dir, &repository_args(args(&["cat-file", "--batch"])));
     TreeFileSource::new(listing, format, blob_command, runner.timeout).map_err(Into::into)
+}
+
+fn tree_file_source_local(
+    runner: &GitRunner<'_>,
+    repository: &LocalRepository,
+    oid: &GitOid,
+) -> Result<TreeFileSource, super::GitAdmissionError> {
+    if oid.format() != repository.format {
+        return Err(super::GitAdmissionError::CheckpointObjectFormatMismatch);
+    }
+    let mut listing = repository.layout.work_tree.temporary_file()?;
+    let output = listing
+        .try_clone()
+        .map_err(|source| super::GitAdmissionError::Io {
+            operation: "retain canonical tree listing",
+            source,
+        })?;
+    run_bounded_command_to_file(
+        runner.local_command(
+            repository,
+            &[
+                OsString::from("ls-tree"),
+                OsString::from("-r"),
+                OsString::from("-z"),
+                OsString::from("--full-tree"),
+                OsString::from(oid.as_hex()),
+            ],
+        ),
+        "spool canonical tree listing",
+        output,
+        MAX_TREE_OUTPUT,
+        MAX_SMALL_OUTPUT,
+        runner.timeout,
+    )?;
+    listing
+        .seek(SeekFrom::Start(0))
+        .map_err(|source| super::GitAdmissionError::Io {
+            operation: "rewind canonical tree listing",
+            source,
+        })?;
+    let blob_command = runner.local_command(repository, &args(&["cat-file", "--batch"]));
+    TreeFileSource::new(listing, repository.format, blob_command, runner.timeout)
+        .map_err(Into::into)
 }
 
 fn scan_streamed_tree(
@@ -2973,6 +3745,28 @@ fn stream_tree_listing(
     Ok(())
 }
 
+fn tree_files_local(
+    runner: &GitRunner<'_>,
+    repository: &LocalRepository,
+    oid: &GitOid,
+) -> Result<Vec<RawFile>, super::GitAdmissionError> {
+    if oid.format() != repository.format {
+        return Err(super::GitAdmissionError::CheckpointObjectFormatMismatch);
+    }
+    let cat_file = runner.local_command(repository, &args(&["cat-file", "--batch"]));
+    let listing = runner.local_command(
+        repository,
+        &[
+            OsString::from("ls-tree"),
+            OsString::from("-r"),
+            OsString::from("-z"),
+            OsString::from("--full-tree"),
+            OsString::from(oid.as_hex()),
+        ],
+    );
+    collect_tree_files(cat_file, listing, repository.format, runner.timeout)
+}
+
 fn tree_files(
     _store: &Store,
     runner: &GitRunner<'_>,
@@ -2987,8 +3781,7 @@ fn tree_files(
         git_dir,
         &repository_args(vec![OsString::from("cat-file"), OsString::from("--batch")]),
     );
-    let mut blobs = CatFileBatch::spawn(cat_file, runner.timeout)?;
-    let command = runner.command(
+    let listing = runner.command(
         git_dir,
         &repository_args(vec![
             OsString::from("ls-tree"),
@@ -2998,9 +3791,19 @@ fn tree_files(
             OsString::from(oid.as_hex()),
         ]),
     );
+    collect_tree_files(cat_file, listing, format, runner.timeout)
+}
+
+fn collect_tree_files(
+    cat_file: Command,
+    listing: Command,
+    format: GitObjectFormat,
+    timeout: Duration,
+) -> Result<Vec<RawFile>, super::GitAdmissionError> {
+    let mut blobs = CatFileBatch::spawn(cat_file, timeout)?;
     let mut files = Vec::new();
     let mut total_bytes = 0_u64;
-    stream_tree_listing(command, format, runner.timeout, |entry| {
+    stream_tree_listing(listing, format, timeout, |entry| {
         let file_limit = canonical_blob_limit(entry.class)
             .ok_or(super::GitAdmissionError::NonCanonicalTrackedPath)?;
         let bytes = blobs.read_blob(&entry.blob, file_limit)?;

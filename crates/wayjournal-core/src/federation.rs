@@ -1880,8 +1880,8 @@ mod descriptor_tests {
         let (attempt_name, attempt) = create_attempt(&store).expect("attempt");
         let request = request();
         let runner = git::GitRunner::new(&request);
-        let local =
-            git::inspect_local_anchored(&runner, &request, git_dir).expect("retained local Git");
+        let local = git::inspect_local_anchored(&store, &runner, &request, git_dir)
+            .expect("retained local Git");
         assert_eq!(local.tip, expected);
         cleanup_attempt(&store, &attempt_name, &attempt).expect("cleanup");
     }

@@ -446,6 +446,12 @@ pub(super) struct Directory {
     pub path: PathBuf,
     device: u64,
 }
+
+pub(super) enum OpenedEntry {
+    Directory(Directory),
+    Regular(File),
+}
+
 impl Directory {
     fn from_file(
         path: PathBuf,
@@ -475,6 +481,16 @@ impl Directory {
         Self::from_file(path.to_owned(), file, None)
     }
     pub fn open_dir(&self, name: &OsStr) -> Result<Self, StoreError> {
+        self.open_dir_with_device(name, Some(self.device))
+    }
+    pub(super) fn open_dir_any_device(&self, name: &OsStr) -> Result<Self, StoreError> {
+        self.open_dir_with_device(name, None)
+    }
+    fn open_dir_with_device(
+        &self,
+        name: &OsStr,
+        expected_device: Option<u64>,
+    ) -> Result<Self, StoreError> {
         validate_component(name, &self.path)?;
         let fd = rfs::openat(
             &self.file,
@@ -489,7 +505,39 @@ impl Directory {
                 error.into(),
             )
         })?;
-        Self::from_file(self.path.join(name), File::from(fd), Some(self.device))
+        Self::from_file(self.path.join(name), File::from(fd), expected_device)
+    }
+    pub(super) fn open_entry(&self, name: &OsStr) -> Result<OpenedEntry, StoreError> {
+        validate_component(name, &self.path)?;
+        let fd = rfs::openat(
+            &self.file,
+            name,
+            OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|error| io_error("open directory entry", &self.path.join(name), error.into()))?;
+        let file = File::from(fd);
+        let stat = rfs::fstat(&file).map_err(|error| {
+            io_error(
+                "inspect directory entry descriptor",
+                &self.path.join(name),
+                error.into(),
+            )
+        })?;
+        if stat.st_dev as u64 != self.device {
+            return Err(StoreError::CrossDeviceLayout {
+                path: self.path.join(name),
+            });
+        }
+        match FileType::from_raw_mode(stat.st_mode) {
+            FileType::Directory => Self::from_file(self.path.join(name), file, Some(self.device))
+                .map(OpenedEntry::Directory),
+            FileType::RegularFile => Ok(OpenedEntry::Regular(file)),
+            _ => Err(invalid_layout(
+                &self.path.join(name),
+                "path is not an ordinary file or directory",
+            )),
+        }
     }
     pub fn ensure_dir(&self, name: &OsStr) -> Result<(Self, bool), StoreError> {
         validate_component(name, &self.path)?;
@@ -528,7 +576,7 @@ impl Directory {
         let fd = rfs::openat(
             &self.file,
             name,
-            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
             Mode::empty(),
         )
         .map_err(|error| {
@@ -710,6 +758,40 @@ impl Directory {
             std::process::id(),
             self.file.as_raw_fd()
         ))
+    }
+    pub(super) fn identity_key(&self) -> Result<(u64, u64), StoreError> {
+        let stat = rfs::fstat(&self.file)
+            .map_err(|error| io_error("inspect retained directory", &self.path, error.into()))?;
+        Ok((stat.st_dev as u64, stat.st_ino as u64))
+    }
+    pub(super) fn same_identity(&self, other: &Self) -> Result<bool, StoreError> {
+        let left = rfs::fstat(&self.file)
+            .map_err(|error| io_error("inspect retained directory", &self.path, error.into()))?;
+        let right = rfs::fstat(&other.file)
+            .map_err(|error| io_error("inspect retained directory", &other.path, error.into()))?;
+        Ok(left.st_dev == right.st_dev && left.st_ino == right.st_ino)
+    }
+    pub(super) fn same_authority(&self, other: &Self) -> Result<bool, StoreError> {
+        let left = rfs::fstat(&self.file)
+            .map_err(|error| io_error("inspect retained directory", &self.path, error.into()))?;
+        let right = rfs::fstat(&other.file)
+            .map_err(|error| io_error("inspect retained directory", &other.path, error.into()))?;
+        Ok(left.st_dev == right.st_dev && left.st_uid == right.st_uid)
+    }
+    pub(super) fn file_same_authority(&self, file: &File) -> Result<bool, StoreError> {
+        let directory = rfs::fstat(&self.file)
+            .map_err(|error| io_error("inspect retained directory", &self.path, error.into()))?;
+        let candidate = rfs::fstat(file)
+            .map_err(|error| io_error("inspect retained file", &self.path, error.into()))?;
+        Ok(directory.st_dev == candidate.st_dev && directory.st_uid == candidate.st_uid)
+    }
+    pub(super) fn file_identity_key(file: &File) -> Result<(u64, u64), StoreError> {
+        let stat = rfs::fstat(file)
+            .map_err(|error| io_error("inspect retained file", Path::new("."), error.into()))?;
+        Ok((stat.st_dev as u64, stat.st_ino as u64))
+    }
+    pub(super) fn file_is_same(left: &File, right: &File) -> Result<bool, StoreError> {
+        Ok(Self::file_identity_key(left)? == Self::file_identity_key(right)?)
     }
     pub fn entry_is(&self, name: &OsStr, child: &Self) -> Result<bool, StoreError> {
         validate_component(name, &self.path)?;

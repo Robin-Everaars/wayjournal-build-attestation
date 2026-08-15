@@ -4,6 +4,7 @@ mod support;
 use std::{
     collections::BTreeSet,
     fs,
+    mem::MaybeUninit,
     path::{Path, PathBuf},
     process::Command,
     sync::{Arc, Mutex},
@@ -123,6 +124,43 @@ fn configure(cwd: &Path) {
     run(cwd, &["config", "user.name", "Wayjournal Test"]);
     run(cwd, &["config", "user.email", "wayjournal@example.invalid"]);
 }
+struct TransferProbe {
+    descriptor: rustix::fd::OwnedFd,
+    watch: i32,
+}
+
+fn install_transfer_probe(remote: &Path) -> TransferProbe {
+    use rustix::fs::inotify;
+
+    let path = remote.join("objects/info/alternates");
+    fs::write(&path, b"wayjournal-contact-probe\n").expect("install transfer probe");
+    let descriptor = inotify::init(inotify::CreateFlags::CLOEXEC | inotify::CreateFlags::NONBLOCK)
+        .expect("create transfer probe");
+    let watch = inotify::add_watch(&descriptor, &path, inotify::WatchFlags::OPEN)
+        .expect("watch transfer probe");
+    TransferProbe { descriptor, watch }
+}
+
+fn transfer_probe_contacted(probe: &TransferProbe) -> bool {
+    use rustix::fs::inotify;
+
+    let mut buffer = [MaybeUninit::uninit(); 256];
+    let mut reader = inotify::Reader::new(&probe.descriptor, &mut buffer);
+    loop {
+        match reader.next() {
+            Ok(event)
+                if event.wd() == probe.watch
+                    && event.events().contains(inotify::ReadFlags::OPEN) =>
+            {
+                return true;
+            }
+            Ok(_) => {}
+            Err(rustix::io::Errno::AGAIN) => return false,
+            Err(error) => panic!("read transfer probe: {error}"),
+        }
+    }
+}
+
 fn request(remote: &Path) -> GitSyncRequest {
     GitSyncRequest::new(
         git(),
@@ -441,6 +479,93 @@ fn append_profile(store: &Store, path: &Path, record: Record, key: &str) {
         .expect("append");
     run(path, &["add", "journal"]);
     run(path, &["commit", "-m", key]);
+}
+
+#[test]
+fn hostile_git_entry_quarantines_before_transfer_or_pending_mutation() {
+    let fixture = fixture("hostile-git-entry-quarantine");
+    let retained = fixture.local.join(".git.retained");
+    fs::rename(fixture.local.join(".git"), &retained).unwrap();
+    std::os::unix::fs::symlink(&retained, fixture.local.join(".git")).unwrap();
+    let probe = install_transfer_probe(&fixture.remote);
+
+    assert!(matches!(
+        fixture.store.sync_git_union(&fixture.request).unwrap(),
+        GitSyncOutcome::Quarantined {
+            reason: GitQuarantineReason::UnsafeRepositoryState,
+            ..
+        }
+    ));
+    assert!(
+        !transfer_probe_contacted(&probe),
+        "hostile .git contacted remote"
+    );
+    assert_eq!(
+        fs::read_dir(fixture.local.join(".wayjournal-local/sync-pending"))
+            .unwrap()
+            .count(),
+        0
+    );
+}
+
+#[test]
+fn linked_worktree_advances_and_publishes_through_the_common_repository() {
+    let fixture = fixture("linked-advance");
+    run(&fixture.local, &["checkout", "--detach"]);
+    let linked = fixture.root.0.join("linked");
+    run(
+        &fixture.local,
+        &[
+            "worktree",
+            "add",
+            linked.to_str().expect("linked path"),
+            "main",
+        ],
+    );
+    let linked_store = Store::open(
+        &linked,
+        wayjournal_domain_registry().expect("registry"),
+        Arc::new(NoLegacy),
+    )
+    .expect("linked store");
+    linked_store
+        .bootstrap_git_admission(&fixture.request)
+        .expect("linked bootstrap");
+
+    let (writer_path, writer, _) = clone_store(&fixture.root.0, &fixture.remote, "writer");
+    run(
+        &writer_path,
+        &[
+            "remote",
+            "add",
+            "origin",
+            fixture.remote.to_str().expect("remote"),
+        ],
+    );
+    append_profile(
+        &writer,
+        &writer_path,
+        profile(
+            "01913f1d-8e2a-7c30-8f4a-426614174021",
+            "01913f1d-8e2a-7c30-8f4a-426614174022",
+            "linked advance",
+            3,
+        ),
+        "linked-advance",
+    );
+    run(&writer_path, &["push", "origin", "HEAD:refs/heads/main"]);
+
+    assert!(matches!(
+        linked_store.sync_git_union(&fixture.request).expect("sync"),
+        GitSyncOutcome::Advanced { .. }
+    ));
+    assert_eq!(oid(&linked, "HEAD"), oid(&fixture.local, "refs/heads/main"));
+    assert!(
+        !fixture
+            .local
+            .join(".git/refs/wayjournal/candidate")
+            .exists()
+    );
 }
 
 #[test]

@@ -3,6 +3,8 @@ mod support;
 
 use std::{
     fs,
+    mem::MaybeUninit,
+    os::unix::ffi::OsStringExt,
     path::{Path, PathBuf},
     process::Command,
     sync::Arc,
@@ -10,9 +12,9 @@ use std::{
 
 use serde_json::json;
 use wayjournal_core::{
-    ActorId, ApprovedRef, ApprovedRemote, ApprovedRemoteLocator, GitAdmissionError, GitSyncOutcome,
-    GitSyncRequest, LocalTrustBinding, Record, Store, StoreError, StoreRevisionRef, prepare_batch,
-    wayjournal_domain_registry,
+    ActorId, ApprovedRef, ApprovedRemote, ApprovedRemoteLocator, GitAdmissionError, GitSyncError,
+    GitSyncOutcome, GitSyncRequest, LocalTrustBinding, Record, Store, StoreError, StoreRevisionRef,
+    prepare_batch, wayjournal_domain_registry,
 };
 
 use support::BoundedNoLegacy as NoLegacy;
@@ -88,6 +90,47 @@ fn profile(record: &str, batch: &str, value: &str) -> Record {
 fn request(remote: &Path) -> GitSyncRequest {
     request_with_git(remote, git())
 }
+struct TransferProbe {
+    descriptor: rustix::fd::OwnedFd,
+    watch: i32,
+}
+
+fn install_open_probe(path: &Path) -> TransferProbe {
+    use rustix::fs::inotify;
+
+    let descriptor = inotify::init(inotify::CreateFlags::CLOEXEC | inotify::CreateFlags::NONBLOCK)
+        .expect("create open probe");
+    let watch =
+        inotify::add_watch(&descriptor, path, inotify::WatchFlags::OPEN).expect("watch open probe");
+    TransferProbe { descriptor, watch }
+}
+
+fn install_transfer_probe(remote: &Path) -> TransferProbe {
+    let path = remote.join("objects/info/alternates");
+    fs::write(&path, b"wayjournal-contact-probe\n").expect("install transfer probe");
+    install_open_probe(&path)
+}
+
+fn transfer_probe_contacted(probe: &TransferProbe) -> bool {
+    use rustix::fs::inotify;
+
+    let mut buffer = [MaybeUninit::uninit(); 256];
+    let mut reader = inotify::Reader::new(&probe.descriptor, &mut buffer);
+    loop {
+        match reader.next() {
+            Ok(event)
+                if event.wd() == probe.watch
+                    && event.events().contains(inotify::ReadFlags::OPEN) =>
+            {
+                return true;
+            }
+            Ok(_) => {}
+            Err(rustix::io::Errno::AGAIN) => return false,
+            Err(error) => panic!("read transfer probe: {error}"),
+        }
+    }
+}
+
 fn request_with_git(remote: &Path, executable: PathBuf) -> GitSyncRequest {
     GitSyncRequest::new(
         executable,
@@ -112,6 +155,109 @@ struct Fixture {
 }
 fn fixture(label: &str) -> Fixture {
     fixture_with_remote(label, true, false)
+}
+
+fn linked_fixture(label: &str) -> Fixture {
+    let mut fixture = fixture(label);
+    run(&fixture.local, &["checkout", "--detach"]);
+    let linked = fixture.root.0.join("linked");
+    run(
+        &fixture.local,
+        &[
+            "worktree",
+            "add",
+            linked.to_str().expect("linked path"),
+            "main",
+        ],
+    );
+    let store = Store::open(
+        &linked,
+        wayjournal_domain_registry().unwrap(),
+        Arc::new(NoLegacy),
+    )
+    .unwrap();
+    store.bootstrap_git_admission(&fixture.request).unwrap();
+    fixture.local = linked;
+    fixture.store = store;
+    fixture
+}
+
+fn linked_admin_and_common(linked: &Path) -> (PathBuf, PathBuf) {
+    let gitfile = fs::read(linked.join(".git")).unwrap();
+    let raw = gitfile
+        .strip_prefix(b"gitdir: ")
+        .unwrap()
+        .strip_suffix(b"\n")
+        .unwrap_or_else(|| gitfile.strip_prefix(b"gitdir: ").unwrap());
+    let admin = PathBuf::from(std::ffi::OsString::from_vec(raw.to_vec()));
+    let common_raw = fs::read(admin.join("commondir")).unwrap();
+    let common_raw = common_raw.strip_suffix(b"\n").unwrap_or(&common_raw);
+    let common =
+        fs::canonicalize(admin.join(std::ffi::OsString::from_vec(common_raw.to_vec()))).unwrap();
+    (admin, common)
+}
+
+#[allow(clippy::unnecessary_debug_formatting)] // Debug produces escaped Rust path literals.
+fn replacement_request(
+    fixture: &Fixture,
+    label: &str,
+    target: &Path,
+    replacement: &Path,
+) -> GitSyncRequest {
+    let tools = fixture.root.0.join(format!("replacement-tools-{label}"));
+    fs::create_dir(&tools).unwrap();
+    let source = tools.join("git-wrapper.rs");
+    let wrapper = tools.join("git-wrapper");
+    let marker = tools.join("replaced");
+    let retained = target.with_extension(format!("wayjournal-retained-{label}"));
+    let marker_literal = format!("{marker:?}");
+    let target_literal = format!("{target:?}");
+    let retained_literal = format!("{retained:?}");
+    let replacement_literal = format!("{replacement:?}");
+    let git_path = git();
+    let git_literal = format!("{git_path:?}");
+    fs::write(
+        &source,
+        format!(
+            r#"use std::{{env, fs, process::Command}};
+fn main() {{
+    let args = env::args_os().skip(1).collect::<Vec<_>>();
+    if env::var_os("GIT_DIR").is_some() && !std::path::Path::new({marker_literal}).exists() {{
+        fs::rename({target_literal}, {retained_literal}).unwrap();
+        fs::rename({replacement_literal}, {target_literal}).unwrap();
+        fs::write({marker_literal}, b"").unwrap();
+    }}
+    let status = Command::new({git_literal}).args(&args).status().unwrap();
+    std::process::exit(status.code().unwrap_or(127));
+}}
+"#,
+        ),
+    )
+    .unwrap();
+    let status = Command::new("rustc")
+        .args([source.as_os_str(), "-o".as_ref(), wrapper.as_os_str()])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    request_with_git(&fixture.remote, wrapper)
+}
+
+fn advance_remote(fixture: &Fixture) {
+    let writer = fixture
+        .root
+        .0
+        .join(format!("writer-{}", uuid::Uuid::now_v7()));
+    run(
+        &fixture.root.0,
+        &[
+            "clone",
+            fixture.remote.to_str().unwrap(),
+            writer.to_str().unwrap(),
+        ],
+    );
+    configure(&writer);
+    run(&writer, &["commit", "--allow-empty", "-m", "advance"]);
+    run(&writer, &["push", "origin", "HEAD:refs/heads/main"]);
 }
 
 fn fixture_with_remote(label: &str, bare: bool, configured_non_bare: bool) -> Fixture {
@@ -412,6 +558,194 @@ fn every_normal_durability_fault_recovers_and_gates_five_fresh_handle_process_ap
         )
         .unwrap();
         resumed.read().expect("APIs resume after durable cleanup");
+    }
+}
+
+#[test]
+fn linked_worktree_recovers_every_durable_publication_phase() {
+    for barrier in [
+        "pending-root-durable",
+        "files-phase-durable",
+        "local-ref-updated",
+        "local-ref-phase-durable",
+        "remote-confirmed-phase-durable",
+    ] {
+        let fixture = linked_fixture(&format!("linked-recovery-{barrier}"));
+        let writer = fixture.root.0.join("writer");
+        run(
+            &fixture.root.0,
+            &[
+                "clone",
+                fixture.remote.to_str().unwrap(),
+                writer.to_str().unwrap(),
+            ],
+        );
+        configure(&writer);
+        run(&writer, &["commit", "--allow-empty", "-m", "advance"]);
+        run(&writer, &["push", "origin", "HEAD:refs/heads/main"]);
+        let status = child_sync(&fixture.local, &fixture.remote, barrier);
+        assert_eq!(status.code(), Some(86), "fault not reached: {barrier}");
+        assert!(
+            fs::read_dir(fixture.local.join(".wayjournal-local/sync-pending"))
+                .unwrap()
+                .count()
+                > 0,
+            "pending state missing at {barrier}"
+        );
+        let fresh = Store::open(
+            &fixture.local,
+            wayjournal_domain_registry().unwrap(),
+            Arc::new(NoLegacy),
+        )
+        .unwrap();
+        assert!(matches!(
+            fresh.sync_git_union(&request(&fixture.remote)).unwrap(),
+            GitSyncOutcome::Advanced { .. } | GitSyncOutcome::UpToDate { .. }
+        ));
+        assert_eq!(
+            fs::read_dir(fixture.local.join(".wayjournal-local/sync-pending"))
+                .unwrap()
+                .count(),
+            0,
+            "pending state survived recovery at {barrier}"
+        );
+        let local =
+            String::from_utf8(run(&fixture.local, &["rev-parse", "refs/heads/main"])).unwrap();
+        let remote = String::from_utf8(run(
+            &fixture.root.0,
+            &[
+                "--git-dir",
+                fixture.remote.to_str().unwrap(),
+                "rev-parse",
+                "refs/heads/main",
+            ],
+        ))
+        .unwrap();
+        assert_eq!(local.trim(), remote.trim(), "ref mismatch at {barrier}");
+        let candidate = Command::new(git())
+            .current_dir(&fixture.local)
+            .args(["rev-parse", "--verify", "refs/wayjournal/candidate"])
+            .output()
+            .unwrap();
+        assert!(
+            !candidate.status.success(),
+            "candidate ref survived recovery at {barrier}"
+        );
+    }
+}
+
+#[test]
+fn linked_pending_layout_failure_precedes_transfer_and_preserves_pending() {
+    let fixture = linked_fixture("linked-pending-layout-failure");
+    let writer = fixture.root.0.join("writer");
+    run(
+        &fixture.root.0,
+        &[
+            "clone",
+            fixture.remote.to_str().unwrap(),
+            writer.to_str().unwrap(),
+        ],
+    );
+    configure(&writer);
+    run(&writer, &["commit", "--allow-empty", "-m", "advance"]);
+    run(&writer, &["push", "origin", "HEAD:refs/heads/main"]);
+    assert_eq!(
+        child_sync(&fixture.local, &fixture.remote, "files-phase-durable").code(),
+        Some(86)
+    );
+    let pending = fixture.local.join(".wayjournal-local/sync-pending");
+    let pending_before = fs::read_dir(&pending).unwrap().count();
+    assert!(pending_before > 0);
+    let probe = install_transfer_probe(&fixture.remote);
+    let retained = fixture.local.join(".git.retained");
+    fs::rename(fixture.local.join(".git"), &retained).unwrap();
+    std::os::unix::fs::symlink(&retained, fixture.local.join(".git")).unwrap();
+
+    let fresh = Store::open(
+        &fixture.local,
+        wayjournal_domain_registry().unwrap(),
+        Arc::new(NoLegacy),
+    )
+    .unwrap();
+    match fresh
+        .sync_git_union(&request(&fixture.remote))
+        .expect_err("hostile linked layout must stop recovery")
+    {
+        GitSyncError::Git(error) => assert_eq!(error.operation(), "resolve local Git layout"),
+        other => panic!("unexpected recovery error: {other:?}"),
+    }
+    assert!(
+        !transfer_probe_contacted(&probe),
+        "recovery contacted remote"
+    );
+    assert_eq!(fs::read_dir(&pending).unwrap().count(), pending_before);
+
+    fs::remove_file(fixture.local.join(".git")).unwrap();
+    fs::rename(&retained, fixture.local.join(".git")).unwrap();
+    assert!(matches!(
+        fresh.sync_git_union(&request(&fixture.remote)).unwrap(),
+        GitSyncOutcome::Advanced { .. } | GitSyncOutcome::UpToDate { .. }
+    ));
+}
+
+#[test]
+fn linked_admin_and_common_replacements_are_never_traversed() {
+    for phase in ["initial", "files-published"] {
+        for kind in ["admin", "common"] {
+            let fixture = linked_fixture(&format!("linked-{phase}-{kind}-replacement"));
+            advance_remote(&fixture);
+            if phase == "files-published" {
+                assert_eq!(
+                    child_sync(&fixture.local, &fixture.remote, "files-phase-durable").code(),
+                    Some(86)
+                );
+            }
+            let (admin, common) = linked_admin_and_common(&fixture.local);
+            let target = if kind == "admin" { &admin } else { &common };
+            let replacement = fixture.root.0.join(format!("{phase}-{kind}-replacement"));
+            fs::create_dir(&replacement).unwrap();
+            let sentinel = replacement.join("sentinel");
+            fs::write(&sentinel, b"must remain unopened").unwrap();
+            let probe = install_open_probe(&sentinel);
+            let replacement_request =
+                replacement_request(&fixture, &format!("{phase}-{kind}"), target, &replacement);
+            let store = Store::open(
+                &fixture.local,
+                wayjournal_domain_registry().unwrap(),
+                Arc::new(NoLegacy),
+            )
+            .unwrap();
+            let result = store.sync_git_union(&replacement_request);
+            match result {
+                Ok(GitSyncOutcome::Advanced { .. } | GitSyncOutcome::UpToDate { .. }) => {
+                    assert_eq!(
+                        fs::read_dir(fixture.local.join(".wayjournal-local/sync-pending"))
+                            .unwrap()
+                            .count(),
+                        0
+                    );
+                }
+                Err(GitSyncError::Git(error)) => {
+                    assert_eq!(error.operation(), "resolve local Git layout");
+                    assert!(
+                        fs::read_dir(fixture.local.join(".wayjournal-local/sync-pending"))
+                            .unwrap()
+                            .count()
+                            > 0,
+                        "fail-closed replacement lost pending state"
+                    );
+                }
+                other => panic!("unexpected {phase} {kind} result: {other:?}"),
+            }
+            assert!(
+                !transfer_probe_contacted(&probe),
+                "traversed {phase} {kind} replacement"
+            );
+            assert_eq!(
+                fs::read(target.join("sentinel")).unwrap(),
+                b"must remain unopened"
+            );
+        }
     }
 }
 

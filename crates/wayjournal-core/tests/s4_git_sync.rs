@@ -135,6 +135,337 @@ fn checkpoint_path(fixture: &AdmissionFixture) -> PathBuf {
         .join(".wayjournal-local/checkpoints/admission-v1.json")
 }
 
+fn linked_fixture(label: &str) -> (AdmissionFixture, TestDir, PathBuf) {
+    let fixture = admission_fixture(label);
+    run(fixture.local.path(), &["checkout", "--detach"]);
+    let linked = TestDir::new(&format!("{label}-linked"));
+    fs::remove_dir(linked.path()).expect("remove linked-worktree destination");
+    run(
+        fixture.local.path(),
+        &[
+            "worktree",
+            "add",
+            linked.path().to_str().expect("UTF-8 linked worktree"),
+            "main",
+        ],
+    );
+    let gitfile = fs::read(linked.path().join(".git")).expect("gitfile");
+    let admin = PathBuf::from(OsString::from_vec(
+        gitfile
+            .strip_prefix(b"gitdir: ")
+            .expect("gitfile prefix")
+            .strip_suffix(b"\n")
+            .unwrap_or_else(|| gitfile.strip_prefix(b"gitdir: ").expect("gitfile prefix"))
+            .to_vec(),
+    ));
+    (fixture, linked, admin)
+}
+
+#[test]
+fn malformed_linked_topology_and_symlink_components_fail_closed() {
+    for case in ["backlink", "commondir", "common-redirect", "symlink"] {
+        let (fixture, linked, admin) = linked_fixture(&format!("linked-topology-{case}"));
+        match case {
+            "backlink" => {
+                let other = linked.path().join("other-gitfile");
+                fs::write(&other, b"not authority\n").expect("other gitfile");
+                fs::write(admin.join("gitdir"), format!("{}\n", other.display()))
+                    .expect("replace backlink");
+            }
+            "commondir" => {
+                fs::write(admin.join("commondir"), b".\n").expect("replace commondir");
+            }
+            "common-redirect" => {
+                fs::write(fixture.local.path().join(".git/commondir"), b"elsewhere\n")
+                    .expect("redirect common");
+            }
+            "symlink" => {
+                let symlink = linked.path().with_extension("admin-link");
+                std::os::unix::fs::symlink(&admin, &symlink).expect("admin symlink");
+                fs::write(
+                    linked.path().join(".git"),
+                    format!("gitdir: {}\n", symlink.display()),
+                )
+                .expect("symlink gitfile");
+            }
+            _ => unreachable!(),
+        }
+        let store = Store::open(
+            linked.path(),
+            wayjournal_domain_registry().expect("registry"),
+            Arc::new(NoLegacy),
+        )
+        .expect("linked store");
+        let error = store
+            .bootstrap_git_admission(&fixture.request)
+            .expect_err("hostile topology must fail");
+        match error {
+            GitAdmissionError::Git(error) => {
+                assert_eq!(error.operation(), "resolve local Git layout", "{case}");
+            }
+            other => panic!("unexpected {case} error: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn fifo_git_control_files_fail_promptly_before_remote_contact() {
+    for control in ["gitfile", "gitdir", "commondir", "HEAD", "config"] {
+        let (fixture, linked, admin) = linked_fixture(&format!("fifo-control-{control}"));
+        let target = match control {
+            "gitfile" => {
+                let retained = linked.path().join(".git.retained");
+                fs::rename(linked.path().join(".git"), retained).expect("retain gitfile");
+                linked.path().join(".git")
+            }
+            "config" => {
+                let target = fixture.local.path().join(".git/config");
+                fs::remove_file(&target).expect("remove config");
+                target
+            }
+            name => {
+                let target = admin.join(name);
+                fs::remove_file(&target).expect("remove admin control");
+                target
+            }
+        };
+        let status = Command::new("mkfifo")
+            .arg(&target)
+            .status()
+            .expect("mkfifo");
+        assert!(status.success(), "mkfifo {control}");
+        let store = Store::open(
+            linked.path(),
+            wayjournal_domain_registry().expect("registry"),
+            Arc::new(NoLegacy),
+        )
+        .expect("linked store");
+        let probe = install_transfer_probe(&fixture);
+        let started = Instant::now();
+        let error = store
+            .bootstrap_git_admission(&fixture.request)
+            .expect_err("FIFO control must fail");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "blocked on {control}"
+        );
+        match error {
+            GitAdmissionError::Git(error) => {
+                let expected = if matches!(control, "HEAD" | "config") {
+                    "audit repository metadata"
+                } else {
+                    "resolve local Git layout"
+                };
+                assert_eq!(error.operation(), expected, "{control}");
+            }
+            other => panic!("unexpected {control} error: {other:?}"),
+        }
+        assert!(
+            !transfer_probe_contacted(&probe),
+            "remote contacted for {control}"
+        );
+    }
+}
+
+#[test]
+fn malformed_gitfiles_fail_closed_before_remote_contact() {
+    let cases = [
+        ("empty", Vec::new()),
+        ("prefix", b"wrong: target\n".to_vec()),
+        ("target", b"gitdir: \n".to_vec()),
+        ("nul", b"gitdir: target\0suffix\n".to_vec()),
+        ("crlf", b"gitdir: target\r\n".to_vec()),
+        ("lines", b"gitdir: target\nsecond\n".to_vec()),
+        ("oversize", vec![b'x'; 4097]),
+    ];
+    for (label, bytes) in cases {
+        let fixture = admission_fixture(&format!("malformed-gitfile-{label}"));
+        fs::rename(
+            fixture.local.path().join(".git"),
+            fixture.local.path().join("admin.git"),
+        )
+        .expect("retain original Git directory");
+        fs::write(fixture.local.path().join(".git"), bytes).expect("malformed gitfile");
+        let probe = install_transfer_probe(&fixture);
+        let error = fixture
+            .store
+            .bootstrap_git_admission(&fixture.request)
+            .expect_err("malformed gitfile must fail");
+        match error {
+            GitAdmissionError::Git(error) => {
+                assert_eq!(error.operation(), "resolve local Git layout", "{label}");
+            }
+            other => panic!("unexpected {label} error: {other:?}"),
+        }
+        assert!(
+            !transfer_probe_contacted(&probe),
+            "remote contacted for {label}"
+        );
+    }
+}
+
+#[test]
+fn local_git_commands_remain_bound_after_gitfile_replacement() {
+    let (fixture, linked, _) = linked_fixture("linked-gitfile-race");
+    let tools = TestDir::new("linked-gitfile-race-tools");
+    let wrapper = tools.path().join("git-wrapper");
+    let log = tools.path().join("git.log");
+    let marker = tools.path().join("replaced");
+    let retained = linked.path().join(".git.retained");
+    let source = tools.path().join("git-wrapper.rs");
+    fs::write(
+        &source,
+        format!(
+            r#"use std::{{env, fs, fs::OpenOptions, io::Write, process::Command}};
+fn main() {{
+    let args = env::args_os().skip(1).collect::<Vec<_>>();
+    if env::var_os("GIT_DIR").is_some() && !std::path::Path::new({marker:?}).exists() {{
+        fs::rename({gitfile:?}, {retained:?}).unwrap();
+        fs::write({gitfile:?}, b"hostile-gitfile").unwrap();
+        fs::write({marker:?}, b"").unwrap();
+    }}
+    let mut log = OpenOptions::new().create(true).append(true).open({log:?}).unwrap();
+    write!(log, "D={{}} C={{}} W={{}}", env::var("GIT_DIR").unwrap_or_default(), env::var("GIT_COMMON_DIR").unwrap_or_default(), env::var("GIT_WORK_TREE").unwrap_or_default()).unwrap();
+    for arg in &args {{ write!(log, " <{{}}>", arg.to_string_lossy()).unwrap(); }}
+    writeln!(log).unwrap();
+    let status = Command::new({git:?}).args(&args).status().unwrap();
+    std::process::exit(status.code().unwrap_or(127));
+}}
+"#,
+            marker = marker,
+            gitfile = linked.path().join(".git"),
+            retained = retained,
+            log = log,
+            git = git(),
+        ),
+    )
+    .expect("wrapper source");
+    let compiled = Command::new("rustc")
+        .args([source.as_os_str(), "-o".as_ref(), wrapper.as_os_str()])
+        .status()
+        .expect("compile wrapper");
+    assert!(compiled.success(), "compile wrapper");
+    let request = GitSyncRequest::new(
+        wrapper,
+        fixture.request.local_trust(),
+        fixture.request.approved_remote().clone(),
+    )
+    .expect("wrapper request");
+    let store = Store::open(
+        linked.path(),
+        wayjournal_domain_registry().expect("registry"),
+        Arc::new(NoLegacy),
+    )
+    .expect("linked store");
+
+    let outcome = store.bootstrap_git_admission(&request);
+    assert!(
+        matches!(outcome, Ok(GitAdmissionOutcome::GenesisValidated { .. })),
+        "replacement outcome: {outcome:?}"
+    );
+    assert_eq!(
+        fs::read(linked.path().join(".git")).expect("replacement gitfile"),
+        b"hostile-gitfile"
+    );
+    let invocations = fs::read_to_string(log).expect("invocation log");
+    let local = invocations
+        .lines()
+        .filter(|line| !line.starts_with("D= C= W="))
+        .collect::<Vec<_>>();
+    assert!(!local.is_empty());
+    for line in local {
+        let fields = line.split_whitespace().take(3).collect::<Vec<_>>();
+        assert_eq!(fields.len(), 3, "{line}");
+        assert!(
+            fields
+                .iter()
+                .all(|field| field.contains("=/proc/") && field.contains("/fd/")),
+            "{line}"
+        );
+        assert!(!line.contains("<--git-dir=.>"), "{line}");
+        assert!(
+            !line.contains(&linked.path().join(".git").display().to_string()),
+            "{line}"
+        );
+    }
+}
+
+#[test]
+fn relative_gitfile_target_preserves_linked_worktree_topology() {
+    let fixture = admission_fixture("relative-linked-worktree");
+    run(fixture.local.path(), &["checkout", "--detach"]);
+    let linked = TestDir::new("relative-linked-worktree-store");
+    fs::remove_dir(linked.path()).expect("remove linked-worktree destination");
+    run(
+        fixture.local.path(),
+        &[
+            "worktree",
+            "add",
+            linked.path().to_str().expect("UTF-8 linked worktree"),
+            "main",
+        ],
+    );
+    let local_name = fixture
+        .local
+        .path()
+        .file_name()
+        .expect("local basename")
+        .to_string_lossy();
+    let linked_name = linked
+        .path()
+        .file_name()
+        .expect("linked basename")
+        .to_string_lossy();
+    fs::write(
+        linked.path().join(".git"),
+        format!("gitdir: ../{local_name}/.git/worktrees/{linked_name}\n"),
+    )
+    .expect("relative gitfile");
+    let store = Store::open(
+        linked.path(),
+        wayjournal_domain_registry().expect("registry"),
+        Arc::new(NoLegacy),
+    )
+    .expect("linked-worktree store");
+
+    assert!(matches!(
+        store.bootstrap_git_admission(&fixture.request),
+        Ok(GitAdmissionOutcome::GenesisValidated { .. })
+    ));
+}
+
+#[test]
+fn real_linked_worktree_bootstrap_uses_the_common_repository() {
+    let fixture = admission_fixture("linked-worktree");
+    run(fixture.local.path(), &["checkout", "--detach"]);
+    let linked = TestDir::new("linked-worktree-store");
+    fs::remove_dir(linked.path()).expect("remove linked-worktree destination");
+    run(
+        fixture.local.path(),
+        &[
+            "worktree",
+            "add",
+            linked.path().to_str().expect("UTF-8 linked worktree"),
+            "main",
+        ],
+    );
+    let store = Store::open(
+        linked.path(),
+        wayjournal_domain_registry().expect("registry"),
+        Arc::new(NoLegacy),
+    )
+    .expect("linked-worktree store");
+
+    assert!(matches!(
+        store.bootstrap_git_admission(&fixture.request),
+        Ok(GitAdmissionOutcome::GenesisValidated { .. })
+    ));
+    assert!(matches!(
+        store.bootstrap_git_admission(&fixture.request),
+        Ok(GitAdmissionOutcome::UpToDate { .. })
+    ));
+}
+
 fn git_output(cwd: &Path, args: &[&str]) -> Vec<u8> {
     let output = Command::new(git())
         .current_dir(cwd)
