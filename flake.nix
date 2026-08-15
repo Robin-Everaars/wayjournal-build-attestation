@@ -38,14 +38,17 @@
       treefmt-nix,
       ...
     }:
-    flake-parts.lib.mkFlake { inherit inputs; } {
-      imports = [ treefmt-nix.flakeModule ];
-
-      systems = [
+    let
+      supportedSystems = [
         "aarch64-darwin"
         "aarch64-linux"
         "x86_64-linux"
       ];
+    in
+    flake-parts.lib.mkFlake { inherit inputs; } {
+      imports = [ treefmt-nix.flakeModule ];
+
+      systems = supportedSystems;
 
       perSystem =
         { system, ... }:
@@ -56,6 +59,7 @@
           };
           rustToolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
           craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
+          cargoManifest = builtins.fromTOML (builtins.readFile ./Cargo.toml);
           src = pkgs.lib.cleanSourceWith {
             src = ./.;
             filter =
@@ -66,7 +70,7 @@
           };
           commonArgs = {
             pname = "wayjournal";
-            version = "0.1.0";
+            version = cargoManifest.workspace.package.version;
             inherit src;
             strictDeps = true;
             nativeBuildInputs = [ pkgs.git ];
@@ -81,7 +85,12 @@
               meta = {
                 description = "Federated immutable Git journal substrate";
                 homepage = "https://codeberg.org/Robinio94/wayjournal";
+                license = [
+                  pkgs.lib.licenses.mit
+                  pkgs.lib.licenses.asl20
+                ];
                 mainProgram = "wayjournal";
+                platforms = supportedSystems;
               };
             }
           );
@@ -164,15 +173,43 @@
               actionlint -config-file actionlint.yaml .forgejo/workflows/check.yml
               touch "$out"
             '';
+            docs-links =
+              pkgs.runCommand "wayjournal-docs-links"
+                {
+                  nativeBuildInputs = [ pkgs.lychee ];
+                  SSL_CERT_FILE = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
+                }
+                ''
+                  cd ${self}
+                  lychee --offline --no-progress README.md CHANGELOG.md CONTRIBUTING.md SECURITY.md docs
+                  touch "$out"
+                '';
+            release-policy =
+              pkgs.runCommand "wayjournal-release-policy" { nativeBuildInputs = [ pkgs.python3 ]; }
+                ''
+                  cd ${self}
+                  python3 nix/check-release-policy.py
+                  touch "$out"
+                '';
+            reuse = pkgs.runCommand "wayjournal-reuse" { nativeBuildInputs = [ pkgs.reuse ]; } ''
+              cd ${self}
+              reuse lint
+              touch "$out"
+            '';
           };
 
           devShells.default = pkgs.mkShell {
             packages = [
               rustToolchain
               pkgs.actionlint
+              pkgs.cargo-audit
               pkgs.cargo-deny
               pkgs.cargo-nextest
               pkgs.git
+              pkgs.jq
+              pkgs.lychee
+              pkgs.python3
+              pkgs.reuse
               pkgs.rust-analyzer
             ];
 

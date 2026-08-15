@@ -6,7 +6,13 @@ resolver = "3"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.97.1"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+homepage = "https://codeberg.org/Robinio94/wayjournal"
+documentation = "https://codeberg.org/Robinio94/wayjournal/src/branch/main/README.md"
 repository = "https://codeberg.org/Robinio94/wayjournal"
+keywords = ["git", "journal", "federation", "immutable", "nix"]
+categories = ["data-structures", "development-tools"]
 
 [workspace.dependencies]
 blake3 = "1.8.2"

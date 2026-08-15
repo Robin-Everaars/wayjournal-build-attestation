@@ -4,6 +4,28 @@ Wayjournal is a generic, federated substrate for immutable journals stored in
 ordinary Git repositories. It is intended to provide domain-neutral journal
 primitives that independent applications can build on.
 
+## Release status
+
+The tree is preparing the source-only v0.1.0 release candidate. It is not a public
+release until a verified signed `v0.1.0` tag and matching Forgejo release exist. Both
+Rust crates remain `publish = false`; distribution is through the locked Nix flake, not
+crates.io. See the [changelog](CHANGELOG.md) for the candidate contract.
+
+## Install and inspect safely
+
+Install Nix with flakes enabled, clone the repository, and inspect the CLI version without
+opening a store, contacting a remote, or mutating journal state:
+
+```console
+nix run . -- --version
+```
+
+The configured package/check matrix is `x86_64-linux`, `aarch64-linux`, and
+`aarch64-darwin`. Native packaging does not imply that every authority path is portable:
+advancing Git admission and retained publication require Linux procfs at
+`/proc/self/fd`. Non-Linux builds can use portable wire and projection surfaces, but Git
+admission fails closed where the retained procfs bindings are unavailable.
+
 The wire slice, Linux filesystem store, identity/profile/catalog domains, Git union
 admission, and S5 federation projections are implemented. They provide strict canonical
 JSON, closed generic record and batch envelopes, typed immutable logical store identity,
@@ -147,6 +169,22 @@ nix run . -- --version
 ```
 
 The Forgejo workflow invokes the same Nix gate on a self-hosted runner labelled
-`nix`; there is no separate CI-only build script.
+`nix`; there is no separate CI-only build script. Evaluation of another architecture is
+not release qualification; the [release procedure](docs/releasing.md) requires a native
+build and test attestation for every configured system.
 
-The license and public release policy will be decided before publication.
+## Documentation and support
+
+- [Changelog and pre-1.0 versioning](CHANGELOG.md)
+- [Contribution and contract-change gates](CONTRIBUTING.md)
+- [Security policy and private reporting](SECURITY.md)
+- [Release procedure](docs/releasing.md)
+
+Only the latest tagged release receives fixes; `main` and untagged candidates are
+unsupported development code. General questions and non-sensitive defects belong in the
+[Forgejo issue tracker](https://codeberg.org/Robinio94/wayjournal/issues). Report
+vulnerabilities privately as described in the security policy.
+
+Wayjournal is licensed under your choice of the [MIT license](LICENSES/MIT.txt) or the
+[Apache License 2.0](LICENSES/Apache-2.0.txt). Canonical schemas, fixtures, lockfiles, and
+documentation are covered by the same `MIT OR Apache-2.0` grant through `REUSE.toml`.

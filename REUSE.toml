@@ -1,0 +1,30 @@
+# SPDX-FileCopyrightText: 2026 Robin Everaars
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+version = 1
+SPDX-PackageName = "wayjournal"
+SPDX-PackageSupplier = "Robin Everaars"
+SPDX-PackageDownloadLocation = "https://codeberg.org/Robinio94/wayjournal"
+
+# Aggregate annotations preserve the frozen bytes of schemas, fixtures, proof
+# preimages, lockfiles, and generated Rust-embedded artifacts.
+[[annotations]]
+path = [
+  ".envrc",
+  ".forgejo/**",
+  ".gitattributes",
+  ".gitignore",
+  "*.lock",
+  "*.md",
+  "*.nix",
+  "*.toml",
+  "*.yaml",
+  "crates/**",
+  "docs/**",
+  "fixtures/**",
+  "nix/**",
+  "schemas/**",
+]
+precedence = "aggregate"
+SPDX-FileCopyrightText = "2026 Robin Everaars"
+SPDX-License-Identifier = "MIT OR Apache-2.0"
