@@ -6,9 +6,9 @@ All notable user-visible changes to Wayjournal are recorded here. Wayjournal fol
 
 No changes yet.
 
-## 0.1.0 - Unreleased
+## 0.1.0 - 2026-08-15
 
-This is the source-only v0.1.0 release candidate. It is not a release until the signed `v0.1.0` tag and corresponding Forgejo release exist.
+Wayjournal v0.1.0 is a source-only release distributed through its locked Nix flake.
 
 ### Added
 

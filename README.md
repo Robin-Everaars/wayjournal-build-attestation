@@ -6,10 +6,10 @@ primitives that independent applications can build on.
 
 ## Release status
 
-The tree is preparing the source-only v0.1.0 release candidate. It is not a public
-release until a verified signed `v0.1.0` tag and matching Forgejo release exist. Both
-Rust crates remain `publish = false`; distribution is through the locked Nix flake, not
-crates.io. See the [changelog](CHANGELOG.md) for the candidate contract.
+Wayjournal v0.1.0 is a source-only release. Both Rust crates remain
+`publish = false`; distribution is through the locked Nix flake, not crates.io. The
+verified signed `v0.1.0` tag and matching Forgejo release identify the release source.
+See the [changelog](CHANGELOG.md) for the released contract.
 
 ## Install and inspect safely
 
