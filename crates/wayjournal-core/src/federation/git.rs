@@ -68,6 +68,23 @@ impl GitCommandError {
                 | "durably sync Git repository"
         )
     }
+
+    pub(super) fn is_hostile_history_bound(&self) -> bool {
+        (self.operation == "enumerate new history" && self.message == "bounded output exceeded")
+            || (self.operation == "bound commit object"
+                && self.message == "commit object exceeds byte limit")
+    }
+
+    fn direct_child_exit_can_explain_snapshot_error(&self) -> bool {
+        self.operation == "read canonical blob batch"
+            && matches!(
+                self.message.as_str(),
+                "cat-file ended before a response header"
+                    | "cat-file ended inside a response header"
+                    | "cat-file blob ended before its declared length"
+                    | "cat-file blob ended before its terminator"
+            )
+    }
 }
 
 pub(super) struct GitRunner<'a> {
@@ -245,6 +262,31 @@ impl<'a> GitRunner<'a> {
         Err(status_error(operation, captured.status))
     }
 
+    fn standalone_output(
+        &self,
+        operation: &'static str,
+        args: &[OsString],
+        stdout_limit: usize,
+    ) -> Result<Vec<u8>, GitCommandError> {
+        let root = Directory::open_ambient(std::path::Path::new("/"))
+            .map_err(|error| command_error(operation, error))?;
+        let mut command = self.command(&root, args);
+        // Remote-only commands must neither discover nor inherit a local repository.
+        command.env("GIT_DIR", "/dev/null");
+        let captured = run_bounded_command_with_input(
+            command,
+            operation,
+            None,
+            stdout_limit,
+            MAX_SMALL_OUTPUT,
+            self.timeout,
+        )?;
+        if captured.status.success() {
+            return Ok(captured.stdout);
+        }
+        Err(status_error(operation, captured.status))
+    }
+
     pub(super) fn output_to_file(
         &self,
         operation: &'static str,
@@ -261,6 +303,7 @@ impl<'a> GitRunner<'a> {
             MAX_SMALL_OUTPUT,
             self.timeout,
         )
+        .map_err(BoundedFileCommandError::into_git)
     }
 
     fn status(
@@ -292,6 +335,22 @@ impl<'a> GitRunner<'a> {
         if captured.status.success() {
             Ok(true)
         } else if captured.status.code().is_some() {
+            Ok(false)
+        } else {
+            Err(status_error(operation, captured.status))
+        }
+    }
+
+    fn exit_one_is_false(
+        &self,
+        operation: &'static str,
+        cwd: &Directory,
+        args: &[OsString],
+    ) -> Result<bool, GitCommandError> {
+        let captured = self.status(operation, cwd, args, None, MAX_SMALL_OUTPUT)?;
+        if captured.status.success() {
+            Ok(true)
+        } else if captured.status.code() == Some(1) {
             Ok(false)
         } else {
             Err(status_error(operation, captured.status))
@@ -337,6 +396,28 @@ fn run_bounded_command(
     )
 }
 
+#[derive(Debug, Error)]
+enum BoundedFileCommandError {
+    #[error(transparent)]
+    StdoutLimit(GitCommandError),
+    #[error(transparent)]
+    Operational(GitCommandError),
+}
+
+impl BoundedFileCommandError {
+    fn into_git(self) -> GitCommandError {
+        match self {
+            Self::StdoutLimit(error) | Self::Operational(error) => error,
+        }
+    }
+}
+
+impl From<GitCommandError> for BoundedFileCommandError {
+    fn from(error: GitCommandError) -> Self {
+        Self::Operational(error)
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 #[allow(unsafe_code)]
 fn run_bounded_command_to_file(
@@ -346,7 +427,7 @@ fn run_bounded_command_to_file(
     stdout_limit: usize,
     stderr_limit: usize,
     timeout: Duration,
-) -> Result<usize, GitCommandError> {
+) -> Result<usize, BoundedFileCommandError> {
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -369,20 +450,23 @@ fn run_bounded_command_to_file(
         return Err(GitCommandError {
             operation,
             message: "stdout pipe was not created".to_owned(),
-        });
+        }
+        .into());
     };
-    let Some(stderr) = child.stderr.take() else {
+    let Some(stderr_pipe) = child.stderr.take() else {
         terminate_process_group(pid, &mut child, true);
         return Err(GitCommandError {
             operation,
             message: "stderr pipe was not created".to_owned(),
-        });
+        }
+        .into());
     };
-    let overflow = Arc::new(AtomicBool::new(false));
+    let stdout_overflow = Arc::new(AtomicBool::new(false));
+    let stderr_overflow = Arc::new(AtomicBool::new(false));
     let (stdout_writer, stdout_rx) =
-        spawn_bounded_file_writer(stdout, output, stdout_limit, Arc::clone(&overflow));
+        spawn_bounded_file_writer(stdout, output, stdout_limit, Arc::clone(&stdout_overflow));
     let (stderr_reader, stderr_rx) =
-        spawn_bounded_reader(stderr, stderr_limit, Arc::clone(&overflow));
+        spawn_bounded_reader(stderr_pipe, stderr_limit, Arc::clone(&stderr_overflow));
     let started = Instant::now();
     let mut status = None;
     let mut written = None;
@@ -395,7 +479,7 @@ fn run_bounded_command_to_file(
                     terminate_process_group(pid, &mut child, status.is_none());
                     let _ = stdout_writer.join();
                     let _ = stderr_reader.join();
-                    return Err(error);
+                    return Err(error.into());
                 }
             }
         }
@@ -406,7 +490,7 @@ fn run_bounded_command_to_file(
                     terminate_process_group(pid, &mut child, status.is_none());
                     let _ = stdout_writer.join();
                     let _ = stderr_reader.join();
-                    return Err(error);
+                    return Err(error.into());
                 }
             }
         }
@@ -420,39 +504,56 @@ fn run_bounded_command_to_file(
                     return Err(GitCommandError {
                         operation,
                         message: error.to_string(),
-                    });
+                    }
+                    .into());
                 }
             }
         }
-        let failure = if overflow.load(Ordering::Acquire) {
-            Some("bounded output exceeded")
+        if stdout_overflow.load(Ordering::Acquire) {
+            terminate_process_group(pid, &mut child, status.is_none());
+            let _ = stdout_writer.join();
+            let _ = stderr_reader.join();
+            return Err(BoundedFileCommandError::StdoutLimit(GitCommandError {
+                operation,
+                message: "bounded output exceeded".to_owned(),
+            }));
+        }
+        let operational_failure = if stderr_overflow.load(Ordering::Acquire) {
+            Some("bounded stderr exceeded")
         } else if started.elapsed() >= timeout {
             Some("operation timed out")
         } else {
             None
         };
-        if let Some(message) = failure {
+        if let Some(message) = operational_failure {
             terminate_process_group(pid, &mut child, status.is_none());
             let _ = stdout_writer.join();
             let _ = stderr_reader.join();
             return Err(GitCommandError {
                 operation,
                 message: message.to_owned(),
-            });
+            }
+            .into());
         }
         if status.is_some() && written.is_some() && stderr.is_some() {
             break;
         }
         thread::sleep(Duration::from_millis(5));
     }
-    stdout_writer.join().map_err(|_| GitCommandError {
-        operation,
-        message: "stdout writer panicked".to_owned(),
-    })?;
-    stderr_reader.join().map_err(|_| GitCommandError {
-        operation,
-        message: "stderr reader panicked".to_owned(),
-    })?;
+    stdout_writer
+        .join()
+        .map_err(|_| GitCommandError {
+            operation,
+            message: "stdout writer panicked".to_owned(),
+        })
+        .map_err(BoundedFileCommandError::from)?;
+    stderr_reader
+        .join()
+        .map_err(|_| GitCommandError {
+            operation,
+            message: "stderr reader panicked".to_owned(),
+        })
+        .map_err(BoundedFileCommandError::from)?;
     let status = status.expect("loop exits only after child status");
     if !status.success() {
         return Err(GitCommandError {
@@ -461,9 +562,34 @@ fn run_bounded_command_to_file(
                 "process exited with {status}: {}",
                 String::from_utf8_lossy(&stderr.expect("loop exits only after stderr")).trim()
             ),
-        });
+        }
+        .into());
     }
     Ok(written.expect("loop exits only after stdout"))
+}
+
+fn run_snapshot_command_to_file(
+    command: Command,
+    operation: &'static str,
+    output: File,
+    stdout_limit: usize,
+    stderr_limit: usize,
+    timeout: Duration,
+) -> Result<usize, super::GitAdmissionError> {
+    match run_bounded_command_to_file(
+        command,
+        operation,
+        output,
+        stdout_limit,
+        stderr_limit,
+        timeout,
+    ) {
+        Ok(written) => Ok(written),
+        Err(BoundedFileCommandError::StdoutLimit(error)) => {
+            Err(super::GitAdmissionError::HostileSnapshot(error))
+        }
+        Err(BoundedFileCommandError::Operational(error)) => Err(error.into()),
+    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -728,6 +854,16 @@ fn command_error(operation: &'static str, error: impl std::fmt::Display) -> GitC
     }
 }
 
+fn hostile_snapshot_error(
+    operation: &'static str,
+    message: impl Into<String>,
+) -> super::GitAdmissionError {
+    super::GitAdmissionError::HostileSnapshot(GitCommandError {
+        operation,
+        message: message.into(),
+    })
+}
+
 fn args(values: &[&str]) -> Vec<OsString> {
     values.iter().map(OsString::from).collect()
 }
@@ -986,7 +1122,7 @@ impl SyncRepository {
         ancestor: &GitOid,
         descendant: &GitOid,
     ) -> Result<bool, GitCommandError> {
-        runner.succeeds(
+        runner.exit_one_is_false(
             "validate commit ancestry",
             &self.bare,
             &repository_args(vec![
@@ -1114,30 +1250,35 @@ impl SyncRepository {
         local: &GitOid,
         candidate: &GitOid,
         output: File,
-    ) -> Result<usize, GitCommandError> {
+    ) -> Result<usize, super::GitAdmissionError> {
         if local.format() != self.format || candidate.format() != self.format {
             return Err(GitCommandError {
                 operation: "enumerate candidate additions",
                 message: "tree diff object format does not match repository".to_owned(),
-            });
+            }
+            .into());
         }
-        runner.output_to_file(
+        run_snapshot_command_to_file(
+            runner.command(
+                &self.bare,
+                &repository_args(vec![
+                    OsString::from("diff-tree"),
+                    OsString::from("-r"),
+                    OsString::from("--no-commit-id"),
+                    OsString::from("--raw"),
+                    OsString::from("-z"),
+                    OsString::from("--no-renames"),
+                    OsString::from("--no-abbrev"),
+                    OsString::from(local.as_hex()),
+                    OsString::from(candidate.as_hex()),
+                    OsString::from("--"),
+                ]),
+            ),
             "enumerate candidate additions",
-            &self.bare,
-            &repository_args(vec![
-                OsString::from("diff-tree"),
-                OsString::from("-r"),
-                OsString::from("--no-commit-id"),
-                OsString::from("--raw"),
-                OsString::from("-z"),
-                OsString::from("--no-renames"),
-                OsString::from("--no-abbrev"),
-                OsString::from(local.as_hex()),
-                OsString::from(candidate.as_hex()),
-                OsString::from("--"),
-            ]),
             output,
             MAX_TREE_DIFF_OUTPUT,
+            MAX_SMALL_OUTPUT,
+            runner.timeout,
         )
     }
 
@@ -1911,11 +2052,9 @@ pub(super) fn observe_remote_ref(
     runner: &GitRunner<'_>,
     request: &GitSyncRequest,
     format: GitObjectFormat,
-    cwd: &Directory,
 ) -> Result<Option<GitOid>, GitCommandError> {
-    let output = runner.output(
+    let output = runner.standalone_output(
         "observe approved remote ref",
-        cwd,
         &[
             OsString::from("ls-remote"),
             OsString::from("--refs"),
@@ -2662,7 +2801,7 @@ fn tree_file_source(
             OsString::from(oid.as_hex()),
         ]),
     );
-    run_bounded_command_to_file(
+    run_snapshot_command_to_file(
         command,
         "spool canonical tree listing",
         output,
@@ -2695,7 +2834,7 @@ fn tree_file_source_local(
             operation: "retain canonical tree listing",
             source,
         })?;
-    run_bounded_command_to_file(
+    run_snapshot_command_to_file(
         runner.local_command(
             repository,
             &[
@@ -2765,9 +2904,8 @@ impl<R: BufRead> TreeListingCursor<R> {
         let separator = record
             .iter()
             .position(|byte| *byte == b'\t')
-            .ok_or_else(|| GitCommandError {
-                operation: "parse tree",
-                message: "tree entry has no path separator".to_owned(),
+            .ok_or_else(|| {
+                hostile_snapshot_error("parse tree", "tree entry has no path separator")
             })?;
         let (metadata, path_with_tab) = record.split_at(separator);
         let path = &path_with_tab[1..];
@@ -2795,19 +2933,14 @@ impl<R: BufRead> TreeListingCursor<R> {
         {
             return Err(super::GitAdmissionError::InvalidTreeEntry);
         }
-        let blob = std::str::from_utf8(blob).map_err(|_| GitCommandError {
-            operation: "parse tree",
-            message: "blob id is not UTF-8".to_owned(),
-        })?;
-        let blob = GitOid::parse(self.format, blob).map_err(|error| GitCommandError {
-            operation: "parse tree",
-            message: error.to_string(),
-        })?;
+        let blob = std::str::from_utf8(blob)
+            .map_err(|_| hostile_snapshot_error("parse tree", "blob id is not UTF-8"))?;
+        let blob = GitOid::parse(self.format, blob)
+            .map_err(|error| hostile_snapshot_error("parse tree", error.to_string()))?;
         self.entry_budget
             .push_sorted_file(path, MAX_CANONICAL_ENTRIES)
-            .map_err(|()| GitCommandError {
-                operation: "parse tree",
-                message: "canonical entry-count limit exceeded".to_owned(),
+            .map_err(|()| {
+                hostile_snapshot_error("parse tree", "canonical entry-count limit exceeded")
             })?;
         self.previous_path = Some(path.to_vec());
         Ok(Some(TreeListingEntry {
@@ -2840,17 +2973,13 @@ impl<R: BufRead> TreeDiffCursor<R> {
             return Ok(None);
         };
         let path = read_nul_record(&mut self.reader, MAX_TREE_RECORD_BYTES)?.ok_or_else(|| {
-            GitCommandError {
-                operation: "parse tree diff",
-                message: "tree diff ended before an addition path".to_owned(),
-            }
+            hostile_snapshot_error("parse tree diff", "tree diff ended before an addition path")
         })?;
         if self.entries >= MAX_CANONICAL_ENTRIES {
-            return Err(GitCommandError {
-                operation: "parse tree diff",
-                message: "canonical entry-count limit exceeded".to_owned(),
-            }
-            .into());
+            return Err(hostile_snapshot_error(
+                "parse tree diff",
+                "canonical entry-count limit exceeded",
+            ));
         }
         let mut parts = metadata.split(|byte| *byte == b' ');
         let old_mode = parts.next().unwrap_or_default();
@@ -2884,14 +3013,10 @@ impl<R: BufRead> TreeDiffCursor<R> {
         {
             return Err(super::GitAdmissionError::InvalidTreeEntry);
         }
-        let new_blob = std::str::from_utf8(new_blob).map_err(|_| GitCommandError {
-            operation: "parse tree diff",
-            message: "blob id is not UTF-8".to_owned(),
-        })?;
-        let blob = GitOid::parse(self.format, new_blob).map_err(|error| GitCommandError {
-            operation: "parse tree diff",
-            message: error.to_string(),
-        })?;
+        let new_blob = std::str::from_utf8(new_blob)
+            .map_err(|_| hostile_snapshot_error("parse tree diff", "blob id is not UTF-8"))?;
+        let blob = GitOid::parse(self.format, new_blob)
+            .map_err(|error| hostile_snapshot_error("parse tree diff", error.to_string()))?;
         self.entries += 1;
         self.previous_path = Some(path.clone());
         Ok(Some(TreeListingEntry { path, blob, class }))
@@ -2933,27 +3058,27 @@ impl TreeAdditionSource {
         let mut count = 0_usize;
         let mut total_bytes = 0_u64;
         while let Some(file) = self.next_file()? {
-            count = count.checked_add(1).ok_or_else(|| GitCommandError {
-                operation: "count candidate additions",
-                message: "addition count overflow".to_owned(),
+            count = count.checked_add(1).ok_or_else(|| {
+                hostile_snapshot_error("count candidate additions", "addition count overflow")
             })?;
             total_bytes = total_bytes
-                .checked_add(
-                    u64::try_from(file.bytes.len()).map_err(|_| GitCommandError {
-                        operation: "count candidate additions",
-                        message: "addition byte count exceeds u64".to_owned(),
-                    })?,
-                )
-                .ok_or_else(|| GitCommandError {
-                    operation: "count candidate additions",
-                    message: "addition byte count overflow".to_owned(),
+                .checked_add(u64::try_from(file.bytes.len()).map_err(|_| {
+                    hostile_snapshot_error(
+                        "count candidate additions",
+                        "addition byte count exceeds u64",
+                    )
+                })?)
+                .ok_or_else(|| {
+                    hostile_snapshot_error(
+                        "count candidate additions",
+                        "addition byte count overflow",
+                    )
                 })?;
             if total_bytes > MAX_TOTAL_CANONICAL_BYTES {
-                return Err(GitCommandError {
-                    operation: "count candidate additions",
-                    message: "addition bytes exceed the canonical store limit".to_owned(),
-                }
-                .into());
+                return Err(hostile_snapshot_error(
+                    "count candidate additions",
+                    "addition bytes exceed the canonical store limit",
+                ));
             }
         }
         self.finish()?;
@@ -2992,23 +3117,12 @@ impl TreeFileSource {
         let byte_limit = canonical_blob_limit(entry.class)
             .ok_or(super::GitAdmissionError::NonCanonicalTrackedPath)?;
         let bytes = self.blobs.read_blob(&entry.blob, byte_limit)?;
-        self.total_bytes = self
-            .total_bytes
-            .checked_add(u64::try_from(bytes.len()).map_err(|_| GitCommandError {
-                operation: "read streamed canonical tree",
-                message: "canonical byte count exceeds u64".to_owned(),
-            })?)
-            .ok_or_else(|| GitCommandError {
-                operation: "read streamed canonical tree",
-                message: "canonical byte count overflow".to_owned(),
-            })?;
-        if self.total_bytes > MAX_TOTAL_CANONICAL_BYTES {
-            return Err(GitCommandError {
-                operation: "read streamed canonical tree",
-                message: "canonical aggregate byte limit exceeded".to_owned(),
-            }
-            .into());
-        }
+        self.total_bytes = checked_snapshot_total(
+            self.total_bytes,
+            bytes.len(),
+            MAX_TOTAL_CANONICAL_BYTES,
+            "read streamed canonical tree",
+        )?;
         Ok(Some(RawFile {
             path: entry.path,
             bytes,
@@ -3018,6 +3132,26 @@ impl TreeFileSource {
     fn finish(self) -> Result<(), GitCommandError> {
         self.blobs.finish()
     }
+}
+
+fn checked_snapshot_total(
+    total: u64,
+    length: usize,
+    limit: u64,
+    operation: &'static str,
+) -> Result<u64, super::GitAdmissionError> {
+    let length = u64::try_from(length)
+        .map_err(|_| hostile_snapshot_error(operation, "canonical byte count exceeds u64"))?;
+    let total = total
+        .checked_add(length)
+        .ok_or_else(|| hostile_snapshot_error(operation, "canonical byte count overflow"))?;
+    if total > limit {
+        return Err(hostile_snapshot_error(
+            operation,
+            "canonical aggregate byte limit exceeded",
+        ));
+    }
+    Ok(total)
 }
 
 fn canonical_blob_limit(class: PathClass) -> Option<usize> {
@@ -3097,8 +3231,8 @@ fn immutable_edge_violation_from_reader(
 fn read_nul_record(
     reader: &mut impl BufRead,
     limit: usize,
-) -> Result<Option<Vec<u8>>, GitCommandError> {
-    read_delimited_record(
+) -> Result<Option<Vec<u8>>, super::GitAdmissionError> {
+    read_snapshot_delimited_record(
         reader,
         0,
         limit,
@@ -3107,6 +3241,45 @@ fn read_nul_record(
         "tree record length overflow",
         "tree record exceeds byte limit",
     )
+}
+
+fn read_snapshot_delimited_record(
+    reader: &mut impl BufRead,
+    delimiter: u8,
+    limit: usize,
+    operation: &'static str,
+    truncated_message: &'static str,
+    overflow_message: &'static str,
+    limit_message: &'static str,
+) -> Result<Option<Vec<u8>>, super::GitAdmissionError> {
+    let mut record = Vec::new();
+    loop {
+        let available = reader
+            .fill_buf()
+            .map_err(|error| command_error(operation, error))?;
+        if available.is_empty() {
+            return if record.is_empty() {
+                Ok(None)
+            } else {
+                Err(hostile_snapshot_error(operation, truncated_message))
+            };
+        }
+        let delimiter = available.iter().position(|byte| *byte == delimiter);
+        let take = delimiter.unwrap_or(available.len());
+        let length = record
+            .len()
+            .checked_add(take)
+            .ok_or_else(|| hostile_snapshot_error(operation, overflow_message))?;
+        if length > limit {
+            return Err(hostile_snapshot_error(operation, limit_message));
+        }
+        record.extend_from_slice(&available[..take]);
+        let terminated = delimiter.is_some();
+        reader.consume(take + usize::from(terminated));
+        if terminated {
+            return Ok(Some(record));
+        }
+    }
 }
 
 fn read_delimited_record(
@@ -3162,10 +3335,10 @@ fn read_cat_file_response(
     reader: &mut impl BufRead,
     expected: &GitOid,
     byte_limit: usize,
-) -> Result<Vec<u8>, GitCommandError> {
+) -> Result<Vec<u8>, super::GitAdmissionError> {
     const OPERATION: &str = "read canonical blob batch";
     const HEADER_LIMIT: usize = 256;
-    let header = read_delimited_record(
+    let header = read_snapshot_delimited_record(
         reader,
         b'\n',
         HEADER_LIMIT,
@@ -3174,70 +3347,76 @@ fn read_cat_file_response(
         "cat-file response header length overflow",
         "cat-file response header exceeds byte limit",
     )?
-    .ok_or_else(|| GitCommandError {
-        operation: OPERATION,
-        message: "cat-file ended before a response header".to_owned(),
-    })?;
+    .ok_or_else(|| hostile_snapshot_error(OPERATION, "cat-file ended before a response header"))?;
     let mut parts = header.split(|byte| *byte == b' ');
     let oid = parts.next().unwrap_or_default();
     let kind = parts.next().unwrap_or_default();
     let size = parts.next().unwrap_or_default();
     if oid != expected.as_hex().as_bytes() || kind != b"blob" || parts.next().is_some() {
-        return Err(GitCommandError {
-            operation: OPERATION,
-            message: "cat-file response does not match the requested blob".to_owned(),
-        });
+        return Err(hostile_snapshot_error(
+            OPERATION,
+            "cat-file response does not match the requested blob",
+        ));
     }
     if size.is_empty()
         || (size.len() > 1 && size[0] == b'0')
         || !size.iter().all(u8::is_ascii_digit)
     {
-        return Err(GitCommandError {
-            operation: OPERATION,
-            message: "cat-file blob length is not canonical decimal".to_owned(),
-        });
+        return Err(hostile_snapshot_error(
+            OPERATION,
+            "cat-file blob length is not canonical decimal",
+        ));
     }
     let size = std::str::from_utf8(size)
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
-        .ok_or_else(|| GitCommandError {
-            operation: OPERATION,
-            message: "cat-file blob length exceeds usize".to_owned(),
-        })?;
+        .ok_or_else(|| hostile_snapshot_error(OPERATION, "cat-file blob length exceeds usize"))?;
     if size > byte_limit {
-        return Err(GitCommandError {
-            operation: OPERATION,
-            message: "cat-file blob exceeds byte limit".to_owned(),
-        });
+        return Err(hostile_snapshot_error(
+            OPERATION,
+            "cat-file blob exceeds byte limit",
+        ));
     }
     let mut bytes = Vec::new();
     bytes
         .try_reserve_exact(size)
-        .map_err(|error| GitCommandError {
-            operation: OPERATION,
-            message: error.to_string(),
-        })?;
+        .map_err(|error| command_error(OPERATION, error))?;
     bytes.resize(size, 0);
-    reader
-        .read_exact(&mut bytes)
-        .map_err(|error| GitCommandError {
-            operation: OPERATION,
-            message: error.to_string(),
-        })?;
+    read_snapshot_exact(
+        reader,
+        &mut bytes,
+        OPERATION,
+        "cat-file blob ended before its declared length",
+    )?;
     let mut terminator = [0_u8; 1];
-    reader
-        .read_exact(&mut terminator)
-        .map_err(|error| GitCommandError {
-            operation: OPERATION,
-            message: error.to_string(),
-        })?;
+    read_snapshot_exact(
+        reader,
+        &mut terminator,
+        OPERATION,
+        "cat-file blob ended before its terminator",
+    )?;
     if terminator != *b"\n" {
-        return Err(GitCommandError {
-            operation: OPERATION,
-            message: "cat-file blob has an invalid terminator".to_owned(),
-        });
+        return Err(hostile_snapshot_error(
+            OPERATION,
+            "cat-file blob has an invalid terminator",
+        ));
     }
     Ok(bytes)
+}
+
+fn read_snapshot_exact(
+    reader: &mut impl Read,
+    bytes: &mut [u8],
+    operation: &'static str,
+    truncated_message: &'static str,
+) -> Result<(), super::GitAdmissionError> {
+    reader.read_exact(bytes).map_err(|error| {
+        if error.kind() == io::ErrorKind::UnexpectedEof {
+            hostile_snapshot_error(operation, truncated_message)
+        } else {
+            command_error(operation, error).into()
+        }
+    })
 }
 
 struct CatFileRequest {
@@ -3278,7 +3457,7 @@ struct CatFileBatch {
     pid: Option<Pid>,
     stdin: Option<std::process::ChildStdin>,
     request_tx: Option<mpsc::SyncSender<CatFileRequest>>,
-    response_rx: Receiver<Result<Vec<u8>, GitCommandError>>,
+    response_rx: Receiver<Result<Vec<u8>, super::GitAdmissionError>>,
     response_reader: Option<thread::JoinHandle<()>>,
     stderr_rx: Receiver<io::Result<Vec<u8>>>,
     stderr_reader: Option<thread::JoinHandle<()>>,
@@ -3333,7 +3512,8 @@ impl CatFileBatch {
         let (stderr_reader, stderr_rx) =
             spawn_bounded_reader(stderr, MAX_SMALL_OUTPUT, Arc::clone(&stderr_overflow));
         let (request_tx, request_rx) = mpsc::sync_channel::<CatFileRequest>(1);
-        let (response_tx, response_rx) = mpsc::sync_channel::<Result<Vec<u8>, GitCommandError>>(1);
+        let (response_tx, response_rx) =
+            mpsc::sync_channel::<Result<Vec<u8>, super::GitAdmissionError>>(1);
         let response_reader = thread::spawn(move || {
             let mut reader = std::io::BufReader::new(stdout);
             while let Ok(request) = request_rx.recv() {
@@ -3366,13 +3546,10 @@ impl CatFileBatch {
         &mut self,
         expected: &GitOid,
         byte_limit: usize,
-    ) -> Result<Vec<u8>, GitCommandError> {
+    ) -> Result<Vec<u8>, super::GitAdmissionError> {
         const OPERATION: &str = "read canonical blob batch";
         if self.finished {
-            return Err(GitCommandError {
-                operation: OPERATION,
-                message: "cat-file batch is closed".to_owned(),
-            });
+            return Err(command_error(OPERATION, "cat-file batch is closed").into());
         }
         let request = CatFileRequest {
             expected: expected.clone(),
@@ -3381,71 +3558,79 @@ impl CatFileBatch {
         if self
             .request_tx
             .as_ref()
-            .ok_or_else(|| GitCommandError {
-                operation: OPERATION,
-                message: "cat-file request channel is closed".to_owned(),
-            })?
+            .ok_or_else(|| command_error(OPERATION, "cat-file request channel is closed"))?
             .send(request)
             .is_err()
         {
-            let error = GitCommandError {
-                operation: OPERATION,
-                message: "cat-file request reader disconnected".to_owned(),
-            };
+            let error = command_error(OPERATION, "cat-file request reader disconnected");
             self.abort();
-            return Err(error);
+            return Err(error.into());
         }
         let write_result = (|| {
-            let stdin = self.stdin.as_mut().ok_or_else(|| GitCommandError {
-                operation: OPERATION,
-                message: "cat-file stdin is closed".to_owned(),
-            })?;
+            let stdin = self
+                .stdin
+                .as_mut()
+                .ok_or_else(|| command_error(OPERATION, "cat-file stdin is closed"))?;
             stdin
                 .write_all(expected.as_hex().as_bytes())
                 .and_then(|()| stdin.write_all(b"\n"))
                 .and_then(|()| stdin.flush())
-                .map_err(|error| GitCommandError {
-                    operation: OPERATION,
-                    message: error.to_string(),
-                })
+                .map_err(|error| command_error(OPERATION, error))
         })();
         if let Err(error) = write_result {
             self.abort();
-            return Err(error);
+            return Err(error.into());
         }
         let started = Instant::now();
         loop {
             if self.stderr_overflow.load(Ordering::Acquire) {
-                let error = GitCommandError {
-                    operation: OPERATION,
-                    message: "bounded stderr exceeded".to_owned(),
-                };
+                let error = command_error(OPERATION, "bounded stderr exceeded");
                 self.abort();
-                return Err(error);
+                return Err(error.into());
             }
             match self.response_rx.recv_timeout(Duration::from_millis(5)) {
                 Ok(Ok(bytes)) => return Ok(bytes),
-                Ok(Err(error)) => {
+                Ok(Err(mut error)) => {
+                    if matches!(
+                        &error,
+                        super::GitAdmissionError::HostileSnapshot(source)
+                            if source.direct_child_exit_can_explain_snapshot_error()
+                    ) {
+                        // An incomplete response can race publication of the direct child's exit
+                        // status. Give that status bounded precedence without letting a child
+                        // SIGPIPE caused by rejecting complete hostile framing erase provenance.
+                        let deadline = Instant::now() + Duration::from_millis(100);
+                        loop {
+                            match self.child.try_wait() {
+                                Ok(Some(status)) if !status.success() => {
+                                    error = status_error(OPERATION, status).into();
+                                    break;
+                                }
+                                Ok(None) if Instant::now() < deadline => {
+                                    thread::sleep(Duration::from_millis(1));
+                                }
+                                Ok(Some(_) | None) => break,
+                                Err(source) => {
+                                    error = command_error(OPERATION, source).into();
+                                    break;
+                                }
+                            }
+                        }
+                    }
                     self.abort();
                     return Err(error);
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    let error = GitCommandError {
-                        operation: OPERATION,
-                        message: "cat-file response reader disconnected".to_owned(),
-                    };
+                    let error = command_error(OPERATION, "cat-file response reader disconnected");
                     self.abort();
-                    return Err(error);
+                    return Err(error.into());
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
             }
             if started.elapsed() >= self.timeout {
-                let error = GitCommandError {
-                    operation: OPERATION,
-                    message: "operation timed out".to_owned(),
-                };
+                let error = command_error(OPERATION, "operation timed out");
                 self.abort();
-                return Err(error);
+                return Err(error.into());
             }
         }
     }
@@ -3807,21 +3992,12 @@ fn collect_tree_files(
         let file_limit = canonical_blob_limit(entry.class)
             .ok_or(super::GitAdmissionError::NonCanonicalTrackedPath)?;
         let bytes = blobs.read_blob(&entry.blob, file_limit)?;
-        total_bytes = total_bytes
-            .checked_add(u64::try_from(bytes.len()).map_err(|_| GitCommandError {
-                operation: "read canonical blob",
-                message: "canonical byte count overflow".to_owned(),
-            })?)
-            .ok_or_else(|| GitCommandError {
-                operation: "read canonical blob",
-                message: "canonical byte count overflow".to_owned(),
-            })?;
-        if total_bytes > MAX_TOTAL_CANONICAL_BYTES {
-            return Err(super::GitAdmissionError::Git(GitCommandError {
-                operation: "read canonical blob",
-                message: "canonical aggregate byte limit exceeded".to_owned(),
-            }));
-        }
+        total_bytes = checked_snapshot_total(
+            total_bytes,
+            bytes.len(),
+            MAX_TOTAL_CANONICAL_BYTES,
+            "read canonical blob",
+        )?;
         files.push(RawFile {
             path: entry.path,
             bytes,
@@ -3836,10 +4012,10 @@ fn collect_tree_files(
 mod tests {
     use super::{
         CatFileBatch, TreeDiffCursor, TreeListingCursor, audit_repository_metadata,
-        clear_cat_file_response_send_hook, count_reachable_inventory,
+        checked_snapshot_total, clear_cat_file_response_send_hook, count_reachable_inventory,
         immutable_edge_violation_from_reader, install_cat_file_response_send_hook,
         read_cat_file_response, run_bounded_command, run_bounded_command_to_file,
-        stream_tree_listing,
+        run_snapshot_command_to_file, stream_tree_listing,
     };
     use std::{
         io::{BufReader, Cursor, Read},
@@ -4058,6 +4234,76 @@ mod tests {
     }
 
     #[test]
+    fn cat_file_protocol_data_failures_have_explicit_hostile_provenance() {
+        let oid = "1111111111111111111111111111111111111111";
+        let expected = super::GitOid::parse(crate::GitObjectFormat::Sha1, oid).expect("OID");
+        for (label, response, limit) in [
+            (
+                "oid",
+                b"2222222222222222222222222222222222222222 blob 1\nx\n".as_slice(),
+                1,
+            ),
+            (
+                "type",
+                b"1111111111111111111111111111111111111111 tree 1\nx\n".as_slice(),
+                1,
+            ),
+            (
+                "size syntax",
+                b"1111111111111111111111111111111111111111 blob 01\nx\n".as_slice(),
+                1,
+            ),
+            (
+                "size bound",
+                b"1111111111111111111111111111111111111111 blob 2\nxx\n".as_slice(),
+                1,
+            ),
+            (
+                "terminator",
+                b"1111111111111111111111111111111111111111 blob 1\nx!".as_slice(),
+                1,
+            ),
+            (
+                "truncated header",
+                b"1111111111111111111111111111111111111111 blob 1".as_slice(),
+                1,
+            ),
+            (
+                "truncated body",
+                b"1111111111111111111111111111111111111111 blob 2\nx".as_slice(),
+                2,
+            ),
+        ] {
+            let mut reader = BufReader::new(Cursor::new(response));
+            let error = read_cat_file_response(&mut reader, &expected, limit)
+                .expect_err("hostile protocol data");
+            assert!(
+                matches!(error, super::super::GitAdmissionError::HostileSnapshot(_)),
+                "{label} lacked hostile provenance: {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejecting_an_explicit_size_violation_cannot_be_reclassified_by_child_sigpipe() {
+        let oid = "1111111111111111111111111111111111111111";
+        let script = r#"IFS= read -r oid
+printf '%s blob 2\n' "$oid"
+exec yes x"#;
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", script]);
+        let expected = super::GitOid::parse(crate::GitObjectFormat::Sha1, oid).expect("OID");
+        let mut batch = CatFileBatch::spawn(command, Duration::from_secs(2)).expect("batch");
+
+        let error = batch.read_blob(&expected, 1).expect_err("hostile size");
+
+        assert!(
+            matches!(error, super::super::GitAdmissionError::HostileSnapshot(_)),
+            "explicit hostile framing lost provenance: {error:?}"
+        );
+    }
+
+    #[test]
     fn cat_file_batch_reuses_one_process_for_multiple_blobs() {
         let oid_a = "1111111111111111111111111111111111111111";
         let oid_b = "2222222222222222222222222222222222222222";
@@ -4249,6 +4495,54 @@ sleep 3 >/dev/null &"#;
         assert!(std::fs::metadata(&path).expect("metadata").len() <= 1024);
         assert!(started.elapsed() < Duration::from_secs(2));
         std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn snapshot_spool_distinguishes_stdout_data_limit_from_operational_failures() {
+        for (label, script, expected_hostile) in [
+            ("stdout limit", "printf 12345", true),
+            ("same-operation exit", "exit 2", false),
+            ("same-operation stderr limit", "printf 12345 >&2", false),
+        ] {
+            let root = std::env::temp_dir().join(format!(
+                "wayjournal-snapshot-spool-{label}-{}",
+                uuid::Uuid::now_v7()
+            ));
+            std::fs::create_dir(&root).expect("root");
+            let output = std::fs::File::create(root.join("output")).expect("output file");
+            let mut command = Command::new("/bin/sh");
+            command.args(["-c", script]);
+
+            let error = run_snapshot_command_to_file(
+                command,
+                "same snapshot operation",
+                output,
+                4,
+                4,
+                Duration::from_secs(2),
+            )
+            .expect_err(label);
+
+            assert_eq!(
+                matches!(error, super::super::GitAdmissionError::HostileSnapshot(_)),
+                expected_hostile,
+                "wrong provenance for {label}: {error:?}"
+            );
+            std::fs::remove_dir_all(root).expect("cleanup");
+        }
+    }
+
+    #[test]
+    fn collected_snapshot_aggregate_bound_has_hostile_provenance() {
+        assert_eq!(
+            checked_snapshot_total(2, 2, 4, "test aggregate").expect("exact limit"),
+            4
+        );
+        let error = checked_snapshot_total(2, 3, 4, "test aggregate").expect_err("limit plus one");
+        assert!(
+            matches!(error, super::super::GitAdmissionError::HostileSnapshot(_)),
+            "aggregate bound lacked hostile provenance: {error:?}"
+        );
     }
 
     #[test]

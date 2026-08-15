@@ -34,21 +34,27 @@ impl HistoryError {
     }
 }
 
-impl From<GitAdmissionError> for HistoryError {
-    fn from(error: GitAdmissionError) -> Self {
-        let reason = match error {
-            GitAdmissionError::IdentityMismatch | GitAdmissionError::CheckpointIdentityMismatch => {
-                GitQuarantineReason::LogicalIdentityMismatch
-            }
-            GitAdmissionError::Store(crate::StoreError::Corrupt {
-                issue: crate::StoreCorruption::DuplicateGlobalRecordId { .. },
-            }) => GitQuarantineReason::UuidCollision,
-            GitAdmissionError::NonCanonicalTrackedPath | GitAdmissionError::InvalidTreeEntry => {
-                GitQuarantineReason::InvalidCommitSnapshot
-            }
-            _ => GitQuarantineReason::InvalidCommitSnapshot,
-        };
-        Self::new(reason, error.to_string())
+#[derive(Debug, Error)]
+pub(super) enum HistoryValidationError {
+    #[error(transparent)]
+    Hostile(#[from] HistoryError),
+    #[error(transparent)]
+    Operational(#[from] GitAdmissionError),
+}
+
+fn classify_admission_error(error: GitAdmissionError) -> HistoryValidationError {
+    if let Some(reason) = super::admission_quarantine_reason(&error) {
+        HistoryError::new(reason, error.to_string()).into()
+    } else {
+        HistoryValidationError::Operational(error)
+    }
+}
+
+fn classify_git_error(error: super::GitCommandError) -> HistoryValidationError {
+    if error.is_hostile_history_bound() {
+        HistoryError::new(GitQuarantineReason::MalformedHistory, error.to_string()).into()
+    } else {
+        HistoryValidationError::Operational(error.into())
     }
 }
 
@@ -65,27 +71,24 @@ pub(super) fn validate_histories(
     boundary: &GitOid,
     local_tip: &GitOid,
     remote_tip: &GitOid,
-) -> Result<(), HistoryError> {
+) -> Result<(), HistoryValidationError> {
     for tip in [local_tip, remote_tip] {
         if !repository
             .is_ancestor(runner, boundary, tip)
-            .map_err(|error| {
-                HistoryError::new(GitQuarantineReason::MalformedHistory, error.to_string())
-            })?
+            .map_err(classify_git_error)?
         {
             return Err(HistoryError::new(
                 GitQuarantineReason::RollbackNonAncestry,
                 "checkpoint is not an ancestor of an advancing tip",
-            ));
+            )
+            .into());
         }
     }
 
     let graph = repository
         .new_history(runner, boundary, local_tip, remote_tip, MAX_GRAPH_OUTPUT)
-        .map_err(|error| {
-            HistoryError::new(GitQuarantineReason::MalformedHistory, error.to_string())
-        })?;
-    let lines = parse_graph(repository.format(), &graph)?;
+        .map_err(classify_git_error)?;
+    let lines = parse_graph(repository.format(), &graph).map_err(HistoryValidationError::from)?;
     validate_tree(store, runner, repository, boundary)?;
     let mut validated = BTreeSet::new();
     validated.insert(boundary.clone());
@@ -96,9 +99,7 @@ pub(super) fn validate_histories(
     for line in &lines {
         repository
             .require_commit_bounded(runner, &line.oid, MAX_COMMIT_BYTES)
-            .map_err(|error| {
-                HistoryError::new(GitQuarantineReason::MalformedHistory, error.to_string())
-            })?;
+            .map_err(classify_git_error)?;
         for parent in &line.parents {
             if validated.contains(parent) {
                 continue;
@@ -107,38 +108,35 @@ pub(super) fn validate_histories(
                 return Err(HistoryError::new(
                     GitQuarantineReason::MalformedHistory,
                     "history is not parent-before-child",
-                ));
+                )
+                .into());
             }
             if !repository
                 .is_ancestor(runner, parent, boundary)
-                .map_err(|error| {
-                    HistoryError::new(GitQuarantineReason::MalformedHistory, error.to_string())
-                })?
+                .map_err(classify_git_error)?
             {
                 return Err(HistoryError::new(
                     GitQuarantineReason::RollbackNonAncestry,
                     "new history escapes the trusted checkpoint ancestry",
-                ));
+                )
+                .into());
             }
             repository
                 .require_commit_bounded(runner, parent, MAX_COMMIT_BYTES)
-                .map_err(|error| {
-                    HistoryError::new(GitQuarantineReason::MalformedHistory, error.to_string())
-                })?;
+                .map_err(classify_git_error)?;
             validate_tree(store, runner, repository, parent)?;
             validated.insert(parent.clone());
         }
         for parent in &line.parents {
             if let Some(reason) = repository
                 .immutable_edge_violation(runner, parent, &line.oid)
-                .map_err(|error| {
-                    HistoryError::new(GitQuarantineReason::MalformedHistory, error.to_string())
-                })?
+                .map_err(classify_git_error)?
             {
                 return Err(HistoryError::new(
                     reason,
                     "immutable history edge changed existing bytes",
-                ));
+                )
+                .into());
             }
         }
         validate_tree(store, runner, repository, &line.oid)?;
@@ -148,7 +146,8 @@ pub(super) fn validate_histories(
         return Err(HistoryError::new(
             GitQuarantineReason::MalformedHistory,
             "history enumeration omitted an advancing tip",
-        ));
+        )
+        .into());
     }
     // Tip validation above is complete. Do not retain either tip: candidate construction uses
     // Git's disk-backed merge machinery and recovery reopens individual paths as needed.
@@ -203,10 +202,10 @@ fn validate_tree(
     runner: &GitRunner<'_>,
     repository: &SyncRepository,
     oid: &GitOid,
-) -> Result<(), HistoryError> {
+) -> Result<(), HistoryValidationError> {
     repository
         .tree_snapshot(store, runner, oid)
-        .map_err(HistoryError::from)?;
+        .map_err(classify_admission_error)?;
     Ok(())
 }
 
@@ -222,7 +221,11 @@ fn validate_loaded_tree(
         .collect::<Vec<_>>();
     crate::store::scan_collected(store, &raw, Vec::new())
         .map_err(GitAdmissionError::from)
-        .map_err(HistoryError::from)?;
+        .map_err(|error| {
+            let reason = super::admission_quarantine_reason(&error)
+                .unwrap_or(GitQuarantineReason::InvalidCommitSnapshot);
+            HistoryError::new(reason, error.to_string())
+        })?;
     Ok(())
 }
 

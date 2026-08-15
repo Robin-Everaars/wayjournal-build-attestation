@@ -497,6 +497,7 @@ pub enum GitQuarantineReason {
     MalformedHistory,
     PathCollision,
     UuidCollision,
+    IdempotencyCollision,
     LogicalIdentityMismatch,
     TrustMismatch,
     UnapprovedRemoteRef,
@@ -564,6 +565,8 @@ pub enum GitAdmissionError {
     Checkpoint(#[from] CheckpointError),
     #[error(transparent)]
     Git(#[from] GitCommandError),
+    #[error("hostile Git snapshot data: {0}")]
+    HostileSnapshot(#[source] GitCommandError),
     #[error(transparent)]
     Store(#[from] crate::StoreError),
     #[error("{operation} failed: {source}")]
@@ -839,6 +842,34 @@ enum StartOperation {
     Quarantined(GitSyncOutcome),
 }
 
+fn corruption_quarantine_reason(issue: &crate::StoreCorruption) -> GitQuarantineReason {
+    match issue {
+        crate::StoreCorruption::DuplicateGlobalRecordId { .. } => {
+            GitQuarantineReason::UuidCollision
+        }
+        crate::StoreCorruption::GenericOwnership(
+            crate::BatchError::IdempotencyRequestMismatch { .. }
+            | crate::BatchError::DuplicateIdempotencyOwnership { .. },
+        ) => GitQuarantineReason::IdempotencyCollision,
+        _ => GitQuarantineReason::InvalidCommitSnapshot,
+    }
+}
+
+fn admission_quarantine_reason(error: &GitAdmissionError) -> Option<GitQuarantineReason> {
+    match error {
+        GitAdmissionError::IdentityMismatch | GitAdmissionError::CheckpointIdentityMismatch => {
+            Some(GitQuarantineReason::LogicalIdentityMismatch)
+        }
+        GitAdmissionError::Store(crate::StoreError::Corrupt { issue }) => {
+            Some(corruption_quarantine_reason(issue))
+        }
+        GitAdmissionError::NonCanonicalTrackedPath
+        | GitAdmissionError::InvalidTreeEntry
+        | GitAdmissionError::HostileSnapshot(_) => Some(GitQuarantineReason::InvalidCommitSnapshot),
+        _ => None,
+    }
+}
+
 fn require_checkpoint_authority(
     checkpoint: &AdmissionCheckpoint,
     request: &GitSyncRequest,
@@ -899,6 +930,23 @@ fn start_sync_operation(
         return Err(GitAdmissionError::CandidateRevisionMismatch.into());
     }
 
+    if git::observe_remote_ref(&runner, request, local.format)?.is_none() {
+        let incident = quarantine::persist(
+            store,
+            original_base.logical_store_id.clone(),
+            request,
+            original_base.accepted_commit.clone(),
+            original_base.accepted_revision,
+            GitQuarantineReason::MissingApprovedRef,
+            None,
+            None,
+        )?;
+        return Ok(StartOperation::Quarantined(GitSyncOutcome::Quarantined {
+            incident_id: incident.incident_id,
+            reason: incident.reason,
+        }));
+    }
+
     let operation_id = GitSyncOperationId::now_v7();
     let operation = pending::create_operation(store, &operation_id)?;
     fault::hit("operation-directory-durable");
@@ -923,7 +971,7 @@ fn start_sync_operation(
             }
             Err(error) => return Err(error.into()),
         };
-    if let Err(error) = history::validate_histories(
+    match history::validate_histories(
         store,
         &runner,
         &repository,
@@ -931,20 +979,24 @@ fn start_sync_operation(
         &local_tip,
         &remote_tip,
     ) {
-        let incident = quarantine::persist(
-            store,
-            original_base.logical_store_id.clone(),
-            request,
-            original_base.accepted_commit.clone(),
-            original_base.accepted_revision,
-            error.reason,
-            Some(remote_tip),
-            Some(&operation_id),
-        )?;
-        return Ok(StartOperation::Quarantined(GitSyncOutcome::Quarantined {
-            incident_id: incident.incident_id,
-            reason: incident.reason,
-        }));
+        Ok(()) => {}
+        Err(history::HistoryValidationError::Hostile(error)) => {
+            let incident = quarantine::persist(
+                store,
+                original_base.logical_store_id.clone(),
+                request,
+                original_base.accepted_commit.clone(),
+                original_base.accepted_revision,
+                error.reason,
+                Some(remote_tip),
+                Some(&operation_id),
+            )?;
+            return Ok(StartOperation::Quarantined(GitSyncOutcome::Quarantined {
+                incident_id: incident.incident_id,
+                reason: incident.reason,
+            }));
+        }
+        Err(history::HistoryValidationError::Operational(error)) => return Err(error.into()),
     }
     let candidate = match git::select_candidate(&runner, &repository, &local_tip, &remote_tip) {
         Ok(candidate) => candidate,
@@ -966,7 +1018,28 @@ fn start_sync_operation(
         }
         Err(error) => return Err(error.into()),
     };
-    let candidate_snapshot = repository.tree_snapshot(store, &runner, &candidate)?;
+    let candidate_snapshot = match repository.tree_snapshot(store, &runner, &candidate) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            let Some(reason) = admission_quarantine_reason(&error) else {
+                return Err(error.into());
+            };
+            let incident = quarantine::persist(
+                store,
+                original_base.logical_store_id.clone(),
+                request,
+                original_base.accepted_commit.clone(),
+                original_base.accepted_revision,
+                reason,
+                Some(remote_tip.clone()),
+                Some(&operation_id),
+            )?;
+            return Ok(StartOperation::Quarantined(GitSyncOutcome::Quarantined {
+                incident_id: incident.incident_id,
+                reason: incident.reason,
+            }));
+        }
+    };
     require_same_s4b_store(&candidate_snapshot, current)?;
     let candidate_parents = repository.commit_parents(&runner, &candidate)?;
     let mut document = pending::PendingDocument::new(
@@ -996,12 +1069,30 @@ fn start_sync_operation(
             operation: "retain candidate addition diff",
             source,
         })?;
-    repository.spool_tree_additions(
+    if let Err(error) = repository.spool_tree_additions(
         &runner,
         &local_tip,
         &document.candidate_commit,
         diff_output,
-    )?;
+    ) {
+        let Some(reason) = admission_quarantine_reason(&error) else {
+            return Err(error.into());
+        };
+        let incident = quarantine::persist(
+            store,
+            original_base.logical_store_id.clone(),
+            request,
+            original_base.accepted_commit.clone(),
+            original_base.accepted_revision,
+            reason,
+            Some(document.expected_remote_tip.clone()),
+            Some(&operation_id),
+        )?;
+        return Ok(StartOperation::Quarantined(GitSyncOutcome::Quarantined {
+            incident_id: incident.incident_id,
+            reason: incident.reason,
+        }));
+    }
     diff_file
         .seek(SeekFrom::Start(0))
         .map_err(|source| GitAdmissionError::Io {
@@ -1110,7 +1201,19 @@ fn recover_sync_operation(
         };
     git::require_sync_commit(&runner, &repository, &active.document.candidate_commit)?;
     let candidate_snapshot =
-        repository.tree_snapshot(store, &runner, &active.document.candidate_commit)?;
+        match repository.tree_snapshot(store, &runner, &active.document.candidate_commit) {
+            Ok(snapshot) => snapshot,
+            Err(error) if admission_quarantine_reason(&error).is_some() => {
+                return quarantine_publication(
+                    store,
+                    request,
+                    &checkpoint_value,
+                    &active,
+                    GitQuarantineReason::HostilePublicationState,
+                );
+            }
+            Err(error) => return Err(error.into()),
+        };
     let actual_parents = repository.commit_parents(&runner, &active.document.candidate_commit)?;
     let ancestry_valid = repository.is_ancestor(
         &runner,
@@ -1145,9 +1248,33 @@ fn recover_sync_operation(
         );
     }
     let original_snapshot =
-        repository.tree_snapshot(store, &runner, &active.document.original_base_commit)?;
+        match repository.tree_snapshot(store, &runner, &active.document.original_base_commit) {
+            Ok(snapshot) => snapshot,
+            Err(error) if admission_quarantine_reason(&error).is_some() => {
+                return quarantine_publication(
+                    store,
+                    request,
+                    &checkpoint_value,
+                    &active,
+                    GitQuarantineReason::HostilePublicationState,
+                );
+            }
+            Err(error) => return Err(error.into()),
+        };
     let advance_snapshot =
-        repository.tree_snapshot(store, &runner, &active.document.advance_from_commit)?;
+        match repository.tree_snapshot(store, &runner, &active.document.advance_from_commit) {
+            Ok(snapshot) => snapshot,
+            Err(error) if admission_quarantine_reason(&error).is_some() => {
+                return quarantine_publication(
+                    store,
+                    request,
+                    &checkpoint_value,
+                    &active,
+                    GitQuarantineReason::HostilePublicationState,
+                );
+            }
+            Err(error) => return Err(error.into()),
+        };
     if original_snapshot.revision() != active.document.original_base_revision
         || advance_snapshot.revision() != active.document.advance_from_revision
         || original_snapshot
@@ -1166,7 +1293,19 @@ fn recover_sync_operation(
         );
     }
     let base_snapshot =
-        repository.tree_snapshot(store, &runner, &active.document.observed_local_tip)?;
+        match repository.tree_snapshot(store, &runner, &active.document.observed_local_tip) {
+            Ok(snapshot) => snapshot,
+            Err(error) if admission_quarantine_reason(&error).is_some() => {
+                return quarantine_publication(
+                    store,
+                    request,
+                    &checkpoint_value,
+                    &active,
+                    GitQuarantineReason::HostilePublicationState,
+                );
+            }
+            Err(error) => return Err(error.into()),
+        };
     if base_snapshot
         .identity()
         .is_none_or(|identity| identity.logical_id() != &active.document.logical_store_id)
@@ -1182,65 +1321,113 @@ fn recover_sync_operation(
     // Revalidate the complete candidate-only diff with one `diff-tree` process and one
     // persistent `cat-file --batch` process. Both streams are globally sorted, so the durable
     // additions can be compared lockstep without per-path Git invocations or a path index.
-    let staged_valid = (|| -> Result<(), pending::PendingError> {
-        let mut diff_file = active.directory.temporary_file()?;
-        let diff_output = diff_file
-            .try_clone()
-            .map_err(|error| pending::PendingError::Invalid(error.to_string()))?;
-        repository
-            .spool_tree_additions(
-                &runner,
-                &active.document.observed_local_tip,
-                &active.document.candidate_commit,
-                diff_output,
-            )
-            .map_err(|error| pending::PendingError::Invalid(error.to_string()))?;
-        diff_file
-            .seek(SeekFrom::Start(0))
-            .map_err(|error| pending::PendingError::Invalid(error.to_string()))?;
-        let mut candidate = repository
-            .tree_addition_source(&runner, diff_file)
-            .map_err(|error| pending::PendingError::Invalid(error.to_string()))?;
-        let mut observed_additions = 0_u64;
-        pending::for_each_addition(&active, |staged| {
-            let Some(expected) = candidate
-                .next_file()
-                .map_err(|error| pending::PendingError::Invalid(error.to_string()))?
-            else {
+    let mut diff_file = active.directory.temporary_file()?;
+    let diff_output = diff_file
+        .try_clone()
+        .map_err(|source| GitAdmissionError::Io {
+            operation: "retain recovery candidate addition diff",
+            source,
+        })?;
+    match repository.spool_tree_additions(
+        &runner,
+        &active.document.observed_local_tip,
+        &active.document.candidate_commit,
+        diff_output,
+    ) {
+        Ok(_) => {}
+        Err(GitAdmissionError::HostileSnapshot(_)) => {
+            return quarantine_publication(
+                store,
+                request,
+                &checkpoint_value,
+                &active,
+                GitQuarantineReason::HostilePublicationState,
+            );
+        }
+        Err(error) => return Err(error.into()),
+    }
+    diff_file
+        .seek(SeekFrom::Start(0))
+        .map_err(|source| GitAdmissionError::Io {
+            operation: "rewind recovery candidate addition diff",
+            source,
+        })?;
+    let mut candidate = repository
+        .tree_addition_source(&runner, diff_file)
+        .map_err(GitAdmissionError::from)?;
+    let mut observed_additions = 0_u64;
+    let mut candidate_error = None;
+    let mut semantic_mismatch = false;
+    let staged_result = pending::for_each_addition(&active, |staged| {
+        let expected = match candidate.next_file() {
+            Ok(Some(expected)) => expected,
+            Ok(None) => {
+                semantic_mismatch = true;
                 return Err(pending::PendingError::Invalid(
                     "candidate additions ended before staged additions".to_owned(),
                 ));
-            };
-            observed_additions = observed_additions.checked_add(1).ok_or_else(|| {
-                pending::PendingError::Invalid("addition count overflow".to_owned())
-            })?;
-            if expected.path != staged.path || expected.bytes != staged.bytes {
+            }
+            Err(error) => {
+                candidate_error = Some(error);
                 return Err(pending::PendingError::Invalid(
-                    "staged blob does not equal candidate-only path".to_owned(),
+                    "candidate addition source failed".to_owned(),
                 ));
             }
-            Ok(())
-        })?;
-        if candidate
-            .next_file()
-            .map_err(|error| pending::PendingError::Invalid(error.to_string()))?
-            .is_some()
-        {
+        };
+        let Some(next_count) = observed_additions.checked_add(1) else {
+            semantic_mismatch = true;
             return Err(pending::PendingError::Invalid(
-                "candidate additions continue after staged additions".to_owned(),
+                "addition count overflow".to_owned(),
             ));
-        }
-        candidate
-            .finish()
-            .map_err(|error| pending::PendingError::Invalid(error.to_string()))?;
-        if observed_additions != active.document.additions_count {
+        };
+        observed_additions = next_count;
+        if expected.path != staged.path || expected.bytes != staged.bytes {
+            semantic_mismatch = true;
             return Err(pending::PendingError::Invalid(
-                "staged addition count does not match pending document".to_owned(),
+                "staged blob does not equal candidate-only path".to_owned(),
             ));
         }
         Ok(())
-    })();
-    if staged_valid.is_err() {
+    });
+    if let Some(error) = candidate_error {
+        if matches!(error, GitAdmissionError::HostileSnapshot(_)) {
+            return quarantine_publication(
+                store,
+                request,
+                &checkpoint_value,
+                &active,
+                GitQuarantineReason::HostilePublicationState,
+            );
+        }
+        return Err(error.into());
+    }
+    if let Err(error) = staged_result {
+        if semantic_mismatch {
+            return quarantine_publication(
+                store,
+                request,
+                &checkpoint_value,
+                &active,
+                GitQuarantineReason::HostilePublicationState,
+            );
+        }
+        return Err(error.into());
+    }
+    match candidate.next_file() {
+        Ok(None) => {}
+        Ok(Some(_)) | Err(GitAdmissionError::HostileSnapshot(_)) => {
+            return quarantine_publication(
+                store,
+                request,
+                &checkpoint_value,
+                &active,
+                GitQuarantineReason::HostilePublicationState,
+            );
+        }
+        Err(error) => return Err(error.into()),
+    }
+    candidate.finish().map_err(GitAdmissionError::from)?;
+    if observed_additions != active.document.additions_count {
         return quarantine_publication(
             store,
             request,
@@ -1442,12 +1629,8 @@ fn recover_sync_operation(
                     &active.document.expected_remote_tip,
                 )?;
                 fault::hit("push-response-lost");
-                let observed = git::observe_remote_ref(
-                    &runner,
-                    request,
-                    active.document.object_format,
-                    &repository.bare,
-                )?;
+                let observed =
+                    git::observe_remote_ref(&runner, request, active.document.object_format)?;
                 match observed {
                     Some(observed) if observed == active.document.candidate_commit => {
                         let mut next = active.document.clone();
@@ -1526,12 +1709,8 @@ fn recover_sync_operation(
                 let visible = guard.validate_visible_s4b_locked()?;
                 let local = git::inspect_local(store, &runner, request)?;
                 let durable = checkpoint::read(store)?.ok_or(GitSyncError::BootstrapRequired)?;
-                let remote = git::observe_remote_ref(
-                    &runner,
-                    request,
-                    active.document.object_format,
-                    &repository.bare,
-                )?;
+                let remote =
+                    git::observe_remote_ref(&runner, request, active.document.object_format)?;
                 if visible.revision() != active.document.candidate_revision
                     || local.tip != active.document.candidate_commit
                     || durable.accepted_commit != active.document.candidate_commit

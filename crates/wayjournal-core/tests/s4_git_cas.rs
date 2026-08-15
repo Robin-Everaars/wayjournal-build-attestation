@@ -12,9 +12,10 @@ use std::{
 
 use serde_json::json;
 use wayjournal_core::{
-    ActorId, ApprovedRef, ApprovedRemote, ApprovedRemoteLocator, GitAdmissionError, GitSyncError,
-    GitSyncOutcome, GitSyncRequest, LocalTrustBinding, Record, Store, StoreError, StoreRevisionRef,
-    prepare_batch, wayjournal_domain_registry,
+    ActorId, ApprovedRef, ApprovedRemote, ApprovedRemoteLocator, GitAdmissionError,
+    GitQuarantineReason, GitSyncError, GitSyncOutcome, GitSyncRequest, LocalTrustBinding,
+    MAX_RECORD_BYTES, Record, Store, StoreError, StoreRevisionRef, prepare_batch,
+    wayjournal_domain_registry,
 };
 
 use support::BoundedNoLegacy as NoLegacy;
@@ -219,10 +220,17 @@ fn replacement_request(
     fs::write(
         &source,
         format!(
-            r#"use std::{{env, fs, process::Command}};
+            r#"use std::{{env, fs, ffi::OsStr, process::Command}};
 fn main() {{
     let args = env::args_os().skip(1).collect::<Vec<_>>();
-    if env::var_os("GIT_DIR").is_some() && !std::path::Path::new({marker_literal}).exists() {{
+    let standalone = args.iter().any(|arg| arg == OsStr::new("ls-remote"));
+    if standalone {{
+        assert_eq!(env::current_dir().unwrap(), std::path::Path::new("/"));
+        assert_eq!(env::var_os("GIT_DIR").as_deref(), Some(OsStr::new("/dev/null")));
+        assert!(env::var_os("GIT_COMMON_DIR").is_none());
+        assert!(env::var_os("GIT_WORK_TREE").is_none());
+    }}
+    if !standalone && env::var_os("GIT_DIR").is_some() && !std::path::Path::new({marker_literal}).exists() {{
         fs::rename({target_literal}, {retained_literal}).unwrap();
         fs::rename({replacement_literal}, {target_literal}).unwrap();
         fs::write({marker_literal}, b"").unwrap();
@@ -838,6 +846,384 @@ fn main() {{
         invocations.lines().count() < 80,
         "recovery process count must be independent of additions:\n{invocations}"
     );
+}
+
+fn mutate_persisted_candidate_snapshot(fixture: &Fixture, label: &str, mutate: impl FnOnce(&Path)) {
+    let pending = fs::read_dir(fixture.local.join(".wayjournal-local/sync-pending"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let document_path = pending.join("pending.json");
+    let document = fs::read(&document_path).unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&document).unwrap();
+    let candidate = value["candidate_commit"]["hex"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let repository = pending.join("repo.git");
+    let corrupt = fixture.root.0.join(label);
+    run(
+        &fixture.root.0,
+        &[
+            "clone",
+            "--no-checkout",
+            repository.to_str().unwrap(),
+            corrupt.to_str().unwrap(),
+        ],
+    );
+    configure(&corrupt);
+    run(&corrupt, &["checkout", "--detach", &candidate]);
+    mutate(&corrupt);
+    run(&corrupt, &["add", "-A"]);
+    run(&corrupt, &["commit", "-m", label]);
+    let corrupt_commit = String::from_utf8(run(&corrupt, &["rev-parse", "HEAD"]))
+        .unwrap()
+        .trim()
+        .to_owned();
+    run(
+        &fixture.root.0,
+        &[
+            "--git-dir",
+            repository.to_str().unwrap(),
+            "fetch",
+            "--no-write-fetch-head",
+            corrupt.join(".git").to_str().unwrap(),
+            &corrupt_commit,
+        ],
+    );
+    let replaced = String::from_utf8(document)
+        .unwrap()
+        .replacen(&candidate, &corrupt_commit, 1);
+    fs::write(&document_path, replaced).unwrap();
+}
+
+#[test]
+fn persisted_candidate_snapshot_bounds_quarantine_as_hostile_publication() {
+    for kind in ["overlong-tree-record", "oversized-canonical-blob"] {
+        let fixture = fixture(&format!("persisted-{kind}"));
+        advance_remote(&fixture);
+        assert_eq!(
+            child_sync(&fixture.local, &fixture.remote, "pending-root-durable").code(),
+            Some(86)
+        );
+        mutate_persisted_candidate_snapshot(&fixture, kind, |corrupt| match kind {
+            "overlong-tree-record" => {
+                let component = "a".repeat(200);
+                let path = corrupt
+                    .join("journal/records")
+                    .join(&component)
+                    .join(&component)
+                    .join(&component)
+                    .join("entry.json");
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                fs::write(path, b"{}\n").unwrap();
+            }
+            "oversized-canonical-blob" => {
+                let paths =
+                    String::from_utf8(run(corrupt, &["ls-tree", "-r", "--name-only", "HEAD"]))
+                        .unwrap();
+                let record = paths
+                    .lines()
+                    .find(|path| path.starts_with("journal/records/"))
+                    .unwrap();
+                fs::write(corrupt.join(record), vec![b'x'; MAX_RECORD_BYTES + 1]).unwrap();
+            }
+            _ => unreachable!(),
+        });
+
+        let first = fixture.store.sync_git_union(&fixture.request).unwrap();
+        let GitSyncOutcome::Quarantined {
+            incident_id,
+            reason: GitQuarantineReason::HostilePublicationState,
+        } = first
+        else {
+            panic!("{kind} was not quarantined: {first:?}")
+        };
+        assert!(matches!(
+            fixture.store.sync_git_union(&fixture.request).unwrap(),
+            GitSyncOutcome::Quarantined {
+                incident_id: retry,
+                reason: GitQuarantineReason::HostilePublicationState,
+            } if retry == incident_id
+        ));
+    }
+}
+
+#[test]
+fn corrupt_persisted_candidate_snapshot_quarantines_as_hostile_publication() {
+    let fixture = fixture("corrupt-persisted-candidate");
+    advance_remote(&fixture);
+    assert_eq!(
+        child_sync(&fixture.local, &fixture.remote, "pending-root-durable").code(),
+        Some(86)
+    );
+    let pending = fs::read_dir(fixture.local.join(".wayjournal-local/sync-pending"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let document_path = pending.join("pending.json");
+    let document = fs::read(&document_path).unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&document).unwrap();
+    let candidate = value["candidate_commit"]["hex"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let repository = pending.join("repo.git");
+    let corrupt = fixture.root.0.join("corrupt-candidate");
+    run(
+        &fixture.root.0,
+        &[
+            "clone",
+            "--no-checkout",
+            repository.to_str().unwrap(),
+            corrupt.to_str().unwrap(),
+        ],
+    );
+    configure(&corrupt);
+    run(&corrupt, &["checkout", "--detach", &candidate]);
+    let paths =
+        String::from_utf8(run(&corrupt, &["ls-tree", "-r", "--name-only", "HEAD"])).unwrap();
+    let manifest = paths
+        .lines()
+        .find(|path| path.starts_with("journal/batches/"))
+        .unwrap();
+    fs::write(corrupt.join(manifest), b"{}\n").unwrap();
+    run(&corrupt, &["add", manifest]);
+    run(&corrupt, &["commit", "-m", "corrupt candidate snapshot"]);
+    let corrupt_commit = String::from_utf8(run(&corrupt, &["rev-parse", "HEAD"]))
+        .unwrap()
+        .trim()
+        .to_owned();
+    run(
+        &fixture.root.0,
+        &[
+            "--git-dir",
+            repository.to_str().unwrap(),
+            "fetch",
+            "--no-write-fetch-head",
+            corrupt.join(".git").to_str().unwrap(),
+            &corrupt_commit,
+        ],
+    );
+    let mut replaced = String::from_utf8(document).unwrap();
+    replaced = replaced.replacen(&candidate, &corrupt_commit, 1);
+    fs::write(&document_path, replaced).unwrap();
+
+    let first = fixture
+        .store
+        .sync_git_union(&fixture.request)
+        .expect("closed hostile-publication outcome");
+    let GitSyncOutcome::Quarantined {
+        incident_id,
+        reason: GitQuarantineReason::HostilePublicationState,
+    } = first
+    else {
+        panic!("corrupt persisted candidate was not quarantined: {first:?}")
+    };
+    assert!(
+        pending.exists(),
+        "hostile recovery retired pending evidence"
+    );
+    assert!(matches!(
+        fixture
+            .store
+            .sync_git_union(&fixture.request)
+            .expect("durable quarantine retry"),
+        GitSyncOutcome::Quarantined {
+            incident_id: retry,
+            reason: GitQuarantineReason::HostilePublicationState,
+        } if retry == incident_id
+    ));
+}
+
+#[test]
+fn operational_recovery_snapshot_failure_preserves_pending_without_quarantine() {
+    for failure in ["ls-tree", "cat-file-batch"] {
+        let fixture = fixture(&format!("operational-recovery-{failure}"));
+        advance_remote(&fixture);
+        assert_eq!(
+            child_sync(&fixture.local, &fixture.remote, "pending-root-durable").code(),
+            Some(86)
+        );
+        let pending = fixture.local.join(".wayjournal-local/sync-pending");
+        let pending_before = fs::read_dir(&pending).unwrap().count();
+        let checkpoint_path = fixture
+            .local
+            .join(".wayjournal-local/checkpoints/admission-v1.json");
+        let checkpoint_before = fs::read(&checkpoint_path).unwrap();
+        let local_before =
+            String::from_utf8(run(&fixture.local, &["rev-parse", "refs/heads/main"])).unwrap();
+
+        let source = fixture
+            .root
+            .0
+            .join(format!("git-recovery-{failure}-wrapper.rs"));
+        let wrapper = fixture
+            .root
+            .0
+            .join(format!("git-recovery-{failure}-wrapper"));
+        let marker = fixture.root.0.join(format!("fail-recovery-{failure}"));
+        let predicate = if failure == "ls-tree" {
+            r#"args.iter().any(|arg| arg == OsStr::new("ls-tree"))"#
+        } else {
+            r#"args.iter().any(|arg| arg == OsStr::new("cat-file")) && args.iter().any(|arg| arg == OsStr::new("--batch"))"#
+        };
+        fs::write(&marker, b"fail\n").unwrap();
+        fs::write(
+            &source,
+            format!(
+                r"use std::{{env, ffi::OsStr, path::Path, process::Command}};
+fn main() {{
+    let args = env::args_os().skip(1).collect::<Vec<_>>();
+    if Path::new({marker:?}).exists() && ({predicate}) {{
+        std::process::exit(2);
+    }}
+    let status = Command::new({git:?}).args(&args).status().unwrap();
+    std::process::exit(status.code().unwrap_or(127));
+}}
+",
+                marker = marker,
+                git = git(),
+            ),
+        )
+        .unwrap();
+        assert!(
+            Command::new("rustc")
+                .args([source.as_os_str(), "-o".as_ref(), wrapper.as_os_str()])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let request = request_with_git(&fixture.remote, wrapper);
+        let result = fixture.store.sync_git_union(&request);
+        assert!(
+            matches!(
+                result,
+                Err(GitSyncError::Admission(GitAdmissionError::Git(_)))
+            ),
+            "unexpected operational {failure} recovery result: {result:?}"
+        );
+        assert_eq!(fs::read_dir(&pending).unwrap().count(), pending_before);
+        assert_eq!(
+            fs::read_dir(fixture.local.join(".wayjournal-local/quarantine"))
+                .unwrap()
+                .count(),
+            0
+        );
+        assert_eq!(fs::read(&checkpoint_path).unwrap(), checkpoint_before);
+        assert_eq!(
+            String::from_utf8(run(&fixture.local, &["rev-parse", "refs/heads/main"])).unwrap(),
+            local_before
+        );
+        fs::remove_file(marker).unwrap();
+        assert!(matches!(
+            fixture.store.sync_git_union(&request).unwrap(),
+            GitSyncOutcome::Advanced { .. } | GitSyncOutcome::UpToDate { .. }
+        ));
+    }
+}
+
+#[test]
+fn deferred_recovery_revalidation_failures_stay_operational_and_retryable() {
+    for failure in ["diff-tree", "fifth-cat-file-batch"] {
+        let fixture = fixture(&format!("deferred-revalidation-{failure}"));
+        advance_remote(&fixture);
+        assert_eq!(
+            child_sync(&fixture.local, &fixture.remote, "pending-root-durable").code(),
+            Some(86)
+        );
+        let pending = fixture.local.join(".wayjournal-local/sync-pending");
+        let pending_before = fs::read_dir(&pending).unwrap().count();
+        let checkpoint_path = fixture
+            .local
+            .join(".wayjournal-local/checkpoints/admission-v1.json");
+        let checkpoint_before = fs::read(&checkpoint_path).unwrap();
+        let local_before =
+            String::from_utf8(run(&fixture.local, &["rev-parse", "refs/heads/main"])).unwrap();
+
+        let source = fixture
+            .root
+            .0
+            .join(format!("git-deferred-{failure}-wrapper.rs"));
+        let wrapper = fixture
+            .root
+            .0
+            .join(format!("git-deferred-{failure}-wrapper"));
+        let marker = fixture.root.0.join(format!("fail-deferred-{failure}"));
+        let count = fixture.root.0.join(format!("deferred-{failure}-count"));
+        fs::write(&marker, b"fail\n").unwrap();
+        fs::write(
+            &source,
+            format!(
+                r#"use std::{{env, ffi::OsStr, fs, path::Path, process::Command}};
+fn main() {{
+    let args = env::args_os().skip(1).collect::<Vec<_>>();
+    let is_batch = args.iter().any(|arg| arg == OsStr::new("cat-file"))
+        && args.iter().any(|arg| arg == OsStr::new("--batch"));
+    let batch_number = if is_batch {{
+        let prior = fs::read_to_string({count:?})
+            .ok().and_then(|value| value.parse::<usize>().ok()).unwrap_or(0);
+        let next = prior + 1;
+        fs::write({count:?}, next.to_string()).unwrap();
+        next
+    }} else {{ 0 }};
+    let should_fail = if {failure:?} == "diff-tree" {{
+        args.iter().any(|arg| arg == OsStr::new("diff-tree"))
+    }} else {{
+        is_batch && batch_number == 5
+    }};
+    if Path::new({marker:?}).exists() && should_fail {{
+        std::process::exit(2);
+    }}
+    let status = Command::new({git:?}).args(&args).status().unwrap();
+    std::process::exit(status.code().unwrap_or(127));
+}}
+"#,
+                count = count,
+                failure = failure,
+                marker = marker,
+                git = git(),
+            ),
+        )
+        .unwrap();
+        assert!(
+            Command::new("rustc")
+                .args([source.as_os_str(), "-o".as_ref(), wrapper.as_os_str()])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let request = request_with_git(&fixture.remote, wrapper);
+        let result = fixture.store.sync_git_union(&request);
+        assert!(
+            matches!(
+                result,
+                Err(GitSyncError::Admission(GitAdmissionError::Git(_)))
+            ),
+            "unexpected deferred {failure} recovery result: {result:?}"
+        );
+        assert_eq!(fs::read_dir(&pending).unwrap().count(), pending_before);
+        assert_eq!(
+            fs::read_dir(fixture.local.join(".wayjournal-local/quarantine"))
+                .unwrap()
+                .count(),
+            0
+        );
+        assert_eq!(fs::read(&checkpoint_path).unwrap(), checkpoint_before);
+        assert_eq!(
+            String::from_utf8(run(&fixture.local, &["rev-parse", "refs/heads/main"])).unwrap(),
+            local_before
+        );
+        fs::remove_file(marker).unwrap();
+        assert!(matches!(
+            fixture.store.sync_git_union(&request).unwrap(),
+            GitSyncOutcome::Advanced { .. } | GitSyncOutcome::UpToDate { .. }
+        ));
+    }
 }
 
 #[test]

@@ -230,6 +230,7 @@ fn reason_string(reason: GitQuarantineReason) -> &'static str {
         GitQuarantineReason::MalformedHistory => "malformed_history",
         GitQuarantineReason::PathCollision => "path_collision",
         GitQuarantineReason::UuidCollision => "uuid_collision",
+        GitQuarantineReason::IdempotencyCollision => "idempotency_collision",
         GitQuarantineReason::LogicalIdentityMismatch => "logical_identity_mismatch",
         GitQuarantineReason::TrustMismatch => "trust_mismatch",
         GitQuarantineReason::UnapprovedRemoteRef => "unapproved_remote_ref",
