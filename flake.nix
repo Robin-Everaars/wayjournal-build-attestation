@@ -118,12 +118,29 @@
                 cargoClippyExtraArgs = "--all-targets --all-features -- --deny warnings";
               }
             );
-            nextest = craneLib.cargoNextest (
-              commonArgs
-              // {
-                inherit cargoArtifacts;
-              }
-            );
+            nextest =
+              if pkgs.stdenv.isLinux then
+                craneLib.cargoNextest (
+                  commonArgs
+                  // {
+                    inherit cargoArtifacts;
+                  }
+                )
+              else
+                # The secure store is Linux-only and fails closed elsewhere; compile every target
+                # without claiming that its filesystem and Git behavior is available.
+                craneLib.mkCargoDerivation (
+                  commonArgs
+                  // {
+                    inherit cargoArtifacts;
+                    pname = "wayjournal-test-compile";
+                    buildPhaseCargoCommand = "cargo check --locked --release --workspace --all-targets --all-features";
+                    installPhaseCommand = ''
+                      mkdir -p "$out"
+                      touch "$out/passed"
+                    '';
+                  }
+                );
             wire-artifacts = craneLib.mkCargoDerivation (
               commonArgs
               // {

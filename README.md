@@ -32,8 +32,9 @@ retained pending/quarantine roots and exact union/CAS authority on which S5 reli
   currently requires Linux procfs at `/proc/self/fd` to link retained file inodes.
   Git admission is likewise Linux/procfs-dependent: it executes the retained Git
   inode and addresses retained store, `.git`, and attempt directories through procfs.
-  Non-Linux systems can evaluate/package the crate but Git admission returns an I/O
-  failure where those procfs bindings are unavailable. Git script executables are
+  Non-Linux systems are package and check-compilation targets only. Secure unnamed
+  staging returns an `Unsupported` I/O failure, and Git admission fails where the
+  required procfs bindings are unavailable. Git script executables are
   not supported reliably; callers should supply an ordinary native Git binary.
 - `Store::bootstrap_git_admission` can establish or revalidate a durable local
   checkpoint only when local HEAD, the fetched approved tip, the filesystem, identity,

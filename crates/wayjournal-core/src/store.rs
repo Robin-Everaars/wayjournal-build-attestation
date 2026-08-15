@@ -1,12 +1,9 @@
 use std::{
     collections::BTreeMap,
     ffi::OsStr,
-    fs::{self, File, OpenOptions},
+    fs::{self, File},
     io::{self, Read},
-    os::{
-        fd::AsRawFd,
-        unix::{ffi::OsStrExt, fs::OpenOptionsExt},
-    },
+    os::{fd::AsRawFd, unix::ffi::OsStrExt},
     path::{Path, PathBuf},
     sync::{Arc, RwLock, RwLockWriteGuard},
 };
@@ -483,19 +480,20 @@ impl Directory {
                 "descriptor is not an ordinary directory",
             ));
         }
-        let device = stat.st_dev as u64;
+        let device = device_id(stat.st_dev, &path)?;
         if expected_device.is_some_and(|expected| expected != device) {
             return Err(StoreError::CrossDeviceLayout { path });
         }
         Ok(Self { file, path, device })
     }
     pub(crate) fn open_ambient(path: &Path) -> Result<Self, StoreError> {
-        let file = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc_flags::DIRECTORY | libc_flags::NOFOLLOW | libc_flags::CLOEXEC)
-            .open(path)
-            .map_err(|source| io_error("open store root", path, source))?;
-        Self::from_file(path.to_owned(), file, None)
+        let fd = rfs::open(
+            path,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|error| io_error("open store root", path, error.into()))?;
+        Self::from_file(path.to_owned(), File::from(fd), None)
     }
     pub fn open_dir(&self, name: &OsStr) -> Result<Self, StoreError> {
         self.open_dir_with_device(name, Some(self.device))
@@ -541,7 +539,7 @@ impl Directory {
                 error.into(),
             )
         })?;
-        if stat.st_dev as u64 != self.device {
+        if device_id(stat.st_dev, &self.path.join(name))? != self.device {
             return Err(StoreError::CrossDeviceLayout {
                 path: self.path.join(name),
             });
@@ -632,6 +630,7 @@ impl Directory {
         })?;
         Ok(file)
     }
+    #[cfg(target_os = "linux")]
     pub fn temporary_file(&self) -> Result<File, StoreError> {
         let display = self.path.join("<temporary>");
         let fd = rfs::openat(
@@ -645,6 +644,18 @@ impl Directory {
         rfs::fchmod(&file, Mode::RUSR | Mode::WUSR)
             .map_err(|error| io_error("set unnamed temporary file mode", &display, error.into()))?;
         Ok(file)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn temporary_file(&self) -> Result<File, StoreError> {
+        Err(io_error(
+            "create unnamed temporary file",
+            &self.path.join("<temporary>"),
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                "secure unnamed temporary staging requires Linux O_TMPFILE",
+            ),
+        ))
     }
 
     pub fn require_regular(&self, file: &File, name: &OsStr) -> Result<u64, StoreError> {
@@ -661,7 +672,7 @@ impl Directory {
                 "path is not an ordinary regular file",
             ));
         }
-        if stat.st_dev as u64 != self.device {
+        if device_id(stat.st_dev, &self.path.join(name))? != self.device {
             return Err(StoreError::CrossDeviceLayout {
                 path: self.path.join(name),
             });
@@ -731,7 +742,7 @@ impl Directory {
                 error.into(),
             )
         })?;
-        if stat.st_dev as u64 != self.device {
+        if device_id(stat.st_dev, &self.path.join(name))? != self.device {
             return Err(StoreError::CrossDeviceLayout {
                 path: self.path.join(name),
             });
@@ -779,7 +790,7 @@ impl Directory {
     pub(super) fn identity_key(&self) -> Result<(u64, u64), StoreError> {
         let stat = rfs::fstat(&self.file)
             .map_err(|error| io_error("inspect retained directory", &self.path, error.into()))?;
-        Ok((stat.st_dev as u64, stat.st_ino as u64))
+        Ok((device_id(stat.st_dev, &self.path)?, stat.st_ino as u64))
     }
     pub(super) fn same_identity(&self, other: &Self) -> Result<bool, StoreError> {
         let left = rfs::fstat(&self.file)
@@ -805,7 +816,7 @@ impl Directory {
     pub(super) fn file_identity_key(file: &File) -> Result<(u64, u64), StoreError> {
         let stat = rfs::fstat(file)
             .map_err(|error| io_error("inspect retained file", Path::new("."), error.into()))?;
-        Ok((stat.st_dev as u64, stat.st_ino as u64))
+        Ok((device_id(stat.st_dev, Path::new("."))?, stat.st_ino as u64))
     }
     pub(super) fn file_is_same(left: &File, right: &File) -> Result<bool, StoreError> {
         Ok(Self::file_identity_key(left)? == Self::file_identity_key(right)?)
@@ -868,12 +879,6 @@ impl Directory {
     }
 }
 
-// Values used only with `OpenOptionsExt`; rustix supplies all descriptor-relative syscalls.
-mod libc_flags {
-    pub const DIRECTORY: i32 = 0o200_000;
-    pub const NOFOLLOW: i32 = 0o400_000;
-    pub const CLOEXEC: i32 = 0o2_000_000;
-}
 fn validate_component(name: &OsStr, path: &Path) -> Result<(), StoreError> {
     let bytes = name.as_bytes();
     if bytes.is_empty()
@@ -1219,6 +1224,11 @@ pub(super) fn invalid_layout(path: &Path, message: &str) -> StoreError {
         path: path.to_owned(),
         message: message.to_owned(),
     }
+}
+fn device_id(device: impl TryInto<u64>, path: &Path) -> Result<u64, StoreError> {
+    device
+        .try_into()
+        .map_err(|_| invalid_layout(path, "negative filesystem device identifier"))
 }
 pub(super) fn io_error(operation: &'static str, path: &Path, source: io::Error) -> StoreError {
     StoreError::Io {
@@ -2276,5 +2286,44 @@ mod hostile_tests {
         drop(guard);
         drop(store);
         fs::remove_dir_all(root_path).unwrap();
+    }
+}
+
+#[cfg(all(test, not(target_os = "linux")))]
+mod non_linux_tests {
+    use super::{Directory, StoreError};
+    use std::{fs, io};
+
+    #[test]
+    fn secure_unnamed_temporary_staging_fails_closed() {
+        let root = std::env::temp_dir().join(format!(
+            "wayjournal-non-linux-temporary-{}",
+            uuid::Uuid::now_v7()
+        ));
+        fs::create_dir(&root).expect("create test directory");
+        let directory = Directory::open_ambient(&root).expect("open test directory");
+
+        let error = directory
+            .temporary_file()
+            .expect_err("non-Linux must not substitute a named temporary file");
+        match error {
+            StoreError::Io {
+                operation,
+                path,
+                source,
+            } => {
+                assert_eq!(operation, "create unnamed temporary file");
+                assert_eq!(path, root.join("<temporary>"));
+                assert_eq!(source.kind(), io::ErrorKind::Unsupported);
+                assert_eq!(
+                    source.to_string(),
+                    "secure unnamed temporary staging requires Linux O_TMPFILE"
+                );
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+
+        drop(directory);
+        fs::remove_dir_all(&root).expect("remove test directory");
     }
 }
