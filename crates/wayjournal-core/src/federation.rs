@@ -26,7 +26,7 @@ mod multi;
 pub(crate) mod pending;
 mod quarantine;
 pub use checkpoint::CheckpointError;
-pub use git::GitCommandError;
+pub use git::{GitCommandError, GitCommandFailureKind};
 pub use multi::{
     AuthorizedGitSyncError, CheckpointObservationError, MAX_MULTI_SYNC_TARGETS,
     MultiStoreSyncError, PerStoreSyncResult, StoreSyncTarget, sync_stores,
@@ -1709,12 +1709,14 @@ fn recover_sync_operation(
                             return Err(GitCommandError {
                                 operation: "confirm synchronization push",
                                 message: "successful push was not remotely observable".to_owned(),
+                                kind: GitCommandFailureKind::Io,
                             }
                             .into());
                         }
                         return Err(GitCommandError {
                             operation: "push synchronization candidate",
                             message: "exact lease was rejected without remote movement".to_owned(),
+                            kind: GitCommandFailureKind::Io,
                         }
                         .into());
                     }

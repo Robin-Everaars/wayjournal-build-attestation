@@ -68,10 +68,11 @@ pub use domains::{
 pub use federation::{
     AdmissionCheckpoint, ApprovalError, ApprovedRef, ApprovedRemote, ApprovedRemoteLocator,
     AuthorizedGitSyncError, CheckpointError, CheckpointObservationError, GitAdmissionError,
-    GitAdmissionOutcome, GitCommandError, GitObjectFormat, GitOid, GitOidError,
-    GitQuarantineReason, GitSyncError, GitSyncOperationId, GitSyncOutcome, GitSyncPendingPhase,
-    GitSyncRequest, LocalTrustBinding, MAX_MULTI_SYNC_TARGETS, MultiStoreSyncError,
-    PerStoreSyncResult, QuarantineError, QuarantineIncidentId, StoreSyncTarget, sync_stores,
+    GitAdmissionOutcome, GitCommandError, GitCommandFailureKind, GitObjectFormat, GitOid,
+    GitOidError, GitQuarantineReason, GitSyncError, GitSyncOperationId, GitSyncOutcome,
+    GitSyncPendingPhase, GitSyncRequest, LocalTrustBinding, MAX_MULTI_SYNC_TARGETS,
+    MultiStoreSyncError, PerStoreSyncResult, QuarantineError, QuarantineIncidentId,
+    StoreSyncTarget, sync_stores,
 };
 pub use hash::{Digest, DigestError};
 pub use identity::{

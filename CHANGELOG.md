@@ -4,7 +4,14 @@ All notable user-visible changes to Wayjournal are recorded here. Wayjournal fol
 
 ## Unreleased
 
-No changes yet.
+### Added
+
+- `Store::open_strict_retained_root` opens a strict store from an already retained directory descriptor. The descriptor stays the root-lock authority, every reserved child is derived descriptor-relatively, and the diagnostic path is never an authority.
+- `GitCommandError` carries a stable `GitCommandFailureKind` (`Spawn`, `Io`, `Timeout`, `NonZeroExit`, `StdoutLimit`, `StderrLimit`, `ProcessControl`) behind a `kind()` accessor, so consumers can classify a failed Git invocation without matching its message text.
+
+### Changed
+
+- Bounded output capture tracks stdout and stderr overflow separately, so a stderr budget breach is reported as `StderrLimit` instead of sharing one flag with stdout.
 
 ## 0.1.0 - 2026-08-15
 

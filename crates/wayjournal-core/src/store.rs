@@ -972,6 +972,33 @@ impl Store {
         registry: DomainRegistry,
         legacy: Arc<dyn LegacyStoreAdapter>,
     ) -> Result<Self, StoreError> {
+        Self::require_strict_builtins(&registry)?;
+        Self::open_mode(&root.into(), registry, legacy, true)
+    }
+
+    /// Opens an S3 strict store from an already retained directory descriptor.
+    /// The descriptor is `fstat`-validated and becomes the root-lock authority;
+    /// every reserved child derives descriptor-relatively. `diagnostic_path` is
+    /// never an authority: it is never created or canonicalized, store access
+    /// never reopens it, and renaming the real root cannot redirect the store.
+    /// One caveat for callers: when the root is a linked Git worktree, Git
+    /// federation resolves these bytes ambiently and then requires the result
+    /// to still name the retained root inode, failing closed when it does not.
+    /// # Errors
+    /// Fails when the descriptor is not an ordinary directory, when built-ins
+    /// are absent, or for the same layout reasons as [`Store::open_strict`].
+    pub fn open_strict_retained_root(
+        root: File,
+        diagnostic_path: PathBuf,
+        registry: DomainRegistry,
+        legacy: Arc<dyn LegacyStoreAdapter>,
+    ) -> Result<Self, StoreError> {
+        Self::require_strict_builtins(&registry)?;
+        let root_dir = Arc::new(Directory::from_file(diagnostic_path.clone(), root, None)?);
+        Self::open_from_root(diagnostic_path, root_dir, registry, legacy, true)
+    }
+
+    fn require_strict_builtins(registry: &DomainRegistry) -> Result<(), StoreError> {
         if !registry.has_sealed_builtins()
             || !registry.supports("wayjournal.identity", crate::IDENTITY_SCHEMA_V1)
             || !registry.supports("wayjournal.profile", crate::PROFILE_SCHEMA_V1)
@@ -982,7 +1009,7 @@ impl Store {
                 "strict store requires sealed identity/profile/catalog v1 built-ins",
             ));
         }
-        Self::open_mode(&root.into(), registry, legacy, true)
+        Ok(())
     }
 
     fn open_mode(
@@ -995,6 +1022,16 @@ impl Store {
         let root = fs::canonicalize(requested)
             .map_err(|source| io_error("canonicalize store root", requested, source))?;
         let root_dir = Arc::new(Directory::open_ambient(&root)?);
+        Self::open_from_root(root, root_dir, registry, legacy, strict_domains)
+    }
+
+    fn open_from_root(
+        root: PathBuf,
+        root_dir: Arc<Directory>,
+        registry: DomainRegistry,
+        legacy: Arc<dyn LegacyStoreAdapter>,
+        strict_domains: bool,
+    ) -> Result<Self, StoreError> {
         #[cfg(test)]
         race(RacePoint::RootAnchor);
         let (events, _) = root_dir.ensure_dir(OsStr::new("events"))?;

@@ -41,16 +41,51 @@ pub(super) const MAX_PENDING_REPO_BYTES: u64 = 24 * 1024 * 1024 * 1024;
 pub(super) const MAX_PENDING_REPO_DEPTH: usize = 64;
 const GIT_TIMEOUT: Duration = Duration::from_mins(1);
 
+/// Stable transport-level classification of a failed Git invocation.
+///
+/// Downstream consumers map this kind plus [`GitCommandError::operation`] into
+/// typed evidence. The display message stays redacted and non-authoritative.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum GitCommandFailureKind {
+    /// The child process could not be launched.
+    Spawn,
+    /// Residual class: reading or writing the child's streams failed, its
+    /// output violated the expected protocol shape, or a local filesystem,
+    /// layout or object-size failure occurred while performing the operation.
+    /// Carries no transience promise; discriminate with
+    /// [`GitCommandError::operation`].
+    Io,
+    /// A bounded deadline elapsed before the command completed. Wall-clock for
+    /// whole invocations, idle progress for streamed listings.
+    Timeout,
+    /// The child exited unsuccessfully or was terminated by a signal.
+    NonZeroExit,
+    /// The bounded stdout budget was exceeded.
+    StdoutLimit,
+    /// The bounded stderr budget was exceeded.
+    StderrLimit,
+    /// Process management failed: pipes, wait, termination, or reader/writer
+    /// thread control.
+    ProcessControl,
+}
+
 #[derive(Debug, Error)]
 #[error("Git {operation} failed: {message}")]
 pub struct GitCommandError {
     pub(super) operation: &'static str,
     pub(super) message: String,
+    pub(super) kind: GitCommandFailureKind,
 }
 impl GitCommandError {
     #[must_use]
     pub const fn operation(&self) -> &'static str {
         self.operation
+    }
+
+    /// Returns the stable failure kind for typed downstream evidence.
+    #[must_use]
+    pub const fn kind(&self) -> GitCommandFailureKind {
+        self.kind
     }
 
     pub(super) fn is_hostile_repository_state(&self) -> bool {
@@ -365,6 +400,7 @@ fn status_error(operation: &'static str, status: std::process::ExitStatus) -> Gi
             Some(code) => format!("command exited with status {code}"),
             None => "command terminated by signal".to_owned(),
         },
+        kind: GitCommandFailureKind::NonZeroExit,
     }
 }
 
@@ -441,6 +477,7 @@ fn run_bounded_command_to_file(
         });
     }
     let mut child = command.spawn().map_err(|error| GitCommandError {
+        kind: GitCommandFailureKind::Spawn,
         operation,
         message: error.to_string(),
     })?;
@@ -448,6 +485,7 @@ fn run_bounded_command_to_file(
     let Some(stdout) = child.stdout.take() else {
         terminate_process_group(pid, &mut child, true);
         return Err(GitCommandError {
+            kind: GitCommandFailureKind::ProcessControl,
             operation,
             message: "stdout pipe was not created".to_owned(),
         }
@@ -456,6 +494,7 @@ fn run_bounded_command_to_file(
     let Some(stderr_pipe) = child.stderr.take() else {
         terminate_process_group(pid, &mut child, true);
         return Err(GitCommandError {
+            kind: GitCommandFailureKind::ProcessControl,
             operation,
             message: "stderr pipe was not created".to_owned(),
         }
@@ -502,6 +541,7 @@ fn run_bounded_command_to_file(
                     let _ = stdout_writer.join();
                     let _ = stderr_reader.join();
                     return Err(GitCommandError {
+                        kind: GitCommandFailureKind::ProcessControl,
                         operation,
                         message: error.to_string(),
                     }
@@ -514,24 +554,29 @@ fn run_bounded_command_to_file(
             let _ = stdout_writer.join();
             let _ = stderr_reader.join();
             return Err(BoundedFileCommandError::StdoutLimit(GitCommandError {
+                kind: GitCommandFailureKind::StdoutLimit,
                 operation,
                 message: "bounded output exceeded".to_owned(),
             }));
         }
         let operational_failure = if stderr_overflow.load(Ordering::Acquire) {
-            Some("bounded stderr exceeded")
+            Some((
+                "bounded stderr exceeded",
+                GitCommandFailureKind::StderrLimit,
+            ))
         } else if started.elapsed() >= timeout {
-            Some("operation timed out")
+            Some(("operation timed out", GitCommandFailureKind::Timeout))
         } else {
             None
         };
-        if let Some(message) = operational_failure {
+        if let Some((message, kind)) = operational_failure {
             terminate_process_group(pid, &mut child, status.is_none());
             let _ = stdout_writer.join();
             let _ = stderr_reader.join();
             return Err(GitCommandError {
                 operation,
                 message: message.to_owned(),
+                kind,
             }
             .into());
         }
@@ -543,6 +588,7 @@ fn run_bounded_command_to_file(
     stdout_writer
         .join()
         .map_err(|_| GitCommandError {
+            kind: GitCommandFailureKind::ProcessControl,
             operation,
             message: "stdout writer panicked".to_owned(),
         })
@@ -550,6 +596,7 @@ fn run_bounded_command_to_file(
     stderr_reader
         .join()
         .map_err(|_| GitCommandError {
+            kind: GitCommandFailureKind::ProcessControl,
             operation,
             message: "stderr reader panicked".to_owned(),
         })
@@ -557,6 +604,7 @@ fn run_bounded_command_to_file(
     let status = status.expect("loop exits only after child status");
     if !status.success() {
         return Err(GitCommandError {
+            kind: GitCommandFailureKind::NonZeroExit,
             operation,
             message: format!(
                 "process exited with {status}: {}",
@@ -620,6 +668,7 @@ fn run_bounded_command_with_input(
         });
     }
     let mut child = command.spawn().map_err(|error| GitCommandError {
+        kind: GitCommandFailureKind::Spawn,
         operation,
         message: error.to_string(),
     })?;
@@ -628,6 +677,7 @@ fn run_bounded_command_with_input(
         let Some(mut stdin) = child.stdin.take() else {
             terminate_process_group(pid, &mut child, true);
             return Err(GitCommandError {
+                kind: GitCommandFailureKind::ProcessControl,
                 operation,
                 message: "stdin pipe was not created".to_owned(),
             });
@@ -635,6 +685,7 @@ fn run_bounded_command_with_input(
         stdin.write_all(bytes).map_err(|error| {
             terminate_process_group(pid, &mut child, true);
             GitCommandError {
+                kind: GitCommandFailureKind::Io,
                 operation,
                 message: error.to_string(),
             }
@@ -643,6 +694,7 @@ fn run_bounded_command_with_input(
     let Some(stdout) = child.stdout.take() else {
         terminate_process_group(pid, &mut child, true);
         return Err(GitCommandError {
+            kind: GitCommandFailureKind::ProcessControl,
             operation,
             message: "stdout pipe was not created".to_owned(),
         });
@@ -650,15 +702,17 @@ fn run_bounded_command_with_input(
     let Some(stderr) = child.stderr.take() else {
         terminate_process_group(pid, &mut child, true);
         return Err(GitCommandError {
+            kind: GitCommandFailureKind::ProcessControl,
             operation,
             message: "stderr pipe was not created".to_owned(),
         });
     };
-    let overflow = Arc::new(AtomicBool::new(false));
+    let stdout_overflow = Arc::new(AtomicBool::new(false));
+    let stderr_overflow = Arc::new(AtomicBool::new(false));
     let (stdout_reader, stdout_rx) =
-        spawn_bounded_reader(stdout, stdout_limit, Arc::clone(&overflow));
+        spawn_bounded_reader(stdout, stdout_limit, Arc::clone(&stdout_overflow));
     let (stderr_reader, stderr_rx) =
-        spawn_bounded_reader(stderr, stderr_limit, Arc::clone(&overflow));
+        spawn_bounded_reader(stderr, stderr_limit, Arc::clone(&stderr_overflow));
     let started = Instant::now();
     let mut status = None;
     let mut stdout = None;
@@ -694,26 +748,36 @@ fn run_bounded_command_with_input(
                     let _ = stdout_reader.join();
                     let _ = stderr_reader.join();
                     return Err(GitCommandError {
+                        kind: GitCommandFailureKind::ProcessControl,
                         operation,
                         message: error.to_string(),
                     });
                 }
             }
         }
-        let failure = if overflow.load(Ordering::Acquire) {
-            Some("bounded output exceeded")
+        let failure = if stdout_overflow.load(Ordering::Acquire) {
+            Some((
+                "bounded output exceeded",
+                GitCommandFailureKind::StdoutLimit,
+            ))
+        } else if stderr_overflow.load(Ordering::Acquire) {
+            Some((
+                "bounded stderr exceeded",
+                GitCommandFailureKind::StderrLimit,
+            ))
         } else if started.elapsed() >= timeout {
-            Some("operation timed out")
+            Some(("operation timed out", GitCommandFailureKind::Timeout))
         } else {
             None
         };
-        if let Some(message) = failure {
+        if let Some((message, kind)) = failure {
             terminate_process_group(pid, &mut child, status.is_none());
             let _ = stdout_reader.join();
             let _ = stderr_reader.join();
             return Err(GitCommandError {
                 operation,
                 message: message.to_owned(),
+                kind,
             });
         }
         if status.is_some() && stdout.is_some() && stderr.is_some() {
@@ -722,10 +786,12 @@ fn run_bounded_command_with_input(
         thread::sleep(Duration::from_millis(5));
     }
     stdout_reader.join().map_err(|_| GitCommandError {
+        kind: GitCommandFailureKind::ProcessControl,
         operation,
         message: "stdout reader panicked".to_owned(),
     })?;
     stderr_reader.join().map_err(|_| GitCommandError {
+        kind: GitCommandFailureKind::ProcessControl,
         operation,
         message: "stderr reader panicked".to_owned(),
     })?;
@@ -808,11 +874,13 @@ fn poll_writer(
     match receiver.try_recv() {
         Ok(Ok(bytes)) => Ok(Some(bytes)),
         Ok(Err(error)) => Err(GitCommandError {
+            kind: GitCommandFailureKind::Io,
             operation,
             message: error.to_string(),
         }),
         Err(TryRecvError::Empty) => Ok(None),
         Err(TryRecvError::Disconnected) => Err(GitCommandError {
+            kind: GitCommandFailureKind::ProcessControl,
             operation,
             message: "output writer disconnected".to_owned(),
         }),
@@ -826,11 +894,13 @@ fn poll_reader(
     match receiver.try_recv() {
         Ok(Ok(bytes)) => Ok(Some(bytes)),
         Ok(Err(error)) => Err(GitCommandError {
+            kind: GitCommandFailureKind::Io,
             operation,
             message: error.to_string(),
         }),
         Err(TryRecvError::Empty) => Ok(None),
         Err(TryRecvError::Disconnected) => Err(GitCommandError {
+            kind: GitCommandFailureKind::ProcessControl,
             operation,
             message: "output reader disconnected".to_owned(),
         }),
@@ -851,6 +921,20 @@ fn command_error(operation: &'static str, error: impl std::fmt::Display) -> GitC
     GitCommandError {
         operation,
         message: error.to_string(),
+        kind: GitCommandFailureKind::Io,
+    }
+}
+
+/// Companion to [`command_error`] for failures of process management itself:
+/// pipes, wait, termination, and reader/writer thread control.
+fn process_control_error(
+    operation: &'static str,
+    error: impl std::fmt::Display,
+) -> GitCommandError {
+    GitCommandError {
+        operation,
+        message: error.to_string(),
+        kind: GitCommandFailureKind::ProcessControl,
     }
 }
 
@@ -861,6 +945,7 @@ fn hostile_snapshot_error(
     super::GitAdmissionError::HostileSnapshot(GitCommandError {
         operation,
         message: message.into(),
+        kind: GitCommandFailureKind::Io,
     })
 }
 
@@ -915,6 +1000,7 @@ impl RetainedAncestry {
             if component == b".." {
                 if resolved.directories.len() == 1 {
                     return Err(GitCommandError {
+                        kind: GitCommandFailureKind::Io,
                         operation: "resolve local Git layout",
                         message: "Git control path escapes the filesystem root".to_owned(),
                     });
@@ -937,11 +1023,13 @@ impl RetainedAncestry {
     fn resolve_file(&self, raw: &[u8]) -> Result<(Self, OsString, File), GitCommandError> {
         let (absolute, mut components) = parse_control_path(raw)?;
         let name = components.pop().ok_or_else(|| GitCommandError {
+            kind: GitCommandFailureKind::Io,
             operation: "resolve local Git layout",
             message: "Git control file path has no basename".to_owned(),
         })?;
         if name == b".." {
             return Err(GitCommandError {
+                kind: GitCommandFailureKind::Io,
                 operation: "resolve local Git layout",
                 message: "Git control file path has no ordinary basename".to_owned(),
             });
@@ -974,6 +1062,7 @@ impl RetainedAncestry {
             OpenedEntry::Regular(file) => file,
             OpenedEntry::Directory(_) => {
                 return Err(GitCommandError {
+                    kind: GitCommandFailureKind::Io,
                     operation: "resolve local Git layout",
                     message: "Git control path is not a regular file".to_owned(),
                 });
@@ -990,6 +1079,7 @@ fn parse_control_path(raw: &[u8]) -> Result<(bool, Vec<Vec<u8>>), GitCommandErro
         || raw.ends_with(b"/")
     {
         return Err(GitCommandError {
+            kind: GitCommandFailureKind::Io,
             operation: "resolve local Git layout",
             message: "Git control path is empty, oversized, NUL-containing, or slash-terminated"
                 .to_owned(),
@@ -999,6 +1089,7 @@ fn parse_control_path(raw: &[u8]) -> Result<(bool, Vec<Vec<u8>>), GitCommandErro
     let body = if absolute { &raw[1..] } else { raw };
     if body.is_empty() {
         return Err(GitCommandError {
+            kind: GitCommandFailureKind::Io,
             operation: "resolve local Git layout",
             message: "Git control path may not name the filesystem root".to_owned(),
         });
@@ -1007,6 +1098,7 @@ fn parse_control_path(raw: &[u8]) -> Result<(bool, Vec<Vec<u8>>), GitCommandErro
     for component in body.split(|byte| *byte == b'/') {
         if component.is_empty() || component == b"." {
             return Err(GitCommandError {
+                kind: GitCommandFailureKind::Io,
                 operation: "resolve local Git layout",
                 message: "Git control path is not lexically canonical".to_owned(),
             });
@@ -1014,6 +1106,7 @@ fn parse_control_path(raw: &[u8]) -> Result<(bool, Vec<Vec<u8>>), GitCommandErro
         components.push(component.to_vec());
         if components.len() > MAX_GIT_CONTROL_COMPONENTS {
             return Err(GitCommandError {
+                kind: GitCommandFailureKind::Io,
                 operation: "resolve local Git layout",
                 message: "Git control path has too many components".to_owned(),
             });
@@ -1089,16 +1182,19 @@ impl SyncRepository {
         )?;
         let mut words = std::str::from_utf8(&output)
             .map_err(|_| GitCommandError {
+                kind: GitCommandFailureKind::Io,
                 operation: "read candidate parents",
                 message: "parent list is not UTF-8".to_owned(),
             })?
             .split_ascii_whitespace();
         let observed = words.next().ok_or_else(|| GitCommandError {
+            kind: GitCommandFailureKind::Io,
             operation: "read candidate parents",
             message: "parent list is empty".to_owned(),
         })?;
         if observed != commit.as_hex() {
             return Err(GitCommandError {
+                kind: GitCommandFailureKind::Io,
                 operation: "read candidate parents",
                 message: "parent list names a different commit".to_owned(),
             });
@@ -1106,6 +1202,7 @@ impl SyncRepository {
         let mut parents = words
             .map(|word| {
                 GitOid::parse(self.format, word).map_err(|error| GitCommandError {
+                    kind: GitCommandFailureKind::Io,
                     operation: "read candidate parents",
                     message: error.to_string(),
                 })
@@ -1144,10 +1241,12 @@ impl SyncRepository {
             .bare
             .temporary_file()
             .map_err(|error| GitCommandError {
+                kind: GitCommandFailureKind::Io,
                 operation: "validate immutable history edge",
                 message: error.to_string(),
             })?;
         let retained = output.try_clone().map_err(|error| GitCommandError {
+            kind: GitCommandFailureKind::Io,
             operation: "validate immutable history edge",
             message: error.to_string(),
         })?;
@@ -1171,6 +1270,7 @@ impl SyncRepository {
         output
             .seek(SeekFrom::Start(0))
             .map_err(|error| GitCommandError {
+                kind: GitCommandFailureKind::Io,
                 operation: "validate immutable history edge",
                 message: error.to_string(),
             })?;
@@ -1223,11 +1323,13 @@ impl SyncRepository {
             .ok()
             .and_then(|value| value.trim().parse::<usize>().ok())
             .ok_or_else(|| GitCommandError {
+                kind: GitCommandFailureKind::Io,
                 operation: "bound commit object",
                 message: "commit size is not canonical decimal".to_owned(),
             })?;
         if size > byte_limit {
             return Err(GitCommandError {
+                kind: GitCommandFailureKind::Io,
                 operation: "bound commit object",
                 message: "commit object exceeds byte limit".to_owned(),
             });
@@ -1253,6 +1355,7 @@ impl SyncRepository {
     ) -> Result<usize, super::GitAdmissionError> {
         if local.format() != self.format || candidate.format() != self.format {
             return Err(GitCommandError {
+                kind: GitCommandFailureKind::Io,
                 operation: "enumerate candidate additions",
                 message: "tree diff object format does not match repository".to_owned(),
             }
@@ -1326,6 +1429,7 @@ fn read_control_file(file: &File, prefix: Option<&[u8]>) -> Result<Vec<u8>, GitC
         .map_err(|error| command_error("resolve local Git layout", error))?;
     if bytes.len() > MAX_GIT_CONTROL_PATH_BYTES || bytes.contains(&0) || bytes.contains(&b'\r') {
         return Err(GitCommandError {
+            kind: GitCommandFailureKind::Io,
             operation: "resolve local Git layout",
             message: "Git control file is oversized or contains forbidden bytes".to_owned(),
         });
@@ -1335,6 +1439,7 @@ fn read_control_file(file: &File, prefix: Option<&[u8]>) -> Result<Vec<u8>, GitC
     }
     if bytes.is_empty() || bytes.contains(&b'\n') {
         return Err(GitCommandError {
+            kind: GitCommandFailureKind::Io,
             operation: "resolve local Git layout",
             message: "Git control file is empty or contains multiple lines".to_owned(),
         });
@@ -1344,6 +1449,7 @@ fn read_control_file(file: &File, prefix: Option<&[u8]>) -> Result<Vec<u8>, GitC
             .strip_prefix(prefix)
             .filter(|value| !value.is_empty())
             .ok_or_else(|| GitCommandError {
+                kind: GitCommandFailureKind::Io,
                 operation: "resolve local Git layout",
                 message: "Git gitfile has an invalid prefix or empty target".to_owned(),
             })?
@@ -1366,6 +1472,7 @@ fn retained_store_ancestry(store: &Store) -> Result<RetainedAncestry, GitCommand
         .map_err(|error| command_error("resolve local Git layout", error))?
     {
         return Err(GitCommandError {
+            kind: GitCommandFailureKind::Io,
             operation: "resolve local Git layout",
             message: "ambient store ancestry no longer names the retained root".to_owned(),
         });
@@ -1384,6 +1491,7 @@ fn require_directory_authority(
         Ok(())
     } else {
         Err(GitCommandError {
+            kind: GitCommandFailureKind::Io,
             operation: "resolve local Git layout",
             message: "Git directory owner or device differs from the store root".to_owned(),
         })
@@ -1399,6 +1507,7 @@ fn require_file_authority(store: &Store, file: &File) -> Result<(), GitCommandEr
         Ok(())
     } else {
         Err(GitCommandError {
+            kind: GitCommandFailureKind::Io,
             operation: "resolve local Git layout",
             message: "Git control-file owner or device differs from the store root".to_owned(),
         })
@@ -1446,6 +1555,7 @@ fn linked_local_repository(
             .map_err(|error| command_error("resolve local Git layout", error))?
     {
         return Err(GitCommandError {
+            kind: GitCommandFailureKind::Io,
             operation: "resolve local Git layout",
             message: "linked-worktree admin backlink does not name the retained gitfile".to_owned(),
         });
@@ -1468,6 +1578,7 @@ fn linked_local_repository(
         || !entry_absent(&common_dir, OsStr::new("commondir"))?
     {
         return Err(GitCommandError {
+            kind: GitCommandFailureKind::Io,
             operation: "resolve local Git layout",
             message: "linked worktree has no distinct self-contained common directory".to_owned(),
         });
@@ -1477,6 +1588,7 @@ fn linked_local_repository(
         .components
         .last()
         .ok_or_else(|| GitCommandError {
+            kind: GitCommandFailureKind::Io,
             operation: "resolve local Git layout",
             message: "linked-worktree admin directory has no basename".to_owned(),
         })?
@@ -1493,6 +1605,7 @@ fn linked_local_repository(
             .map_err(|error| command_error("resolve local Git layout", error))?
     {
         return Err(GitCommandError {
+            kind: GitCommandFailureKind::Io,
             operation: "resolve local Git layout",
             message: "linked-worktree admin directory is outside common/worktrees".to_owned(),
         });
@@ -1539,6 +1652,7 @@ pub(super) fn inspect_local(
             require_directory_authority(store, &git_dir)?;
             if !entry_absent(&git_dir, OsStr::new("commondir"))? {
                 return Err(GitCommandError {
+                    kind: GitCommandFailureKind::Io,
                     operation: "resolve local Git layout",
                     message: "ordinary repository unexpectedly contains commondir".to_owned(),
                 });
@@ -1605,6 +1719,7 @@ fn finish_inspect_local(
     if branch.strip_suffix(b"\n") != Some(request.approved_remote().reference().as_str().as_bytes())
     {
         return Err(GitCommandError {
+            kind: GitCommandFailureKind::Io,
             operation: "read local branch",
             message: "checked-out branch is not the approved ref".to_owned(),
         });
@@ -1620,6 +1735,7 @@ fn finish_inspect_local(
         .map(str::trim)
         .and_then(|text| text.parse().ok())
         .ok_or_else(|| GitCommandError {
+            kind: GitCommandFailureKind::Io,
             operation: "read object format",
             message: "unsupported object format".to_owned(),
         })?;
@@ -1648,6 +1764,7 @@ pub(super) fn fetch_remote(
         .map_err(|error| command_error("create admission repository", error))?;
     if !created {
         return Err(GitCommandError {
+            kind: GitCommandFailureKind::Io,
             operation: "create admission repository",
             message: "admission repository already exists".to_owned(),
         });
@@ -1695,6 +1812,7 @@ pub(super) fn create_sync_repository(
         .map_err(|error| command_error("create disposable synchronization attempt", error))?;
     if !created {
         return Err(GitCommandError {
+            kind: GitCommandFailureKind::Io,
             operation: "create disposable synchronization attempt",
             message: "synchronization attempt already exists".to_owned(),
         });
@@ -1704,6 +1822,7 @@ pub(super) fn create_sync_repository(
         .map_err(|error| command_error("create disposable fetched repository", error))?;
     if !created {
         return Err(GitCommandError {
+            kind: GitCommandFailureKind::Io,
             operation: "create disposable fetched repository",
             message: "fetched repository already exists".to_owned(),
         });
@@ -1757,6 +1876,7 @@ pub(super) fn create_sync_repository(
         .map_err(|error| command_error("create compact synchronization repository", error))?;
     if !created {
         return Err(GitCommandError {
+            kind: GitCommandFailureKind::Io,
             operation: "create compact synchronization repository",
             message: "compact synchronization repository already exists".to_owned(),
         });
@@ -1797,6 +1917,7 @@ pub(super) fn create_sync_repository(
         || repository.ref_oid(runner, "refs/wayjournal/remote")? != remote_tip
     {
         return Err(GitCommandError {
+            kind: GitCommandFailureKind::Io,
             operation: "compact reachable synchronization objects",
             message: "compacted authority refs changed".to_owned(),
         });
@@ -1852,10 +1973,12 @@ fn verify_reachable_objects(
         .bare
         .temporary_file()
         .map_err(|error| GitCommandError {
+            kind: GitCommandFailureKind::Io,
             operation: "inventory fetched objects",
             message: error.to_string(),
         })?;
     let retained = objects.try_clone().map_err(|error| GitCommandError {
+        kind: GitCommandFailureKind::Io,
         operation: "inventory fetched objects",
         message: error.to_string(),
     })?;
@@ -1869,6 +1992,7 @@ fn verify_reachable_objects(
     objects
         .seek(SeekFrom::Start(0))
         .map_err(|error| GitCommandError {
+            kind: GitCommandFailureKind::Io,
             operation: "inventory fetched objects",
             message: error.to_string(),
         })?;
@@ -1923,6 +2047,7 @@ pub(super) fn select_candidate(
     for tip in [local_tip, remote_tip] {
         if !repository.is_ancestor(runner, tip, &candidate)? {
             return Err(GitCommandError {
+                kind: GitCommandFailureKind::Io,
                 operation: "validate union candidate ancestry",
                 message: "candidate does not descend every admitted tip".to_owned(),
             });
@@ -1958,6 +2083,7 @@ pub(super) fn advance_local_ref(
     }
     if current != *expected {
         return Err(GitCommandError {
+            kind: GitCommandFailureKind::Io,
             operation: "advance approved local ref",
             message: "approved local ref is neither expected old nor candidate".to_owned(),
         });
@@ -1993,6 +2119,7 @@ pub(super) fn advance_local_ref(
     super::fault::hit("local-git-durable");
     if inspect_local_ref(runner, local, request)? != *candidate {
         return Err(GitCommandError {
+            kind: GitCommandFailureKind::Io,
             operation: "advance approved local ref",
             message: "approved local ref did not reach candidate after durable reopen".to_owned(),
         });
@@ -2071,6 +2198,7 @@ pub(super) fn observe_remote_ref(
     };
     if lines.next().is_some() {
         return Err(GitCommandError {
+            kind: GitCommandFailureKind::Io,
             operation: "observe approved remote ref",
             message: "remote returned multiple exact ref observations".to_owned(),
         });
@@ -2082,17 +2210,20 @@ pub(super) fn observe_remote_ref(
         || reference != request.approved_remote().reference().as_str().as_bytes()
     {
         return Err(GitCommandError {
+            kind: GitCommandFailureKind::Io,
             operation: "observe approved remote ref",
             message: "remote exact ref observation is malformed".to_owned(),
         });
     }
     let oid = std::str::from_utf8(oid).map_err(|_| GitCommandError {
+        kind: GitCommandFailureKind::Io,
         operation: "observe approved remote ref",
         message: "remote object id is not UTF-8".to_owned(),
     })?;
     GitOid::parse(format, oid)
         .map(Some)
         .map_err(|error| GitCommandError {
+            kind: GitCommandFailureKind::Io,
             operation: "observe approved remote ref",
             message: error.to_string(),
         })
@@ -2114,6 +2245,7 @@ pub(super) fn remove_internal_local_candidate(
         &args(&["rev-parse", "--verify", "refs/wayjournal/candidate"]),
     )? {
         return Err(GitCommandError {
+            kind: GitCommandFailureKind::Io,
             operation: "remove internal candidate ref",
             message: "internal candidate ref remained after durable removal".to_owned(),
         });
@@ -2191,6 +2323,7 @@ fn audit_repository_metadata(git_dir: &Directory) -> Result<(), GitCommandError>
         || exists_regular(git_dir, OsStr::new("shallow"))?
     {
         return Err(GitCommandError {
+            kind: GitCommandFailureKind::Io,
             operation: "audit repository metadata",
             message: "alternates or shallow history is not allowed".to_owned(),
         });
@@ -2198,6 +2331,7 @@ fn audit_repository_metadata(git_dir: &Directory) -> Result<(), GitCommandError>
     match git_dir.open_dir(OsStr::new("info")) {
         Ok(root_info) if exists_regular(&root_info, OsStr::new("grafts"))? => {
             return Err(GitCommandError {
+                kind: GitCommandFailureKind::Io,
                 operation: "audit repository metadata",
                 message: "grafts are not allowed".to_owned(),
             });
@@ -2217,6 +2351,7 @@ fn audit_repository_metadata(git_dir: &Directory) -> Result<(), GitCommandError>
                 .is_empty() =>
         {
             return Err(GitCommandError {
+                kind: GitCommandFailureKind::Io,
                 operation: "audit repository metadata",
                 message: "replace refs are not allowed".to_owned(),
             });
@@ -2238,6 +2373,7 @@ fn audit_repository_metadata(git_dir: &Directory) -> Result<(), GitCommandError>
                 })
             {
                 return Err(GitCommandError {
+                    kind: GitCommandFailureKind::Io,
                     operation: "audit repository metadata",
                     message: "packed replace refs or oversized packed refs are not allowed"
                         .to_owned(),
@@ -2288,6 +2424,7 @@ fn sync_directory_tree_shared(
 ) -> Result<(), GitCommandError> {
     if depth > MAX_PENDING_REPO_DEPTH {
         return Err(GitCommandError {
+            kind: GitCommandFailureKind::Io,
             operation: "durably sync Git repository",
             message: "repository depth limit exceeded".to_owned(),
         });
@@ -2386,6 +2523,7 @@ fn remove_directory_tree(
 ) -> Result<(), GitCommandError> {
     if depth > MAX_PENDING_REPO_DEPTH {
         return Err(GitCommandError {
+            kind: GitCommandFailureKind::Io,
             operation: "retire disposable synchronization attempt",
             message: "attempt depth limit exceeded".to_owned(),
         });
@@ -2393,6 +2531,7 @@ fn remove_directory_tree(
     loop {
         if *budget == 0 {
             return Err(GitCommandError {
+                kind: GitCommandFailureKind::Io,
                 operation: "retire disposable synchronization attempt",
                 message: "attempt entry limit exceeded".to_owned(),
             });
@@ -2468,6 +2607,7 @@ fn audit_repository_walk(
 ) -> Result<(), GitCommandError> {
     if depth > MAX_PENDING_REPO_DEPTH {
         return Err(GitCommandError {
+            kind: GitCommandFailureKind::Io,
             operation: "bound fetched repository",
             message: "repository depth limit exceeded".to_owned(),
         });
@@ -2574,6 +2714,7 @@ fn audit_local_repository_metadata(layout: &LocalRepositoryLayout) -> Result<(),
         .map_err(|error| command_error("audit repository metadata", error))?;
     if config_bytes > MAX_SMALL_OUTPUT as u64 {
         return Err(GitCommandError {
+            kind: GitCommandFailureKind::Io,
             operation: "audit repository metadata",
             message: "repository config exceeds byte limit".to_owned(),
         });
@@ -2588,6 +2729,7 @@ fn audit_local_repository_metadata(layout: &LocalRepositoryLayout) -> Result<(),
         .map_err(|error| command_error("audit repository metadata", error))?;
     if head_bytes > MAX_SMALL_OUTPUT as u64 {
         return Err(GitCommandError {
+            kind: GitCommandFailureKind::Io,
             operation: "audit repository metadata",
             message: "worktree HEAD exceeds byte limit".to_owned(),
         });
@@ -2596,6 +2738,7 @@ fn audit_local_repository_metadata(layout: &LocalRepositoryLayout) -> Result<(),
         for name in ["config", "config.worktree"] {
             if !entry_absent(&layout.admin_dir, OsStr::new(name))? {
                 return Err(GitCommandError {
+                    kind: GitCommandFailureKind::Io,
                     operation: "audit repository metadata",
                     message: "per-worktree config is not allowed".to_owned(),
                 });
@@ -2641,6 +2784,7 @@ fn audit_local_config(
         );
         if !allowed {
             return Err(GitCommandError {
+                kind: GitCommandFailureKind::Io,
                 operation: "audit local config",
                 message: format!("unsafe local Git config key: {key}"),
             });
@@ -2651,10 +2795,12 @@ fn audit_local_config(
 
 fn parse_oid_output(format: GitObjectFormat, output: &[u8]) -> Result<GitOid, GitCommandError> {
     let text = std::str::from_utf8(output).map_err(|_| GitCommandError {
+        kind: GitCommandFailureKind::Io,
         operation: "parse object id",
         message: "non-UTF-8 object id".to_owned(),
     })?;
     GitOid::parse(format, text.trim()).map_err(|error| GitCommandError {
+        kind: GitCommandFailureKind::Io,
         operation: "parse object id",
         message: error.to_string(),
     })
@@ -2677,6 +2823,7 @@ fn require_commit_object(
     )?;
     if object_type != b"commit\n" {
         return Err(GitCommandError {
+            kind: GitCommandFailureKind::Io,
             operation: "validate commit object",
             message: "approved object is not a commit".to_owned(),
         });
@@ -2701,6 +2848,7 @@ pub(super) fn require_local_commit(
     )?;
     if object_type != b"commit\n" {
         return Err(GitCommandError {
+            kind: GitCommandFailureKind::Io,
             operation: "validate commit object",
             message: "approved object is not a commit".to_owned(),
         });
@@ -3180,11 +3328,13 @@ fn count_reachable_inventory(
     .is_some()
     {
         count = count.checked_add(1).ok_or_else(|| GitCommandError {
+            kind: GitCommandFailureKind::Io,
             operation: "inventory fetched objects",
             message: "reachable object count overflow".to_owned(),
         })?;
         if count > limit {
             return Err(GitCommandError {
+                kind: GitCommandFailureKind::Io,
                 operation: "inventory fetched objects",
                 message: "reachable object count exceeds bound".to_owned(),
             });
@@ -3215,6 +3365,7 @@ fn immutable_edge_violation_from_reader(
             "immutable edge diff path exceeds byte limit",
         )?
         .ok_or_else(|| GitCommandError {
+            kind: GitCommandFailureKind::Io,
             operation: "validate immutable history edge",
             message: "immutable edge diff ended before a path".to_owned(),
         })?;
@@ -3294,6 +3445,7 @@ fn read_delimited_record(
     let mut record = Vec::new();
     loop {
         let available = reader.fill_buf().map_err(|error| GitCommandError {
+            kind: GitCommandFailureKind::Io,
             operation,
             message: error.to_string(),
         })?;
@@ -3302,6 +3454,7 @@ fn read_delimited_record(
                 Ok(None)
             } else {
                 Err(GitCommandError {
+                    kind: GitCommandFailureKind::Io,
                     operation,
                     message: truncated_message.to_owned(),
                 })
@@ -3313,11 +3466,13 @@ fn read_delimited_record(
             .len()
             .checked_add(take)
             .ok_or_else(|| GitCommandError {
+                kind: GitCommandFailureKind::Io,
                 operation,
                 message: overflow_message.to_owned(),
             })?;
         if length > limit {
             return Err(GitCommandError {
+                kind: GitCommandFailureKind::Io,
                 operation,
                 message: limit_message.to_owned(),
             });
@@ -3483,6 +3638,7 @@ impl CatFileBatch {
             });
         }
         let mut child = command.spawn().map_err(|error| GitCommandError {
+            kind: GitCommandFailureKind::Spawn,
             operation: OPERATION,
             message: error.to_string(),
         })?;
@@ -3490,6 +3646,7 @@ impl CatFileBatch {
         let Some(stdin) = child.stdin.take() else {
             terminate_process_group(pid, &mut child, true);
             return Err(GitCommandError {
+                kind: GitCommandFailureKind::ProcessControl,
                 operation: OPERATION,
                 message: "stdin pipe was not created".to_owned(),
             });
@@ -3497,6 +3654,7 @@ impl CatFileBatch {
         let Some(stdout) = child.stdout.take() else {
             terminate_process_group(pid, &mut child, true);
             return Err(GitCommandError {
+                kind: GitCommandFailureKind::ProcessControl,
                 operation: OPERATION,
                 message: "stdout pipe was not created".to_owned(),
             });
@@ -3504,6 +3662,7 @@ impl CatFileBatch {
         let Some(stderr) = child.stderr.take() else {
             terminate_process_group(pid, &mut child, true);
             return Err(GitCommandError {
+                kind: GitCommandFailureKind::ProcessControl,
                 operation: OPERATION,
                 message: "stderr pipe was not created".to_owned(),
             });
@@ -3549,7 +3708,7 @@ impl CatFileBatch {
     ) -> Result<Vec<u8>, super::GitAdmissionError> {
         const OPERATION: &str = "read canonical blob batch";
         if self.finished {
-            return Err(command_error(OPERATION, "cat-file batch is closed").into());
+            return Err(process_control_error(OPERATION, "cat-file batch is closed").into());
         }
         let request = CatFileRequest {
             expected: expected.clone(),
@@ -3558,11 +3717,11 @@ impl CatFileBatch {
         if self
             .request_tx
             .as_ref()
-            .ok_or_else(|| command_error(OPERATION, "cat-file request channel is closed"))?
+            .ok_or_else(|| process_control_error(OPERATION, "cat-file request channel is closed"))?
             .send(request)
             .is_err()
         {
-            let error = command_error(OPERATION, "cat-file request reader disconnected");
+            let error = process_control_error(OPERATION, "cat-file request reader disconnected");
             self.abort();
             return Err(error.into());
         }
@@ -3570,7 +3729,7 @@ impl CatFileBatch {
             let stdin = self
                 .stdin
                 .as_mut()
-                .ok_or_else(|| command_error(OPERATION, "cat-file stdin is closed"))?;
+                .ok_or_else(|| process_control_error(OPERATION, "cat-file stdin is closed"))?;
             stdin
                 .write_all(expected.as_hex().as_bytes())
                 .and_then(|()| stdin.write_all(b"\n"))
@@ -3584,7 +3743,11 @@ impl CatFileBatch {
         let started = Instant::now();
         loop {
             if self.stderr_overflow.load(Ordering::Acquire) {
-                let error = command_error(OPERATION, "bounded stderr exceeded");
+                let error = GitCommandError {
+                    kind: GitCommandFailureKind::StderrLimit,
+                    operation: OPERATION,
+                    message: "bounded stderr exceeded".to_owned(),
+                };
                 self.abort();
                 return Err(error.into());
             }
@@ -3611,7 +3774,7 @@ impl CatFileBatch {
                                 }
                                 Ok(Some(_) | None) => break,
                                 Err(source) => {
-                                    error = command_error(OPERATION, source).into();
+                                    error = process_control_error(OPERATION, source).into();
                                     break;
                                 }
                             }
@@ -3621,14 +3784,19 @@ impl CatFileBatch {
                     return Err(error);
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    let error = command_error(OPERATION, "cat-file response reader disconnected");
+                    let error =
+                        process_control_error(OPERATION, "cat-file response reader disconnected");
                     self.abort();
                     return Err(error.into());
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
             }
             if started.elapsed() >= self.timeout {
-                let error = command_error(OPERATION, "operation timed out");
+                let error = GitCommandError {
+                    operation: OPERATION,
+                    message: "operation timed out".to_owned(),
+                    kind: GitCommandFailureKind::Timeout,
+                };
                 self.abort();
                 return Err(error.into());
             }
@@ -3657,6 +3825,7 @@ impl CatFileBatch {
                     Ok(value) => status = value,
                     Err(error) => {
                         let error = GitCommandError {
+                            kind: GitCommandFailureKind::ProcessControl,
                             operation: OPERATION,
                             message: error.to_string(),
                         };
@@ -3666,16 +3835,20 @@ impl CatFileBatch {
                 }
             }
             let failure = if self.stderr_overflow.load(Ordering::Acquire) {
-                Some("bounded stderr exceeded")
+                Some((
+                    "bounded stderr exceeded",
+                    GitCommandFailureKind::StderrLimit,
+                ))
             } else if started.elapsed() >= self.timeout {
-                Some("operation timed out")
+                Some(("operation timed out", GitCommandFailureKind::Timeout))
             } else {
                 None
             };
-            if let Some(message) = failure {
+            if let Some((message, kind)) = failure {
                 let error = GitCommandError {
                     operation: OPERATION,
                     message: message.to_owned(),
+                    kind,
                 };
                 self.abort();
                 return Err(error);
@@ -3691,6 +3864,7 @@ impl CatFileBatch {
             .expect("open batch owns response reader")
             .join()
             .map_err(|_| GitCommandError {
+                kind: GitCommandFailureKind::ProcessControl,
                 operation: OPERATION,
                 message: "cat-file response reader panicked".to_owned(),
             })?;
@@ -3699,6 +3873,7 @@ impl CatFileBatch {
             .expect("open batch owns stderr reader")
             .join()
             .map_err(|_| GitCommandError {
+                kind: GitCommandFailureKind::ProcessControl,
                 operation: OPERATION,
                 message: "cat-file stderr reader panicked".to_owned(),
             })?;
@@ -3706,6 +3881,7 @@ impl CatFileBatch {
         let stderr = stderr.expect("finish waits for stderr");
         if !status.success() {
             return Err(GitCommandError {
+                kind: GitCommandFailureKind::NonZeroExit,
                 operation: OPERATION,
                 message: format!(
                     "process exited with {status}: {}",
@@ -3762,6 +3938,7 @@ fn stream_tree_listing(
         });
     }
     let mut child = command.spawn().map_err(|error| GitCommandError {
+        kind: GitCommandFailureKind::Spawn,
         operation: OPERATION,
         message: error.to_string(),
     })?;
@@ -3769,6 +3946,7 @@ fn stream_tree_listing(
     let Some(stdout) = child.stdout.take() else {
         terminate_process_group(pid, &mut child, true);
         return Err(GitCommandError {
+            kind: GitCommandFailureKind::ProcessControl,
             operation: OPERATION,
             message: "stdout pipe was not created".to_owned(),
         }
@@ -3777,6 +3955,7 @@ fn stream_tree_listing(
     let Some(stderr) = child.stderr.take() else {
         terminate_process_group(pid, &mut child, true);
         return Err(GitCommandError {
+            kind: GitCommandFailureKind::ProcessControl,
             operation: OPERATION,
             message: "stderr pipe was not created".to_owned(),
         }
@@ -3805,6 +3984,7 @@ fn stream_tree_listing(
     while !listing_done && stream_error.is_none() {
         if overflow.load(Ordering::Acquire) {
             stream_error = Some(super::GitAdmissionError::Git(GitCommandError {
+                kind: GitCommandFailureKind::StderrLimit,
                 operation: OPERATION,
                 message: "bounded stderr exceeded".to_owned(),
             }));
@@ -3812,6 +3992,7 @@ fn stream_tree_listing(
         }
         if last_progress.elapsed() >= timeout {
             stream_error = Some(super::GitAdmissionError::Git(GitCommandError {
+                kind: GitCommandFailureKind::Timeout,
                 operation: OPERATION,
                 message: "operation timed out".to_owned(),
             }));
@@ -3832,6 +4013,7 @@ fn stream_tree_listing(
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 stream_error = Some(super::GitAdmissionError::Git(GitCommandError {
+                    kind: GitCommandFailureKind::ProcessControl,
                     operation: OPERATION,
                     message: "tree listing reader disconnected".to_owned(),
                 }));
@@ -3850,6 +4032,7 @@ fn stream_tree_listing(
                 Ok(value) => status = value,
                 Err(error) => {
                     stream_error = Some(super::GitAdmissionError::Git(GitCommandError {
+                        kind: GitCommandFailureKind::ProcessControl,
                         operation: OPERATION,
                         message: error.to_string(),
                     }));
@@ -3857,16 +4040,20 @@ fn stream_tree_listing(
             }
         }
         let failure = if overflow.load(Ordering::Acquire) {
-            Some("bounded stderr exceeded")
+            Some((
+                "bounded stderr exceeded",
+                GitCommandFailureKind::StderrLimit,
+            ))
         } else if last_progress.elapsed() >= timeout {
-            Some("operation timed out")
+            Some(("operation timed out", GitCommandFailureKind::Timeout))
         } else {
             None
         };
-        if let Some(message) = failure {
+        if let Some((message, kind)) = failure {
             stream_error = Some(super::GitAdmissionError::Git(GitCommandError {
                 operation: OPERATION,
                 message: message.to_owned(),
+                kind,
             }));
         }
         if (status.is_none() || stderr.is_none()) && stream_error.is_none() {
@@ -3879,12 +4066,14 @@ fn stream_tree_listing(
     drop(entry_rx);
     if listing_reader.join().is_err() && stream_error.is_none() {
         stream_error = Some(super::GitAdmissionError::Git(GitCommandError {
+            kind: GitCommandFailureKind::ProcessControl,
             operation: OPERATION,
             message: "tree listing reader panicked".to_owned(),
         }));
     }
     if stderr_reader.join().is_err() && stream_error.is_none() {
         stream_error = Some(super::GitAdmissionError::Git(GitCommandError {
+            kind: GitCommandFailureKind::ProcessControl,
             operation: OPERATION,
             message: "stderr reader panicked".to_owned(),
         }));
@@ -3897,6 +4086,7 @@ fn stream_tree_listing(
             Ok(Err(error)) => {
                 if stream_error.is_none() {
                     stream_error = Some(super::GitAdmissionError::Git(GitCommandError {
+                        kind: GitCommandFailureKind::Io,
                         operation: OPERATION,
                         message: error.to_string(),
                     }));
@@ -3906,6 +4096,7 @@ fn stream_tree_listing(
             Err(_) => {
                 if stream_error.is_none() {
                     stream_error = Some(super::GitAdmissionError::Git(GitCommandError {
+                        kind: GitCommandFailureKind::ProcessControl,
                         operation: OPERATION,
                         message: "stderr reader disconnected".to_owned(),
                     }));
@@ -3920,6 +4111,7 @@ fn stream_tree_listing(
     let status = status.expect("successful listing records a child status");
     if !status.success() {
         return Err(super::GitAdmissionError::Git(GitCommandError {
+            kind: GitCommandFailureKind::NonZeroExit,
             operation: OPERATION,
             message: format!(
                 "process exited with {status}: {}",
@@ -4013,14 +4205,14 @@ mod tests {
     use super::{
         CatFileBatch, TreeDiffCursor, TreeListingCursor, audit_repository_metadata,
         checked_snapshot_total, clear_cat_file_response_send_hook, count_reachable_inventory,
-        immutable_edge_violation_from_reader, install_cat_file_response_send_hook,
-        read_cat_file_response, run_bounded_command, run_bounded_command_to_file,
+        immutable_edge_violation_from_reader, install_cat_file_response_send_hook, poll_reader,
+        poll_writer, read_cat_file_response, run_bounded_command, run_bounded_command_to_file,
         run_snapshot_command_to_file, stream_tree_listing,
     };
     use std::{
         io::{BufReader, Cursor, Read},
         process::Command,
-        sync::{Arc, Barrier},
+        sync::{Arc, Barrier, mpsc},
         thread,
         time::{Duration, Instant},
     };
@@ -4589,5 +4781,170 @@ sleep 3 >/dev/null &"#;
                 .expect_err("output bound");
         assert!(error.to_string().contains("bounded output exceeded"));
         assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn command_failures_carry_stable_failure_kinds() {
+        use super::GitCommandFailureKind;
+
+        let spawn = run_bounded_command(
+            Command::new("/nonexistent/wayjournal-git-probe"),
+            "spawn probe",
+            64,
+            64,
+            Duration::from_secs(2),
+        )
+        .expect_err("spawn failure");
+        assert_eq!(spawn.kind(), GitCommandFailureKind::Spawn);
+
+        let mut exit = Command::new("/bin/sh");
+        exit.args(["-c", "exit 3"]);
+        let captured = run_bounded_command(exit, "exit probe", 64, 64, Duration::from_secs(2))
+            .expect("captured non-zero exit");
+        assert!(!captured.status.success());
+        let non_zero = super::status_error("exit probe", captured.status);
+        assert_eq!(non_zero.kind(), GitCommandFailureKind::NonZeroExit);
+
+        let mut signaled = Command::new("/bin/sh");
+        signaled.args(["-c", "kill -9 $$"]);
+        let captured =
+            run_bounded_command(signaled, "signal probe", 64, 64, Duration::from_secs(2))
+                .expect("captured signal termination");
+        assert!(!captured.status.success());
+        let signal = super::status_error("signal probe", captured.status);
+        assert_eq!(signal.kind(), GitCommandFailureKind::NonZeroExit);
+
+        let mut slow = Command::new("/bin/sh");
+        slow.args(["-c", "sleep 30"]);
+        let timeout =
+            run_bounded_command(slow, "timeout probe", 64, 64, Duration::from_millis(100))
+                .expect_err("timeout");
+        assert_eq!(timeout.kind(), GitCommandFailureKind::Timeout);
+    }
+
+    #[test]
+    fn captured_output_limits_classify_their_stream() {
+        use super::GitCommandFailureKind;
+
+        let mut noisy = Command::new("/bin/sh");
+        noisy.args(["-c", "while :; do printf 0123456789abcdef; done"]);
+        let stdout_bound =
+            run_bounded_command(noisy, "stdout probe", 64, 65536, Duration::from_secs(2))
+                .expect_err("stdout bound");
+        assert_eq!(stdout_bound.kind(), GitCommandFailureKind::StdoutLimit);
+
+        let mut hissy = Command::new("/bin/sh");
+        hissy.args(["-c", "while :; do printf 0123456789abcdef 1>&2; done"]);
+        let stderr_bound =
+            run_bounded_command(hissy, "stderr probe", 65536, 64, Duration::from_secs(2))
+                .expect_err("stderr bound");
+        assert_eq!(stderr_bound.kind(), GitCommandFailureKind::StderrLimit);
+    }
+
+    #[test]
+    fn cat_file_batch_read_blob_classifies_its_failures() {
+        use super::GitCommandFailureKind;
+
+        let oid = "1111111111111111111111111111111111111111";
+        // A hostile child that floods stderr, survives the resulting broken pipe and never
+        // answers the request: the one shape that reaches the read path's stderr budget check
+        // instead of racing the child's own exit status.
+        let mut command = Command::new("/bin/sh");
+        command.args([
+            "-c",
+            "trap '' PIPE; IFS= read -r oid; while :; do printf 0123456789abcdef 1>&2 || :; done",
+        ]);
+        let expected = super::GitOid::parse(crate::GitObjectFormat::Sha1, oid).expect("OID");
+        let mut batch = CatFileBatch::spawn(command, Duration::from_secs(10)).expect("batch");
+
+        let breach = batch.read_blob(&expected, 3).expect_err("bounded stderr");
+        let super::super::GitAdmissionError::Git(breach) = breach else {
+            panic!("stderr breach lost its command error: {breach:?}");
+        };
+        assert_eq!(breach.kind(), GitCommandFailureKind::StderrLimit);
+
+        // The breach aborted the batch, so the next read fails on process state, not on I/O.
+        let closed = batch.read_blob(&expected, 3).expect_err("closed batch");
+        let super::super::GitAdmissionError::Git(closed) = closed else {
+            panic!("closed batch lost its command error: {closed:?}");
+        };
+        assert_eq!(closed.kind(), GitCommandFailureKind::ProcessControl);
+    }
+
+    #[test]
+    fn stream_pumps_separate_io_from_process_control() {
+        use super::GitCommandFailureKind;
+
+        let (reader_tx, reader_rx) = mpsc::channel::<std::io::Result<Vec<u8>>>();
+        reader_tx
+            .send(Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe)))
+            .expect("queue reader failure");
+        let failed = poll_reader(&reader_rx, "reader probe").expect_err("reader failure");
+        assert_eq!(failed.kind(), GitCommandFailureKind::Io);
+        drop(reader_tx);
+        let gone = poll_reader(&reader_rx, "reader probe").expect_err("reader disconnect");
+        assert_eq!(gone.kind(), GitCommandFailureKind::ProcessControl);
+
+        let (writer_tx, writer_rx) = mpsc::channel::<std::io::Result<usize>>();
+        writer_tx
+            .send(Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe)))
+            .expect("queue writer failure");
+        let failed = poll_writer(&writer_rx, "writer probe").expect_err("writer failure");
+        assert_eq!(failed.kind(), GitCommandFailureKind::Io);
+        drop(writer_tx);
+        let gone = poll_writer(&writer_rx, "writer probe").expect_err("writer disconnect");
+        assert_eq!(gone.kind(), GitCommandFailureKind::ProcessControl);
+    }
+
+    #[test]
+    fn file_spooled_output_limits_classify_their_stream() {
+        use super::{BoundedFileCommandError, GitCommandFailureKind};
+
+        let root =
+            std::env::temp_dir().join(format!("wayjournal-failure-kind-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir(&root).expect("root");
+
+        let stdout_target = std::fs::File::create(root.join("stdout")).expect("output file");
+        let mut noisy = Command::new("/bin/sh");
+        noisy.args(["-c", "while :; do printf 0123456789abcdef; done"]);
+        let stdout_bound = run_bounded_command_to_file(
+            noisy,
+            "stdout file probe",
+            stdout_target,
+            64,
+            65536,
+            Duration::from_secs(2),
+        )
+        .expect_err("stdout bound");
+        match stdout_bound {
+            BoundedFileCommandError::StdoutLimit(error) => {
+                assert_eq!(error.kind(), GitCommandFailureKind::StdoutLimit);
+            }
+            BoundedFileCommandError::Operational(error) => {
+                panic!("stdout overflow must classify as a stdout limit: {error}");
+            }
+        }
+
+        let stderr_target = std::fs::File::create(root.join("stderr")).expect("output file");
+        let mut hissy = Command::new("/bin/sh");
+        hissy.args(["-c", "while :; do printf 0123456789abcdef 1>&2; done"]);
+        let stderr_bound = run_bounded_command_to_file(
+            hissy,
+            "stderr file probe",
+            stderr_target,
+            65536,
+            64,
+            Duration::from_secs(2),
+        )
+        .expect_err("stderr bound");
+        match stderr_bound {
+            BoundedFileCommandError::Operational(error) => {
+                assert_eq!(error.kind(), GitCommandFailureKind::StderrLimit);
+            }
+            BoundedFileCommandError::StdoutLimit(error) => {
+                panic!("stderr overflow must not classify as a stdout limit: {error}");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
