@@ -327,9 +327,12 @@ fn main() {{
         fs::write({marker:?}, b"").unwrap();
     }}
     let mut log = OpenOptions::new().create(true).append(true).open({log:?}).unwrap();
-    write!(log, "D={{}} C={{}} W={{}}", env::var("GIT_DIR").unwrap_or_default(), env::var("GIT_COMMON_DIR").unwrap_or_default(), env::var("GIT_WORK_TREE").unwrap_or_default()).unwrap();
-    for arg in &args {{ write!(log, " <{{}}>", arg.to_string_lossy()).unwrap(); }}
-    writeln!(log).unwrap();
+    // The store keeps a cat-file batch child alive while it streams ls-tree, so two wrappers
+    // append here at once; one write per line keeps their records from interleaving.
+    let mut line = format!("D={{}} C={{}} W={{}}", env::var("GIT_DIR").unwrap_or_default(), env::var("GIT_COMMON_DIR").unwrap_or_default(), env::var("GIT_WORK_TREE").unwrap_or_default());
+    for arg in &args {{ line.push_str(&format!(" <{{}}>", arg.to_string_lossy())); }}
+    line.push('\n');
+    log.write_all(line.as_bytes()).unwrap();
     let status = Command::new({git:?}).args(&args).status().unwrap();
     std::process::exit(status.code().unwrap_or(127));
 }}

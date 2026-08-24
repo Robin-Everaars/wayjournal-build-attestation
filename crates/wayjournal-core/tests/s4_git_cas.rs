@@ -802,7 +802,11 @@ fn prepared_recovery_uses_constant_git_processes_for_many_additions() {
 fn main() {{
     let args = env::args_os().skip(1).collect::<Vec<_>>();
     let mut log = OpenOptions::new().create(true).append(true).open({log:?}).unwrap();
-    writeln!(log, "{{}}", args.iter().map(|arg| arg.to_string_lossy()).collect::<Vec<_>>().join(" ")).unwrap();
+    // Concurrent wrappers share this log, and a line split across writes merges with theirs,
+    // which would undercount the invocations asserted below; one write per line keeps it exact.
+    let mut line = args.iter().map(|arg| arg.to_string_lossy()).collect::<Vec<_>>().join(" ");
+    line.push('\n');
+    log.write_all(line.as_bytes()).unwrap();
     let status = Command::new({git:?}).args(&args).status().unwrap();
     std::process::exit(status.code().unwrap_or(127));
 }}
