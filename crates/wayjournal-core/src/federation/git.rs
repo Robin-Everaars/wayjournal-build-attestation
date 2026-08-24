@@ -4783,11 +4783,12 @@ sleep 3 >/dev/null &"#;
         assert!(started.elapsed() < Duration::from_secs(2));
     }
 
-    #[test]
-    fn command_failures_carry_stable_failure_kinds() {
-        use super::GitCommandFailureKind;
+    // One focused inducing test per GitCommandFailureKind. Grouping them would let a
+    // misclassification hide behind a sibling assertion in the same test.
 
-        let spawn = run_bounded_command(
+    #[test]
+    fn an_unlaunchable_child_induces_spawn() {
+        let error = run_bounded_command(
             Command::new("/nonexistent/wayjournal-git-probe"),
             "spawn probe",
             64,
@@ -4795,50 +4796,168 @@ sleep 3 >/dev/null &"#;
             Duration::from_secs(2),
         )
         .expect_err("spawn failure");
-        assert_eq!(spawn.kind(), GitCommandFailureKind::Spawn);
+        assert_eq!(error.kind(), super::GitCommandFailureKind::Spawn);
+    }
 
+    #[test]
+    fn a_coded_exit_induces_non_zero_exit() {
         let mut exit = Command::new("/bin/sh");
         exit.args(["-c", "exit 3"]);
+        // The captured runner reports a coded exit as Ok; callers convert through status_error.
         let captured = run_bounded_command(exit, "exit probe", 64, 64, Duration::from_secs(2))
             .expect("captured non-zero exit");
         assert!(!captured.status.success());
-        let non_zero = super::status_error("exit probe", captured.status);
-        assert_eq!(non_zero.kind(), GitCommandFailureKind::NonZeroExit);
+        let error = super::status_error("exit probe", captured.status);
+        assert_eq!(error.kind(), super::GitCommandFailureKind::NonZeroExit);
+    }
 
+    #[test]
+    fn a_signalled_child_induces_non_zero_exit() {
         let mut signaled = Command::new("/bin/sh");
         signaled.args(["-c", "kill -9 $$"]);
         let captured =
             run_bounded_command(signaled, "signal probe", 64, 64, Duration::from_secs(2))
                 .expect("captured signal termination");
         assert!(!captured.status.success());
-        let signal = super::status_error("signal probe", captured.status);
-        assert_eq!(signal.kind(), GitCommandFailureKind::NonZeroExit);
-
-        let mut slow = Command::new("/bin/sh");
-        slow.args(["-c", "sleep 30"]);
-        let timeout =
-            run_bounded_command(slow, "timeout probe", 64, 64, Duration::from_millis(100))
-                .expect_err("timeout");
-        assert_eq!(timeout.kind(), GitCommandFailureKind::Timeout);
+        let error = super::status_error("signal probe", captured.status);
+        assert_eq!(error.kind(), super::GitCommandFailureKind::NonZeroExit);
     }
 
     #[test]
-    fn captured_output_limits_classify_their_stream() {
-        use super::GitCommandFailureKind;
+    fn an_expired_deadline_induces_timeout() {
+        let mut slow = Command::new("/bin/sh");
+        slow.args(["-c", "sleep 30"]);
+        let error = run_bounded_command(slow, "timeout probe", 64, 64, Duration::from_millis(100))
+            .expect_err("timeout");
+        assert_eq!(error.kind(), super::GitCommandFailureKind::Timeout);
+    }
 
+    #[test]
+    fn a_breached_stdout_budget_induces_stdout_limit() {
         let mut noisy = Command::new("/bin/sh");
         noisy.args(["-c", "while :; do printf 0123456789abcdef; done"]);
+        let error = run_bounded_command(noisy, "stdout probe", 64, 65536, Duration::from_secs(2))
+            .expect_err("stdout bound");
+        assert_eq!(error.kind(), super::GitCommandFailureKind::StdoutLimit);
+    }
+
+    #[test]
+    fn a_breached_stderr_budget_induces_stderr_limit() {
+        let mut hissy = Command::new("/bin/sh");
+        hissy.args(["-c", "while :; do printf 0123456789abcdef 1>&2; done"]);
+        let error = run_bounded_command(hissy, "stderr probe", 65536, 64, Duration::from_secs(2))
+            .expect_err("stderr bound");
+        assert_eq!(error.kind(), super::GitCommandFailureKind::StderrLimit);
+    }
+
+    #[test]
+    fn a_failed_stream_pump_induces_io() {
+        let (reader_tx, reader_rx) = mpsc::channel::<std::io::Result<Vec<u8>>>();
+        reader_tx
+            .send(Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe)))
+            .expect("queue reader failure");
+        let error = poll_reader(&reader_rx, "reader probe").expect_err("reader failure");
+        assert_eq!(error.kind(), super::GitCommandFailureKind::Io);
+
+        let (writer_tx, writer_rx) = mpsc::channel::<std::io::Result<usize>>();
+        writer_tx
+            .send(Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe)))
+            .expect("queue writer failure");
+        let error = poll_writer(&writer_rx, "writer probe").expect_err("writer failure");
+        assert_eq!(error.kind(), super::GitCommandFailureKind::Io);
+    }
+
+    #[test]
+    fn a_departed_pump_thread_induces_process_control() {
+        let (reader_tx, reader_rx) = mpsc::channel::<std::io::Result<Vec<u8>>>();
+        drop(reader_tx);
+        let error = poll_reader(&reader_rx, "reader probe").expect_err("reader disconnect");
+        assert_eq!(error.kind(), super::GitCommandFailureKind::ProcessControl);
+
+        let (writer_tx, writer_rx) = mpsc::channel::<std::io::Result<usize>>();
+        drop(writer_tx);
+        let error = poll_writer(&writer_rx, "writer probe").expect_err("writer disconnect");
+        assert_eq!(error.kind(), super::GitCommandFailureKind::ProcessControl);
+    }
+
+    #[test]
+    fn every_failure_kind_serializes_without_the_command_details() {
+        const SENTINEL: &str = "SENTINEL_SECRET";
+
+        // The sentinel is planted everywhere Wayjournal itself controls: the program path,
+        // the arguments and the environment. None of it may reach the display text. A child's
+        // own stderr is a separate, explicitly non-authoritative channel.
+        let spawn = run_bounded_command(
+            Command::new(format!("/nonexistent/{SENTINEL}-git")),
+            "spawn probe",
+            64,
+            64,
+            Duration::from_secs(2),
+        )
+        .expect_err("spawn failure");
+
+        let mut slow = Command::new("/bin/sh");
+        slow.args(["-c", "sleep 30", SENTINEL])
+            .env(SENTINEL, SENTINEL);
+        let timeout =
+            run_bounded_command(slow, "timeout probe", 64, 64, Duration::from_millis(100))
+                .expect_err("timeout");
+
+        let mut noisy = Command::new("/bin/sh");
+        noisy
+            .args(["-c", "while :; do printf 0123456789abcdef; done", SENTINEL])
+            .env(SENTINEL, SENTINEL);
         let stdout_bound =
             run_bounded_command(noisy, "stdout probe", 64, 65536, Duration::from_secs(2))
                 .expect_err("stdout bound");
-        assert_eq!(stdout_bound.kind(), GitCommandFailureKind::StdoutLimit);
 
         let mut hissy = Command::new("/bin/sh");
-        hissy.args(["-c", "while :; do printf 0123456789abcdef 1>&2; done"]);
+        hissy
+            .args([
+                "-c",
+                "while :; do printf 0123456789abcdef 1>&2; done",
+                SENTINEL,
+            ])
+            .env(SENTINEL, SENTINEL);
         let stderr_bound =
             run_bounded_command(hissy, "stderr probe", 65536, 64, Duration::from_secs(2))
                 .expect_err("stderr bound");
-        assert_eq!(stderr_bound.kind(), GitCommandFailureKind::StderrLimit);
+
+        let mut exit = Command::new("/bin/sh");
+        exit.args(["-c", "exit 3", SENTINEL])
+            .env(SENTINEL, SENTINEL);
+        let captured = run_bounded_command(exit, "exit probe", 64, 64, Duration::from_secs(2))
+            .expect("captured non-zero exit");
+        let non_zero = super::status_error("exit probe", captured.status);
+
+        let (tx, rx) = mpsc::channel::<std::io::Result<Vec<u8>>>();
+        tx.send(Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe)))
+            .expect("queue reader failure");
+        let io = poll_reader(&rx, "reader probe").expect_err("reader failure");
+        drop(tx);
+        let control = poll_reader(&rx, "reader probe").expect_err("reader disconnect");
+
+        for error in [
+            spawn,
+            timeout,
+            stdout_bound,
+            stderr_bound,
+            non_zero,
+            io,
+            control,
+        ] {
+            let text = error.to_string();
+            assert!(
+                !text.contains(SENTINEL),
+                "{:?} leaked command details: {text}",
+                error.kind()
+            );
+            assert!(
+                text.starts_with(&format!("Git {} failed: ", error.operation())),
+                "{:?} broke the display contract: {text}",
+                error.kind()
+            );
+        }
     }
 
     #[test]
@@ -4869,31 +4988,6 @@ sleep 3 >/dev/null &"#;
             panic!("closed batch lost its command error: {closed:?}");
         };
         assert_eq!(closed.kind(), GitCommandFailureKind::ProcessControl);
-    }
-
-    #[test]
-    fn stream_pumps_separate_io_from_process_control() {
-        use super::GitCommandFailureKind;
-
-        let (reader_tx, reader_rx) = mpsc::channel::<std::io::Result<Vec<u8>>>();
-        reader_tx
-            .send(Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe)))
-            .expect("queue reader failure");
-        let failed = poll_reader(&reader_rx, "reader probe").expect_err("reader failure");
-        assert_eq!(failed.kind(), GitCommandFailureKind::Io);
-        drop(reader_tx);
-        let gone = poll_reader(&reader_rx, "reader probe").expect_err("reader disconnect");
-        assert_eq!(gone.kind(), GitCommandFailureKind::ProcessControl);
-
-        let (writer_tx, writer_rx) = mpsc::channel::<std::io::Result<usize>>();
-        writer_tx
-            .send(Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe)))
-            .expect("queue writer failure");
-        let failed = poll_writer(&writer_rx, "writer probe").expect_err("writer failure");
-        assert_eq!(failed.kind(), GitCommandFailureKind::Io);
-        drop(writer_tx);
-        let gone = poll_writer(&writer_rx, "writer probe").expect_err("writer disconnect");
-        assert_eq!(gone.kind(), GitCommandFailureKind::ProcessControl);
     }
 
     #[test]
