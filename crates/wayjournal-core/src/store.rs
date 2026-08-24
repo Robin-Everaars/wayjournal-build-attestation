@@ -985,8 +985,10 @@ impl Store {
     /// federation resolves these bytes ambiently and then requires the result
     /// to still name the retained root inode, failing closed when it does not.
     /// # Errors
-    /// Fails when the descriptor is not an ordinary directory, when built-ins
-    /// are absent, or for the same layout reasons as [`Store::open_strict`].
+    /// Fails when the descriptor is not an ordinary directory, cannot be
+    /// synchronized, or cannot yield an independent read-only root-lock
+    /// descriptor; when built-ins are absent; or for the same layout reasons as
+    /// [`Store::open_strict`].
     pub fn open_strict_retained_root(
         root: File,
         diagnostic_path: PathBuf,
@@ -995,6 +997,13 @@ impl Store {
     ) -> Result<Self, StoreError> {
         Self::require_strict_builtins(&registry)?;
         let root_dir = Arc::new(Directory::from_file(diagnostic_path.clone(), root, None)?);
+        // `fstat` alone accepts descriptors the store can never operate through:
+        // an `O_PATH` handle is a legal `mkdirat` target but cannot be synced,
+        // and a root without read permission cannot yield the root-lock
+        // descriptor every read takes. Refuse both here, while the reserved
+        // layout still does not exist, rather than after creating it.
+        root_dir.sync()?;
+        drop(root_dir.lock_file()?);
         Self::open_from_root(diagnostic_path, root_dir, registry, legacy, true)
     }
 

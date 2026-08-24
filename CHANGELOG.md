@@ -6,7 +6,7 @@ All notable user-visible changes to Wayjournal are recorded here. Wayjournal fol
 
 ### Added
 
-- `Store::open_strict_retained_root` opens a strict store from an already retained directory descriptor. The descriptor stays the root-lock authority, every reserved child is derived descriptor-relatively, and the diagnostic path is never an authority.
+- `Store::open_strict_retained_root` opens a strict store from an already retained directory descriptor. Before creating the layout, it rejects descriptors that cannot be synchronized or cannot yield an independent read-only root-lock descriptor. The retained descriptor stays the root-lock authority, every reserved child is derived descriptor-relatively, and the diagnostic path is never an authority.
 - `GitCommandError` carries a stable `GitCommandFailureKind` (`Spawn`, `Io`, `Timeout`, `NonZeroExit`, `StdoutLimit`, `StderrLimit`, `ProcessControl`) behind a `kind()` accessor, so consumers can classify a failed Git invocation without matching its message text.
 
 ### Changed
