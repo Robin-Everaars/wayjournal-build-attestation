@@ -148,13 +148,19 @@ pub enum RevisionError {
     NonCanonicalOrder(Vec<u8>),
 }
 
-pub(crate) struct CanonicalRevisionAccumulator {
+/// Incremental `wayjournal.store/blake3-framed-v1` revision computation.
+///
+/// Entries must be supplied in strictly increasing canonical path order. The
+/// accumulator copies only the previous path and never retains content bytes;
+/// callers remain responsible for bounding entry counts and aggregate bytes.
+pub struct StoreRevisionAccumulator {
     hasher: blake3::Hasher,
     previous_path: Option<Vec<u8>>,
 }
 
-impl CanonicalRevisionAccumulator {
-    pub(crate) fn new() -> Self {
+impl StoreRevisionAccumulator {
+    #[must_use]
+    pub fn new() -> Self {
         let mut hasher = blake3::Hasher::new();
         hasher.update(STORE_REVISION_DOMAIN);
         Self {
@@ -163,7 +169,12 @@ impl CanonicalRevisionAccumulator {
         }
     }
 
-    pub(crate) fn push(&mut self, path: &[u8], bytes: &[u8]) -> Result<(), RevisionError> {
+    /// Adds one regular canonical entry without retaining its content bytes.
+    ///
+    /// # Errors
+    /// Returns [`RevisionError`] for noncanonical, duplicate, or decreasing
+    /// paths. Resource bounds remain the caller's responsibility.
+    pub fn push(&mut self, path: &[u8], bytes: &[u8]) -> Result<(), RevisionError> {
         if !matches!(
             classify_path(path),
             PathClass::LegacyEvent
@@ -187,11 +198,18 @@ impl CanonicalRevisionAccumulator {
         Ok(())
     }
 
-    pub(crate) fn finish(self) -> StoreRevisionRef {
+    #[must_use]
+    pub fn finish(self) -> StoreRevisionRef {
         StoreRevisionRef {
             algorithm: RevisionAlgorithm::WayjournalBlake3FramedV1,
             digest: Digest::from_hash(self.hasher.finalize()),
         }
+    }
+}
+
+impl Default for StoreRevisionAccumulator {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -214,7 +232,7 @@ pub fn compute_store_revision(
     {
         return Err(RevisionError::DuplicatePath(path));
     }
-    let mut accumulator = CanonicalRevisionAccumulator::new();
+    let mut accumulator = StoreRevisionAccumulator::new();
     for entry in &entries {
         match classify_path(&entry.path) {
             PathClass::InvalidReserved => {
@@ -237,7 +255,7 @@ pub fn compute_store_revision(
 
 #[cfg(test)]
 mod streaming_tests {
-    use super::{CanonicalRevisionAccumulator, RevisionEntry, compute_store_revision};
+    use super::{RevisionEntry, StoreRevisionAccumulator, compute_store_revision};
 
     #[test]
     fn canonical_revision_accumulator_matches_sorted_revision_without_retaining_bytes() {
@@ -258,7 +276,7 @@ mod streaming_tests {
                 .map(|(path, bytes)| RevisionEntry::regular(*path, *bytes)),
         )
         .expect("revision");
-        let mut accumulator = CanonicalRevisionAccumulator::new();
+        let mut accumulator = StoreRevisionAccumulator::new();
         for (path, bytes) in entries {
             accumulator.push(path, bytes).expect("ordered entry");
         }
@@ -271,10 +289,10 @@ mod streaming_tests {
         let later =
             b"events/123e4567-e89b-42d3-a456-426614174000/01913f1d-8e2a-7c30-8f4a-426614174002.json";
         let earlier = b"batches/01913f1d-8e2a-7c30-8f4a-426614174012.json";
-        let mut duplicate = CanonicalRevisionAccumulator::new();
+        let mut duplicate = StoreRevisionAccumulator::new();
         duplicate.push(later, b"one").expect("first");
         assert!(duplicate.push(later, b"two").is_err());
-        let mut unordered = CanonicalRevisionAccumulator::new();
+        let mut unordered = StoreRevisionAccumulator::new();
         unordered.push(later, b"one").expect("first");
         assert!(unordered.push(earlier, b"two").is_err());
     }

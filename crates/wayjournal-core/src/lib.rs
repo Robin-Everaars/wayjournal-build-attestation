@@ -104,8 +104,8 @@ pub use record::{
 };
 pub use revision::{
     LEGACY_REVISION_ALGORITHM_V1, REVISION_ALGORITHM_V1, RevisionAlgorithm, RevisionAlgorithmError,
-    RevisionEntry, RevisionError, StoreRevisionParseError, StoreRevisionRef,
-    compute_store_revision,
+    RevisionEntry, RevisionError, StoreRevisionAccumulator, StoreRevisionParseError,
+    StoreRevisionRef, compute_store_revision,
 };
 pub use store::{
     CommitOutcome, ExclusiveSnapshot, LegacyEntry, LegacyEntrySource, LegacyStoreAdapter,

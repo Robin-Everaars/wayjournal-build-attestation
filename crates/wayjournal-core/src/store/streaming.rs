@@ -655,7 +655,7 @@ fn collect_facts(
     let mut idempotency = ExternalSorter::new(directory, replay.budget.clone());
     let mut claims = ExternalSorter::new(directory, replay.budget.clone());
     let mut headers = ExternalSorter::new(directory, replay.budget.clone());
-    let mut revision = crate::revision::CanonicalRevisionAccumulator::new();
+    let mut revision = crate::revision::StoreRevisionAccumulator::new();
     let mut cursor = replay.cursor()?;
     let mut manifest_count = 0;
     let mut record_count = 0;
