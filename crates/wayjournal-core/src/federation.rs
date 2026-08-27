@@ -325,11 +325,40 @@ impl GitSyncRequest {
             rustix::fs::Mode::empty(),
         )
         .map_err(|_| ApprovalError::InvalidGitExecutable)?;
-        let executable = File::from(descriptor);
+        Self::from_retained_executable(
+            git_executable,
+            File::from(descriptor),
+            local_trust,
+            approved_remote,
+        )
+    }
+
+    /// Creates one closed admission request from an already-retained Git executable.
+    ///
+    /// `git_executable` is an absolute diagnostic path only. This constructor validates and
+    /// retains `executable` directly; it does not reopen or compare the diagnostic pathname.
+    ///
+    /// # Errors
+    /// Rejects a relative diagnostic path, a descriptor that does not name an ordinary
+    /// executable file, or a descriptor without `CLOEXEC` set.
+    pub fn from_retained_executable(
+        git_executable: PathBuf,
+        executable: File,
+        local_trust: LocalTrustBinding,
+        approved_remote: ApprovedRemote,
+    ) -> Result<Self, ApprovalError> {
+        if !git_executable.is_absolute() {
+            return Err(ApprovalError::InvalidGitExecutable);
+        }
         let metadata = executable
             .metadata()
             .map_err(|_| ApprovalError::InvalidGitExecutable)?;
-        if !metadata.is_file() || metadata.mode() & 0o111 == 0 {
+        let descriptor_flags = rustix::io::fcntl_getfd(&executable)
+            .map_err(|_| ApprovalError::InvalidGitExecutable)?;
+        if !metadata.is_file()
+            || metadata.mode() & 0o111 == 0
+            || !descriptor_flags.contains(rustix::io::FdFlags::CLOEXEC)
+        {
             return Err(ApprovalError::InvalidGitExecutable);
         }
         Ok(Self {
@@ -1996,8 +2025,8 @@ mod descriptor_tests {
     use super::*;
     use crate::{LegacyEntry, LegacyStoreAdapter, Store, wayjournal_domain_registry};
     use std::{
-        fs,
-        os::unix::fs::symlink,
+        fs::{self, File},
+        os::unix::fs::{PermissionsExt, symlink},
         path::{Path, PathBuf},
         process::Command,
     };
@@ -2044,9 +2073,8 @@ mod descriptor_tests {
         );
     }
 
-    fn request() -> GitSyncRequest {
-        GitSyncRequest::new(
-            git(),
+    fn approval() -> (LocalTrustBinding, ApprovedRemote) {
+        (
             LocalTrustBinding::parse(
                 "3c4835897266c2b72f1ad9528309c6002f388071b0e9c780827bedbfaa35ce15",
             )
@@ -2056,7 +2084,101 @@ mod descriptor_tests {
                 ApprovedRef::parse("refs/heads/main").expect("ref"),
             ),
         )
-        .expect("request")
+    }
+
+    fn request() -> GitSyncRequest {
+        let (trust, remote) = approval();
+        GitSyncRequest::new(git(), trust, remote).expect("request")
+    }
+
+    #[test]
+    fn retained_executable_constructor_uses_the_consumed_inode_for_its_lifetime() {
+        let root = TestDir::new("retained-executable");
+        let diagnostic_path = root.0.join("git");
+        fs::copy(
+            std::env::current_exe().expect("test executable"),
+            &diagnostic_path,
+        )
+        .expect("copy executable A");
+        let executable = File::open(&diagnostic_path).expect("open executable A");
+        let (trust, remote) = approval();
+        let request = GitSyncRequest::from_retained_executable(
+            diagnostic_path.clone(),
+            executable,
+            trust,
+            remote,
+        )
+        .expect("retained request");
+
+        let retained_path = root.0.join("retained-a");
+        fs::rename(&diagnostic_path, &retained_path).expect("retain pathname A elsewhere");
+        fs::write(&diagnostic_path, b"replacement B").expect("replace pathname with B");
+        fs::set_permissions(&diagnostic_path, fs::Permissions::from_mode(0o700))
+            .expect("make replacement executable");
+        fs::remove_file(&retained_path).expect("remove every remaining name for A");
+
+        let output = Command::new(request.executable_proc_path())
+            .arg("--list")
+            .output()
+            .expect("execute retained A");
+        assert!(output.status.success(), "retained A did not execute");
+        assert_eq!(request.git_executable(), diagnostic_path);
+    }
+
+    #[test]
+    fn retained_executable_constructor_rejects_invalid_path_file_kind_mode_and_flags() {
+        let root = TestDir::new("invalid-retained-executable");
+        let executable_path = root.0.join("executable");
+        fs::copy(
+            std::env::current_exe().expect("test executable"),
+            &executable_path,
+        )
+        .expect("copy executable");
+        let (trust, remote) = approval();
+        assert!(
+            GitSyncRequest::from_retained_executable(
+                PathBuf::from("relative-git"),
+                File::open(&executable_path).expect("open executable"),
+                trust,
+                remote.clone(),
+            )
+            .is_err()
+        );
+        assert!(
+            GitSyncRequest::from_retained_executable(
+                root.0.join("directory"),
+                File::open(&root.0).expect("open directory"),
+                trust,
+                remote.clone(),
+            )
+            .is_err()
+        );
+
+        let non_executable_path = root.0.join("non-executable");
+        fs::write(&non_executable_path, b"not executable").expect("write non-executable");
+        let non_executable = File::open(&non_executable_path).expect("open non-executable");
+        assert!(
+            GitSyncRequest::from_retained_executable(
+                non_executable_path,
+                non_executable,
+                trust,
+                remote.clone(),
+            )
+            .is_err()
+        );
+
+        let missing_cloexec = File::open(&executable_path).expect("open executable");
+        rustix::io::fcntl_setfd(&missing_cloexec, rustix::io::FdFlags::empty())
+            .expect("clear CLOEXEC");
+        assert!(
+            GitSyncRequest::from_retained_executable(
+                executable_path,
+                missing_cloexec,
+                trust,
+                remote,
+            )
+            .is_err()
+        );
     }
 
     #[test]
