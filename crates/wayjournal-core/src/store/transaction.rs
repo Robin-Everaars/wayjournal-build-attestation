@@ -95,6 +95,11 @@ struct StagedManifest {
     manifest: BatchManifest,
     bytes: Vec<u8>,
 }
+struct ObservedTransactionRecovery {
+    journals: Vec<BatchId>,
+    stages: Vec<BatchId>,
+    union: Vec<BatchId>,
+}
 
 type Barrier<'a> = &'a mut dyn FnMut(CrashPoint) -> io::Result<()>;
 
@@ -123,6 +128,9 @@ fn operation_error_into_store(error: ExclusiveOperationError) -> StoreError {
         ExclusiveOperationError::Store(error) => error,
         ExclusiveOperationError::PendingCleanupRequired => StoreError::InvalidGitSyncState {
             message: "Git synchronization residue appeared during append".to_owned(),
+        },
+        ExclusiveOperationError::InvalidRecoveryObservation => StoreError::InvalidGitSyncState {
+            message: "invalid exclusive recovery observation".to_owned(),
         },
         ExclusiveOperationError::RecoveryRequired => StoreError::InvalidGitSyncState {
             message: "exclusive operation was not recovered".to_owned(),
@@ -192,11 +200,15 @@ impl ExclusiveStoreOperation<'_> {
         if self.invalidated {
             return Err(self.state_error());
         }
-        let git_cleanup_required = crate::federation::pending::gate_without_git(self.store())?
+        let git_cleanup_required = crate::federation::pending::gate_without_git(self.store())
+            .map_err(sanitize_recovery_observation_error)?
             == crate::federation::pending::GateAction::CleanDisposable;
-        let batch_ids = observe_transaction_recovery(self.store())?;
+        let observed = observe_transaction_recovery(self.store())
+            .map_err(|_| ExclusiveOperationError::InvalidRecoveryObservation)?;
         Ok(ExclusiveRecoveryObservation {
-            batch_ids,
+            journal_batch_ids: observed.journals,
+            stage_batch_ids: observed.stages,
+            batch_ids: observed.union,
             git_cleanup_required,
             _operation: std::marker::PhantomData,
         })
@@ -308,6 +320,15 @@ impl ExclusiveStoreOperation<'_> {
         RetainedStoreRoot {
             directory: &self.guard.store().root_dir,
         }
+    }
+}
+
+fn sanitize_recovery_observation_error(error: StoreError) -> ExclusiveOperationError {
+    match error {
+        StoreError::GitSyncPending { .. } | StoreError::ConflictingRecoveryState => {
+            ExclusiveOperationError::Store(error)
+        }
+        _ => ExclusiveOperationError::InvalidRecoveryObservation,
     }
 }
 
@@ -726,7 +747,7 @@ fn validate_recovery_base(
     Ok(())
 }
 
-fn observe_transaction_recovery(store: &Store) -> Result<Vec<BatchId>, StoreError> {
+fn observe_transaction_recovery(store: &Store) -> Result<ObservedTransactionRecovery, StoreError> {
     let journals = listed_journals(store)?;
     let stages = listed_stages(store)?;
     if journals
@@ -738,11 +759,15 @@ fn observe_transaction_recovery(store: &Store) -> Result<Vec<BatchId>, StoreErro
             "recovery journal has no matching stage directory",
         ));
     }
-    let mut ids = stages;
-    ids.extend(journals);
+    let mut ids = stages.clone();
+    ids.extend(journals.iter().copied());
     ids.sort_unstable();
     ids.dedup();
-    Ok(ids)
+    Ok(ObservedTransactionRecovery {
+        journals,
+        stages,
+        union: ids,
+    })
 }
 
 fn listed_journals(store: &Store) -> Result<Vec<BatchId>, StoreError> {
@@ -1366,7 +1391,7 @@ mod tests {
         ]
     }
     #[test]
-    fn recovery_observation_is_repeatable_sorted_and_deduplicated() {
+    fn recovery_observation_distinguishes_stage_only_from_journal_backed_ids() {
         let (root, _, store) = fixture_store("observe-recovery-ids");
         let first = "01913f1d-8e2a-7c30-8f4a-426614174097";
         let second = "01913f1d-8e2a-7c30-8f4a-426614174099";
@@ -1382,6 +1407,11 @@ mod tests {
 
         for _ in 0..2 {
             let observation = operation.observe_recovery_locked().unwrap();
+            assert_eq!(observation.journal_batch_ids(), &[second.parse().unwrap()]);
+            assert_eq!(
+                observation.stage_batch_ids(),
+                &[first.parse().unwrap(), second.parse().unwrap()]
+            );
             assert_eq!(
                 observation.batch_ids(),
                 &[first.parse().unwrap(), second.parse().unwrap()]
@@ -1414,15 +1444,38 @@ mod tests {
                 _ => unreachable!(),
             }
             let operation = store.begin_exclusive_operation().unwrap();
+            let error = operation
+                .observe_recovery_locked()
+                .expect_err("malformed observation must fail");
             assert!(matches!(
-                operation.observe_recovery_locked(),
-                Err(crate::ExclusiveOperationError::Store(
-                    StoreError::InvalidJournal { .. }
-                ))
+                error,
+                crate::ExclusiveOperationError::InvalidRecoveryObservation
             ));
+            assert_eq!(error.to_string(), "invalid recovery observation");
+            assert!(!format!("{error:?}").contains("not-a-batch-id"));
             drop(operation);
             fs::remove_dir_all(root).unwrap();
         }
+    }
+
+    #[test]
+    fn recovery_observation_sanitizes_malformed_git_pending_names() {
+        let (root, _, store) = fixture_store("observe-malformed-git-name");
+        let raw_name = "attacker-secret-pending-name";
+        fs::create_dir(root.join(".wayjournal-local/sync-pending").join(raw_name)).unwrap();
+        let operation = store.begin_exclusive_operation().unwrap();
+
+        let error = operation
+            .observe_recovery_locked()
+            .expect_err("malformed Git pending name must fail");
+        assert!(matches!(
+            error,
+            crate::ExclusiveOperationError::InvalidRecoveryObservation
+        ));
+        assert_eq!(error.to_string(), "invalid recovery observation");
+        assert!(!format!("{error:?}").contains(raw_name));
+        drop(operation);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1437,6 +1490,8 @@ mod tests {
         let mut operation = store.begin_exclusive_operation().unwrap();
 
         let observation = operation.observe_recovery_locked().unwrap();
+        assert!(observation.journal_batch_ids().is_empty());
+        assert!(observation.stage_batch_ids().is_empty());
         assert!(observation.batch_ids().is_empty());
         assert!(observation.git_cleanup_required());
         drop(observation);
@@ -1500,6 +1555,14 @@ mod tests {
         let before = inventory(&root);
         let mut operation = store.begin_exclusive_operation().unwrap();
         let observation = operation.observe_recovery_locked().unwrap();
+        assert_eq!(
+            observation.journal_batch_ids(),
+            &[batch.manifest().batch_id()]
+        );
+        assert_eq!(
+            observation.stage_batch_ids(),
+            &[batch.manifest().batch_id()]
+        );
         assert_eq!(observation.batch_ids(), &[batch.manifest().batch_id()]);
         assert!(!observation.git_cleanup_required());
         drop(observation);

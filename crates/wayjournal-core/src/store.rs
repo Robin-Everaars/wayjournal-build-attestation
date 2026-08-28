@@ -327,6 +327,8 @@ pub enum ExclusiveOperationError {
     StateInvalidated,
     #[error("Git synchronization residue appeared during the exclusive store operation")]
     PendingCleanupRequired,
+    #[error("invalid recovery observation")]
+    InvalidRecoveryObservation,
     #[error(transparent)]
     Store(#[from] StoreError),
 }
@@ -461,12 +463,29 @@ pub struct ExclusiveStoreOperation<'store> {
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct ExclusiveRecoveryObservation<'operation> {
+    pub(super) journal_batch_ids: Vec<BatchId>,
+    pub(super) stage_batch_ids: Vec<BatchId>,
     pub(super) batch_ids: Vec<BatchId>,
     pub(super) git_cleanup_required: bool,
     pub(super) _operation: std::marker::PhantomData<&'operation ()>,
 }
 impl ExclusiveRecoveryObservation<'_> {
-    /// Returns the sorted, unique ordinary transaction batch IDs.
+    /// Returns the sorted, unique IDs backed by published recovery journals.
+    #[must_use]
+    pub fn journal_batch_ids(&self) -> &[BatchId] {
+        &self.journal_batch_ids
+    }
+
+    /// Returns the sorted, unique IDs present as ordinary stage directories.
+    #[must_use]
+    pub fn stage_batch_ids(&self) -> &[BatchId] {
+        &self.stage_batch_ids
+    }
+
+    /// Returns the sorted, unique union of journal and stage batch IDs.
+    ///
+    /// Use the provenance-specific accessors when deciding whether residue may be adopted or
+    /// cleaned.
     #[must_use]
     pub fn batch_ids(&self) -> &[BatchId] {
         &self.batch_ids

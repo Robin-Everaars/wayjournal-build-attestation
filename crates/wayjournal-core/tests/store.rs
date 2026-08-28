@@ -419,6 +419,8 @@ fn exclusive_operation_compile_contract<'store>(
 ) -> Result<(CommitOutcome, StoreRevisionRef), ExclusiveOperationError> {
     let mut operation: ExclusiveStoreOperation<'store> = store.begin_exclusive_operation()?;
     let observation: ExclusiveRecoveryObservation<'_> = operation.observe_recovery_locked()?;
+    let _: &[wayjournal_core::BatchId] = observation.journal_batch_ids();
+    let _: &[wayjournal_core::BatchId] = observation.stage_batch_ids();
     let _: &[wayjournal_core::BatchId] = observation.batch_ids();
     let _: bool = observation.git_cleanup_required();
     drop(observation);
