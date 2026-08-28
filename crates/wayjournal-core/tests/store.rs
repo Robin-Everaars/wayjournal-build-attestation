@@ -4,15 +4,20 @@ use std::{
     fs,
     os::unix::fs::symlink,
     path::{Path, PathBuf},
-    sync::{Arc, Barrier, mpsc},
+    sync::{
+        Arc, Barrier,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
     thread,
     time::Duration,
 };
 
 use support::{BATCH_ID, RECORD_A, RECORD_B, note_record, registry};
 use wayjournal_core::{
-    AppendPreview, CommitOutcome, ExclusiveStoreOperation, LegacyEntry, LegacyStoreAdapter,
-    PathClass, PreparedBatch, Store, StoreCorruption, StoreError, StoreRevisionRef, prepare_batch,
+    AppendPreview, CommitOutcome, ExclusiveOperationError, ExclusiveStoreOperation, LegacyEntry,
+    LegacyStoreAdapter, PathClass, PreparedBatch, Store, StoreCorruption, StoreError,
+    StoreRevisionRef, prepare_batch,
 };
 
 struct TestDir(PathBuf);
@@ -54,6 +59,25 @@ impl LegacyStoreAdapter for FixtureLegacy {
             || entries[1].bytes() != b"legacy event\n"
         {
             return Err("frozen legacy pair is incomplete or malformed".to_owned());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct PendingInjectingLegacy {
+    root: PathBuf,
+    armed: AtomicBool,
+}
+impl LegacyStoreAdapter for PendingInjectingLegacy {
+    fn validate(&self, _: &[LegacyEntry<'_>]) -> Result<(), String> {
+        if self.armed.swap(false, Ordering::SeqCst) {
+            fs::create_dir(
+                self.root
+                    .join(".wayjournal-local/sync-pending")
+                    .join("01913f1d-8e2a-7c30-8f4a-426614174077"),
+            )
+            .map_err(|error| error.to_string())?;
         }
         Ok(())
     }
@@ -392,7 +416,7 @@ fn exclusive_operation_compile_contract<'store>(
     store: &'store Store,
     prepared: &PreparedBatch,
     expected: StoreRevisionRef,
-) -> Result<(CommitOutcome, StoreRevisionRef), StoreError> {
+) -> Result<(CommitOutcome, StoreRevisionRef), ExclusiveOperationError> {
     let mut operation: ExclusiveStoreOperation<'store> = store.begin_exclusive_operation()?;
     operation.recover_locked()?;
     let _root = operation.retained_root().duplicate_descriptor()?;
@@ -400,6 +424,138 @@ fn exclusive_operation_compile_contract<'store>(
     let _preview: AppendPreview = operation.preview_append_locked(prepared, expected)?;
     let (outcome, snapshot) = operation.append_locked(prepared, expected)?;
     Ok((outcome, snapshot.revision()))
+}
+
+#[test]
+fn locked_operation_requires_recovery_and_invalidates_after_failed_append() {
+    let directory = TestDir::new("exclusive-operation-state");
+    let store = store(directory.path()).expect("open");
+    let prepared = prepare_batch(
+        &[note_record(
+            RECORD_A,
+            "123e4567-e89b-42d3-a456-426614174000",
+            "locked state",
+        )],
+        "locked-state-key",
+        &registry(),
+    )
+    .expect("prepare");
+    let mut operation = store.begin_exclusive_operation().expect("begin operation");
+
+    assert!(matches!(
+        operation.snapshot_locked(),
+        Err(ExclusiveOperationError::RecoveryRequired)
+    ));
+    assert!(matches!(
+        operation.preview_append_locked(
+            &prepared,
+            StoreRevisionRef::parse(wayjournal_core::REVISION_ALGORITHM_V1, &"0".repeat(64))
+                .expect("revision")
+        ),
+        Err(ExclusiveOperationError::RecoveryRequired)
+    ));
+
+    operation.recover_locked().expect("recover");
+    let expected = operation.snapshot_locked().expect("snapshot").revision();
+    let wrong = StoreRevisionRef::parse(wayjournal_core::REVISION_ALGORITHM_V1, &"f".repeat(64))
+        .expect("wrong revision");
+    assert!(matches!(
+        operation.append_locked(&prepared, wrong),
+        Err(ExclusiveOperationError::Store(
+            StoreError::RevisionMismatch { .. }
+        ))
+    ));
+    assert!(matches!(
+        operation.snapshot_locked(),
+        Err(ExclusiveOperationError::StateInvalidated)
+    ));
+    assert!(matches!(
+        operation.preview_append_locked(&prepared, expected),
+        Err(ExclusiveOperationError::StateInvalidated)
+    ));
+    assert!(matches!(
+        operation.append_locked(&prepared, expected),
+        Err(ExclusiveOperationError::StateInvalidated)
+    ));
+
+    operation.recover_locked().expect("explicit recovery");
+    assert_eq!(
+        operation.snapshot_locked().expect("snapshot").revision(),
+        expected
+    );
+}
+
+#[test]
+fn locked_preview_rechecks_federation_pending_state_without_cleaning_it() {
+    let directory = TestDir::new("exclusive-operation-pending-preview");
+    let store = store(directory.path()).expect("open");
+    let prepared = prepare_batch(
+        &[note_record(
+            RECORD_A,
+            "123e4567-e89b-42d3-a456-426614174000",
+            "pending preview",
+        )],
+        "pending-preview-key",
+        &registry(),
+    )
+    .expect("prepare");
+    let mut operation = store.begin_exclusive_operation().expect("begin operation");
+    operation.recover_locked().expect("recover");
+    let expected = operation.snapshot_locked().expect("snapshot").revision();
+    let pending = directory
+        .path()
+        .join(".wayjournal-local/sync-pending")
+        .join("01913f1d-8e2a-7c30-8f4a-426614174076");
+    fs::create_dir(&pending).expect("disposable pending residue");
+
+    assert!(matches!(
+        operation.preview_append_locked(&prepared, expected),
+        Err(ExclusiveOperationError::PendingCleanupRequired)
+    ));
+    assert!(
+        pending.is_dir(),
+        "preview must not clean federation residue"
+    );
+}
+
+#[test]
+fn locked_append_rechecks_federation_pending_state_immediately_before_staging() {
+    let directory = TestDir::new("exclusive-operation-pending-race");
+    let legacy = Arc::new(PendingInjectingLegacy {
+        root: directory.path().to_owned(),
+        armed: AtomicBool::new(false),
+    });
+    let store =
+        Store::open_legacy_s1_s2(directory.path(), registry(), legacy.clone()).expect("open store");
+    let prepared = prepare_batch(
+        &[note_record(
+            RECORD_A,
+            "123e4567-e89b-42d3-a456-426614174000",
+            "pending race",
+        )],
+        "pending-race-key",
+        &registry(),
+    )
+    .expect("prepare");
+    let mut operation = store.begin_exclusive_operation().expect("begin operation");
+    operation.recover_locked().expect("recover");
+    let expected = operation.snapshot_locked().expect("snapshot").revision();
+    legacy.armed.store(true, Ordering::SeqCst);
+
+    assert!(matches!(
+        operation.append_locked(&prepared, expected),
+        Err(ExclusiveOperationError::PendingCleanupRequired)
+    ));
+    assert!(
+        fs::read_dir(directory.path().join(".wayjournal-local/stages"))
+            .expect("stages")
+            .next()
+            .is_none()
+    );
+    assert!(matches!(
+        operation.snapshot_locked(),
+        Err(ExclusiveOperationError::StateInvalidated)
+    ));
 }
 
 #[test]
@@ -447,6 +603,7 @@ fn locked_operation_previews_publishes_and_replays_without_reacquiring() {
     ));
     assert!(matches!(
         operation.preview_append_locked(&prepared, expected),
-        Err(StoreError::RevisionMismatch { actual, .. }) if actual == previewed
+        Err(ExclusiveOperationError::Store(StoreError::RevisionMismatch { actual, .. }))
+            if actual == previewed
     ));
 }

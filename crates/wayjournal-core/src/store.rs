@@ -311,14 +311,24 @@ pub enum StoreError {
     InvalidGitSyncState { message: String },
     #[error("Git synchronization pending state conflicts with ordinary transaction recovery")]
     ConflictingRecoveryState,
-    #[error("exclusive store operation requires successful recovery")]
-    RecoveryRequired,
     #[error("injected crash at {point}")]
     InjectedCrash { point: &'static str },
     #[error("batch operation failed: {0}")]
     Batch(#[from] BatchError),
     #[error("store corruption: {issue:?}")]
     Corrupt { issue: StoreCorruption },
+}
+
+#[derive(Debug, Error)]
+pub enum ExclusiveOperationError {
+    #[error("exclusive store operation requires successful recovery")]
+    RecoveryRequired,
+    #[error("exclusive store operation state was invalidated; recover it before continuing")]
+    StateInvalidated,
+    #[error("Git synchronization residue appeared during the exclusive store operation")]
+    PendingCleanupRequired,
+    #[error(transparent)]
+    Store(#[from] StoreError),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -441,17 +451,22 @@ pub struct ExclusiveStoreOperation<'store> {
     pub(super) guard: UnsnapshottedExclusive<'store>,
     pub(super) snapshot: Option<StoreSnapshot>,
     pub(super) recovered: bool,
+    pub(super) invalidated: bool,
 }
 
 /// A validated snapshot held under the retained root-directory inode lock.
 pub struct ExclusiveSnapshot<'store> {
-    snapshot: StoreSnapshot,
-    _operation: ExclusiveStoreOperation<'store>,
+    operation: ExclusiveStoreOperation<'store>,
 }
 impl ExclusiveSnapshot<'_> {
+    /// # Panics
+    /// Panics only if the private constructor violates its recovered-operation invariant.
     #[must_use]
     pub const fn snapshot(&self) -> &StoreSnapshot {
-        &self.snapshot
+        match self.operation.snapshot.as_ref() {
+            Some(snapshot) => snapshot,
+            None => panic!("exclusive snapshot invariant violated"),
+        }
     }
 }
 
@@ -1159,7 +1174,7 @@ impl Store {
             };
             if needs_exclusive {
                 let mut operation = self.begin_exclusive_operation()?;
-                operation.recover_locked()?;
+                transaction::recover_operation(&mut operation)?;
             }
         }
     }
@@ -1193,6 +1208,7 @@ impl Store {
             guard: self.lock_exclusive_unsnapshotted()?,
             snapshot: None,
             recovered: false,
+            invalidated: false,
         })
     }
 

@@ -465,6 +465,11 @@ fn exclusive_operation_blocks_an_authenticated_process_on_the_root_inode() {
     fs::create_dir(&root).expect("store root");
     let store = retained_store(&root, Arc::new(NoLegacy)).expect("open retained store");
     let operation = store.begin_exclusive_operation().expect("parent operation");
+    let duplicate = operation
+        .retained_root()
+        .duplicate_descriptor()
+        .expect("duplicate retained root");
+    duplicate.unlock().expect("unlock non-locking duplicate");
     let marker = directory.path().join("child-acquired");
 
     let mut child = Command::new(std::env::current_exe().expect("test executable"))

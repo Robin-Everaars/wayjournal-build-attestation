@@ -19,9 +19,9 @@ use crate::{
 };
 
 use super::{
-    AppendPreview, CommitOutcome, Directory, ExclusiveSnapshot, ExclusiveStoreOperation, RawFile,
-    RetainedStoreRoot, Store, StoreError, StoreSnapshot, enforce_limits, io_error,
-    read_file_bounded, scan_collected, scan_visible, visible_inventory,
+    AppendPreview, CommitOutcome, Directory, ExclusiveOperationError, ExclusiveSnapshot,
+    ExclusiveStoreOperation, RawFile, RetainedStoreRoot, Store, StoreError, StoreSnapshot,
+    enforce_limits, io_error, read_file_bounded, scan_collected, scan_visible, visible_inventory,
 };
 #[cfg(test)]
 use super::{RacePoint, race};
@@ -99,12 +99,14 @@ type Barrier<'a> = &'a mut dyn FnMut(CrashPoint) -> io::Result<()>;
 
 pub(super) fn exclusive_snapshot(store: &Store) -> Result<ExclusiveSnapshot<'_>, StoreError> {
     let mut operation = store.begin_exclusive_operation()?;
-    operation.recover_locked()?;
-    let snapshot = operation.snapshot_locked()?.clone();
-    Ok(ExclusiveSnapshot {
-        snapshot,
-        _operation: operation,
-    })
+    operation.recover_locked_with_barrier(&mut |_| Ok(()))?;
+    Ok(ExclusiveSnapshot { operation })
+}
+
+pub(super) fn recover_operation(
+    operation: &mut ExclusiveStoreOperation<'_>,
+) -> Result<(), StoreError> {
+    operation.recover_locked_with_barrier(&mut |_| Ok(()))
 }
 
 pub(super) fn append(
@@ -115,6 +117,30 @@ pub(super) fn append(
     append_inner(store, prepared, expected, &mut |_| Ok(()))
 }
 
+fn operation_error_into_store(error: ExclusiveOperationError) -> StoreError {
+    match error {
+        ExclusiveOperationError::Store(error) => error,
+        ExclusiveOperationError::PendingCleanupRequired => StoreError::InvalidGitSyncState {
+            message: "Git synchronization residue appeared during append".to_owned(),
+        },
+        ExclusiveOperationError::RecoveryRequired => StoreError::InvalidGitSyncState {
+            message: "exclusive operation was not recovered".to_owned(),
+        },
+        ExclusiveOperationError::StateInvalidated => StoreError::InvalidGitSyncState {
+            message: "exclusive operation state was invalidated".to_owned(),
+        },
+    }
+}
+
+fn require_pending_allow(store: &Store) -> Result<(), ExclusiveOperationError> {
+    match crate::federation::pending::gate_without_git(store)? {
+        crate::federation::pending::GateAction::Allow => Ok(()),
+        crate::federation::pending::GateAction::CleanDisposable => {
+            Err(ExclusiveOperationError::PendingCleanupRequired)
+        }
+    }
+}
+
 impl ExclusiveStoreOperation<'_> {
     fn store(&self) -> &Store {
         self.guard.store()
@@ -123,6 +149,7 @@ impl ExclusiveStoreOperation<'_> {
     fn recover_locked_with_barrier(&mut self, barrier: Barrier<'_>) -> Result<(), StoreError> {
         self.snapshot = None;
         self.recovered = false;
+        self.invalidated = false;
         let store = self.store();
         crate::federation::pending::clean_disposable_locked(store)?;
         if crate::federation::pending::gate_without_git(store)?
@@ -138,36 +165,52 @@ impl ExclusiveStoreOperation<'_> {
         Ok(())
     }
 
+    fn state_error(&self) -> ExclusiveOperationError {
+        if self.invalidated {
+            ExclusiveOperationError::StateInvalidated
+        } else {
+            ExclusiveOperationError::RecoveryRequired
+        }
+    }
+
+    fn invalidate(&mut self) {
+        self.snapshot = None;
+        self.recovered = false;
+        self.invalidated = true;
+    }
+
     /// Recovers transaction residue without reacquiring either operation lock.
     /// # Errors
     /// Returns pending-state, recovery, or canonical-validation failures.
-    pub fn recover_locked(&mut self) -> Result<(), StoreError> {
+    pub fn recover_locked(&mut self) -> Result<(), ExclusiveOperationError> {
         self.recover_locked_with_barrier(&mut |_| Ok(()))
+            .map_err(Into::into)
     }
 
     /// Returns the operation-owned validated snapshot.
     /// # Errors
-    /// Returns [`StoreError::RecoveryRequired`] before successful recovery.
-    pub fn snapshot_locked(&mut self) -> Result<&StoreSnapshot, StoreError> {
+    /// Returns an operation-state error before successful recovery or after invalidation.
+    pub fn snapshot_locked(&mut self) -> Result<&StoreSnapshot, ExclusiveOperationError> {
         if !self.recovered {
-            return Err(StoreError::RecoveryRequired);
+            return Err(self.state_error());
         }
-        self.snapshot.as_ref().ok_or(StoreError::RecoveryRequired)
+        self.snapshot.as_ref().ok_or_else(|| self.state_error())
     }
 
     /// Validates an append and predicts its exact canonical outcome without writing.
     /// # Errors
-    /// Returns recovery, revision, idempotency, ownership, fold, or resource-limit failures.
+    /// Returns operation-state, pending-state, revision, validation, or resource-limit failures.
     pub fn preview_append_locked(
         &mut self,
         prepared: &PreparedBatch,
         expected: StoreRevisionRef,
-    ) -> Result<AppendPreview, StoreError> {
+    ) -> Result<AppendPreview, ExclusiveOperationError> {
         if !self.recovered {
-            return Err(StoreError::RecoveryRequired);
+            return Err(self.state_error());
         }
-        let snapshot = self.snapshot.as_ref().ok_or(StoreError::RecoveryRequired)?;
-        preview_from_snapshot(self.store(), snapshot, prepared, expected)
+        require_pending_allow(self.store())?;
+        let snapshot = self.snapshot.as_ref().ok_or_else(|| self.state_error())?;
+        preview_from_snapshot(self.store(), snapshot, prepared, expected).map_err(Into::into)
     }
 
     fn append_locked_with_barrier<'operation>(
@@ -175,14 +218,27 @@ impl ExclusiveStoreOperation<'_> {
         prepared: &PreparedBatch,
         expected: StoreRevisionRef,
         barrier: Barrier<'_>,
-    ) -> Result<(CommitOutcome, &'operation StoreSnapshot), StoreError> {
-        let preview = self.preview_append_locked(prepared, expected)?;
+    ) -> Result<(CommitOutcome, &'operation StoreSnapshot), ExclusiveOperationError> {
+        if !self.recovered {
+            return Err(self.state_error());
+        }
+        let preview = match self.preview_append_locked(prepared, expected) {
+            Ok(preview) => preview,
+            Err(error) => {
+                self.invalidate();
+                return Err(error);
+            }
+        };
         match preview {
             AppendPreview::Replay { batch_id, revision } => {
-                let snapshot = self.snapshot.as_ref().ok_or(StoreError::RecoveryRequired)?;
+                let snapshot = self.snapshot.as_ref().ok_or_else(|| self.state_error())?;
                 Ok((CommitOutcome::Replay { batch_id, revision }, snapshot))
             }
             AppendPreview::Publish { .. } => {
+                if let Err(error) = require_pending_allow(self.store()) {
+                    self.invalidate();
+                    return Err(error);
+                }
                 self.snapshot = None;
                 let store = self.guard.store();
                 let result = (|| {
@@ -200,11 +256,13 @@ impl ExclusiveStoreOperation<'_> {
                 match result {
                     Ok((outcome, snapshot)) => {
                         self.snapshot = Some(snapshot);
-                        let snapshot =
-                            self.snapshot.as_ref().ok_or(StoreError::RecoveryRequired)?;
+                        let snapshot = self.snapshot.as_ref().ok_or_else(|| self.state_error())?;
                         Ok((outcome, snapshot))
                     }
-                    Err(error) => Err(error),
+                    Err(error) => {
+                        self.invalidate();
+                        Err(ExclusiveOperationError::Store(error))
+                    }
                 }
             }
         }
@@ -217,7 +275,7 @@ impl ExclusiveStoreOperation<'_> {
         &'operation mut self,
         prepared: &PreparedBatch,
         expected: StoreRevisionRef,
-    ) -> Result<(CommitOutcome, &'operation StoreSnapshot), StoreError> {
+    ) -> Result<(CommitOutcome, &'operation StoreSnapshot), ExclusiveOperationError> {
         self.append_locked_with_barrier(prepared, expected, &mut |_| Ok(()))
     }
 
@@ -265,6 +323,7 @@ fn append_inner(
     operation
         .append_locked_with_barrier(prepared, expected, barrier)
         .map(|(outcome, _)| outcome)
+        .map_err(operation_error_into_store)
 }
 
 fn classify_prepared(
@@ -1242,15 +1301,15 @@ mod tests {
             let expected = operation.snapshot_locked().unwrap().revision();
             assert!(matches!(
                 operation.preview_append_locked(&prepared, expected),
-                Err(StoreError::Corrupt {
+                Err(crate::ExclusiveOperationError::Store(StoreError::Corrupt {
                     issue: crate::StoreCorruption::InvalidDomainFold { .. }
-                })
+                }))
             ));
             assert!(matches!(
                 operation.append_locked(&prepared, expected),
-                Err(StoreError::Corrupt {
+                Err(crate::ExclusiveOperationError::Store(StoreError::Corrupt {
                     issue: crate::StoreCorruption::InvalidDomainFold { .. }
-                })
+                }))
             ));
             assert!(
                 fs::read_dir(root.join(".wayjournal-local/stages"))
@@ -1481,11 +1540,15 @@ mod tests {
         operation.recover_locked().unwrap();
         assert!(matches!(
             operation.preview_append_locked(&batch, empty),
-            Err(crate::StoreError::InvalidLayout { .. })
+            Err(crate::ExclusiveOperationError::Store(
+                crate::StoreError::InvalidLayout { .. }
+            ))
         ));
         assert!(matches!(
             operation.append_locked(&batch, empty),
-            Err(crate::StoreError::InvalidLayout { .. })
+            Err(crate::ExclusiveOperationError::Store(
+                crate::StoreError::InvalidLayout { .. }
+            ))
         ));
         assert!(
             fs::read_dir(root.join(".wayjournal-local/stages"))
