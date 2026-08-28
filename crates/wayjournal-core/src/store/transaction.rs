@@ -19,8 +19,9 @@ use crate::{
 };
 
 use super::{
-    CommitOutcome, Directory, ExclusiveSnapshot, RawFile, Store, StoreError, StoreSnapshot,
-    enforce_limits, io_error, read_file_bounded, scan_collected, scan_visible, visible_inventory,
+    AppendPreview, CommitOutcome, Directory, ExclusiveSnapshot, ExclusiveStoreOperation, RawFile,
+    RetainedStoreRoot, Store, StoreError, StoreSnapshot, enforce_limits, io_error,
+    read_file_bounded, scan_collected, scan_visible, visible_inventory,
 };
 #[cfg(test)]
 use super::{RacePoint, race};
@@ -97,16 +98,13 @@ struct StagedManifest {
 type Barrier<'a> = &'a mut dyn FnMut(CrashPoint) -> io::Result<()>;
 
 pub(super) fn exclusive_snapshot(store: &Store) -> Result<ExclusiveSnapshot<'_>, StoreError> {
-    let guard = store.lock_exclusive_unsnapshotted()?;
-    crate::federation::pending::clean_disposable_locked(store)?;
-    if crate::federation::pending::gate_without_git(store)?
-        != crate::federation::pending::GateAction::Allow
-    {
-        return Err(StoreError::InvalidGitSyncState {
-            message: "disposable pending cleanup did not converge".to_owned(),
-        });
-    }
-    guard.into_recovered_snapshot()
+    let mut operation = store.begin_exclusive_operation()?;
+    operation.recover_locked()?;
+    let snapshot = operation.snapshot_locked()?.clone();
+    Ok(ExclusiveSnapshot {
+        snapshot,
+        _operation: operation,
+    })
 }
 
 pub(super) fn append(
@@ -116,23 +114,128 @@ pub(super) fn append(
 ) -> Result<CommitOutcome, StoreError> {
     append_inner(store, prepared, expected, &mut |_| Ok(()))
 }
-fn append_inner(
+
+impl ExclusiveStoreOperation<'_> {
+    fn store(&self) -> &Store {
+        self.guard.store()
+    }
+
+    fn recover_locked_with_barrier(&mut self, barrier: Barrier<'_>) -> Result<(), StoreError> {
+        self.snapshot = None;
+        self.recovered = false;
+        let store = self.store();
+        crate::federation::pending::clean_disposable_locked(store)?;
+        if crate::federation::pending::gate_without_git(store)?
+            != crate::federation::pending::GateAction::Allow
+        {
+            return Err(StoreError::InvalidGitSyncState {
+                message: "disposable pending cleanup did not converge".to_owned(),
+            });
+        }
+        recover_locked(store, barrier)?;
+        self.snapshot = Some(scan_visible(store)?);
+        self.recovered = true;
+        Ok(())
+    }
+
+    /// Recovers transaction residue without reacquiring either operation lock.
+    /// # Errors
+    /// Returns pending-state, recovery, or canonical-validation failures.
+    pub fn recover_locked(&mut self) -> Result<(), StoreError> {
+        self.recover_locked_with_barrier(&mut |_| Ok(()))
+    }
+
+    /// Returns the operation-owned validated snapshot.
+    /// # Errors
+    /// Returns [`StoreError::RecoveryRequired`] before successful recovery.
+    pub fn snapshot_locked(&mut self) -> Result<&StoreSnapshot, StoreError> {
+        if !self.recovered {
+            return Err(StoreError::RecoveryRequired);
+        }
+        self.snapshot.as_ref().ok_or(StoreError::RecoveryRequired)
+    }
+
+    /// Validates an append and predicts its exact canonical outcome without writing.
+    /// # Errors
+    /// Returns recovery, revision, idempotency, ownership, fold, or resource-limit failures.
+    pub fn preview_append_locked(
+        &mut self,
+        prepared: &PreparedBatch,
+        expected: StoreRevisionRef,
+    ) -> Result<AppendPreview, StoreError> {
+        if !self.recovered {
+            return Err(StoreError::RecoveryRequired);
+        }
+        let snapshot = self.snapshot.as_ref().ok_or(StoreError::RecoveryRequired)?;
+        preview_from_snapshot(self.store(), snapshot, prepared, expected)
+    }
+
+    fn append_locked_with_barrier<'operation>(
+        &'operation mut self,
+        prepared: &PreparedBatch,
+        expected: StoreRevisionRef,
+        barrier: Barrier<'_>,
+    ) -> Result<(CommitOutcome, &'operation StoreSnapshot), StoreError> {
+        let preview = self.preview_append_locked(prepared, expected)?;
+        match preview {
+            AppendPreview::Replay { batch_id, revision } => {
+                let snapshot = self.snapshot.as_ref().ok_or(StoreError::RecoveryRequired)?;
+                Ok((CommitOutcome::Replay { batch_id, revision }, snapshot))
+            }
+            AppendPreview::Publish { .. } => {
+                self.snapshot = None;
+                let store = self.guard.store();
+                let result = (|| {
+                    stage_batch(store, prepared, expected, barrier)?;
+                    recover_one(store, prepared.manifest().batch_id(), barrier)?;
+                    let committed = scan_visible(store)?;
+                    Ok((
+                        CommitOutcome::Published {
+                            batch_id: prepared.manifest().batch_id(),
+                            revision: committed.revision(),
+                        },
+                        committed,
+                    ))
+                })();
+                match result {
+                    Ok((outcome, snapshot)) => {
+                        self.snapshot = Some(snapshot);
+                        let snapshot =
+                            self.snapshot.as_ref().ok_or(StoreError::RecoveryRequired)?;
+                        Ok((outcome, snapshot))
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+        }
+    }
+
+    /// Appends under the continuously held operation locks and returns its committed snapshot.
+    /// # Errors
+    /// Returns the same failures as preview plus staging, durability, or recovery failures.
+    pub fn append_locked<'operation>(
+        &'operation mut self,
+        prepared: &PreparedBatch,
+        expected: StoreRevisionRef,
+    ) -> Result<(CommitOutcome, &'operation StoreSnapshot), StoreError> {
+        self.append_locked_with_barrier(prepared, expected, &mut |_| Ok(()))
+    }
+
+    /// Returns descriptor-only proof of the exact root inode retained by this operation.
+    #[must_use]
+    pub fn retained_root(&self) -> RetainedStoreRoot<'_> {
+        RetainedStoreRoot {
+            directory: &self.guard.store().root_dir,
+        }
+    }
+}
+
+fn preview_from_snapshot(
     store: &Store,
+    snapshot: &StoreSnapshot,
     prepared: &PreparedBatch,
     expected: StoreRevisionRef,
-    barrier: Barrier<'_>,
-) -> Result<CommitOutcome, StoreError> {
-    let _guard = store.lock_exclusive_unsnapshotted()?;
-    crate::federation::pending::clean_disposable_locked(store)?;
-    if crate::federation::pending::gate_without_git(store)?
-        != crate::federation::pending::GateAction::Allow
-    {
-        return Err(StoreError::InvalidGitSyncState {
-            message: "disposable pending cleanup did not converge".to_owned(),
-        });
-    }
-    recover_locked(store, barrier)?;
-    let snapshot = scan_visible(store)?;
+) -> Result<AppendPreview, StoreError> {
     if snapshot.revision() != expected {
         return Err(StoreError::RevisionMismatch {
             expected,
@@ -140,19 +243,28 @@ fn append_inner(
         });
     }
     if let Some(batch_id) = classify_prepared(snapshot.manifests(), prepared)? {
-        return Ok(CommitOutcome::Replay {
+        return Ok(AppendPreview::Replay {
             batch_id,
             revision: snapshot.revision(),
         });
     }
-    validate_candidate(store, prepared)?;
-    stage_batch(store, prepared, snapshot.revision(), barrier)?;
-    recover_one(store, prepared.manifest().batch_id(), barrier)?;
-    let committed = scan_visible(store)?;
-    Ok(CommitOutcome::Published {
-        batch_id: prepared.manifest().batch_id(),
-        revision: committed.revision(),
+    let candidate = validate_candidate(store, prepared)?;
+    Ok(AppendPreview::Publish {
+        revision: candidate.revision(),
     })
+}
+
+fn append_inner(
+    store: &Store,
+    prepared: &PreparedBatch,
+    expected: StoreRevisionRef,
+    barrier: Barrier<'_>,
+) -> Result<CommitOutcome, StoreError> {
+    let mut operation = store.begin_exclusive_operation()?;
+    operation.recover_locked_with_barrier(barrier)?;
+    operation
+        .append_locked_with_barrier(prepared, expected, barrier)
+        .map(|(outcome, _)| outcome)
 }
 
 fn classify_prepared(
@@ -1121,6 +1233,38 @@ mod tests {
         ]
     }
     #[test]
+    fn preview_and_append_share_all_strict_builtin_fold_rejections() {
+        for (label, records) in recovery_hostiles() {
+            let (root, registry, store) = strict_fixture(&format!("preview-{label}"));
+            let prepared = prepare_batch(&records, label, &registry).unwrap();
+            let mut operation = store.begin_exclusive_operation().unwrap();
+            operation.recover_locked().unwrap();
+            let expected = operation.snapshot_locked().unwrap().revision();
+            assert!(matches!(
+                operation.preview_append_locked(&prepared, expected),
+                Err(StoreError::Corrupt {
+                    issue: crate::StoreCorruption::InvalidDomainFold { .. }
+                })
+            ));
+            assert!(matches!(
+                operation.append_locked(&prepared, expected),
+                Err(StoreError::Corrupt {
+                    issue: crate::StoreCorruption::InvalidDomainFold { .. }
+                })
+            ));
+            assert!(
+                fs::read_dir(root.join(".wayjournal-local/stages"))
+                    .unwrap()
+                    .next()
+                    .is_none(),
+                "{label}"
+            );
+            drop(operation);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
     fn post_journal_published_recovery_rejects_all_semantic_hostiles_and_cleans_residue() {
         for (label, records) in recovery_hostiles() {
             let (root, registry, store) = strict_fixture(label);
@@ -1315,7 +1459,7 @@ mod tests {
     }
 
     #[test]
-    fn reduced_limit_append_and_partial_recovery_refuse_before_unreadable_publication() {
+    fn reduced_limit_preview_append_and_partial_recovery_refuse_before_unreadable_publication() {
         fn limits(entries: usize) -> impl Drop {
             struct Reset;
             impl Drop for Reset {
@@ -1333,8 +1477,14 @@ mod tests {
         let empty = store.read().unwrap().revision();
         let batch = prepare_batch(&records(), "candidate-limit-append", &registry).unwrap();
         let guard = limits(7);
+        let mut operation = store.begin_exclusive_operation().unwrap();
+        operation.recover_locked().unwrap();
         assert!(matches!(
-            store.append(&batch, empty),
+            operation.preview_append_locked(&batch, empty),
+            Err(crate::StoreError::InvalidLayout { .. })
+        ));
+        assert!(matches!(
+            operation.append_locked(&batch, empty),
             Err(crate::StoreError::InvalidLayout { .. })
         ));
         assert!(
@@ -1343,10 +1493,22 @@ mod tests {
                 .next()
                 .is_none()
         );
+        drop(operation);
         drop(guard);
         let guard = limits(8);
-        store.append(&batch, empty).unwrap();
-        assert_eq!(store.read().unwrap().records().len(), 2);
+        let mut operation = store.begin_exclusive_operation().unwrap();
+        operation.recover_locked().unwrap();
+        let preview = operation.preview_append_locked(&batch, empty).unwrap();
+        let (outcome, snapshot) = operation.append_locked(&batch, empty).unwrap();
+        assert!(matches!(
+            (preview, outcome),
+            (
+                crate::AppendPreview::Publish { revision: preview },
+                crate::CommitOutcome::Published { revision, .. }
+            ) if preview == revision && snapshot.revision() == revision
+        ));
+        assert_eq!(snapshot.records().len(), 2);
+        drop(operation);
         drop(guard);
         fs::remove_dir_all(root).unwrap();
 
@@ -1376,6 +1538,27 @@ mod tests {
         let guard = limits(8);
         assert_eq!(store.read().unwrap().records().len(), 2);
         drop(guard);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn one_operation_recovers_then_previews_and_replays_interrupted_publication() {
+        let (root, _, store, batch) = interrupted("locked-recover-preview-append");
+        let mut operation = store.begin_exclusive_operation().unwrap();
+        operation.recover_locked().unwrap();
+        let recovered = operation.snapshot_locked().unwrap().revision();
+        assert!(matches!(
+            operation.preview_append_locked(&batch, recovered).unwrap(),
+            crate::AppendPreview::Replay { revision, .. } if revision == recovered
+        ));
+        let (outcome, snapshot) = operation.append_locked(&batch, recovered).unwrap();
+        assert!(matches!(
+            outcome,
+            crate::CommitOutcome::Replay { revision, .. } if revision == recovered
+        ));
+        assert_eq!(snapshot.revision(), recovered);
+        assert_eq!(snapshot.records().len(), 2);
+        drop(operation);
         fs::remove_dir_all(root).unwrap();
     }
 

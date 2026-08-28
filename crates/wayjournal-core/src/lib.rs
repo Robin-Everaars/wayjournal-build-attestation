@@ -108,7 +108,7 @@ pub use revision::{
     StoreRevisionRef, compute_store_revision,
 };
 pub use store::{
-    CommitOutcome, ExclusiveSnapshot, LegacyEntry, LegacyEntrySource, LegacyStoreAdapter,
-    LegacyStreamRequirement, LegacyStreamingError, MAX_LEGACY_FILE_BYTES, Store, StoreCorruption,
-    StoreError, StoreSnapshot,
+    AppendPreview, CommitOutcome, ExclusiveSnapshot, ExclusiveStoreOperation, LegacyEntry,
+    LegacyEntrySource, LegacyStoreAdapter, LegacyStreamRequirement, LegacyStreamingError,
+    MAX_LEGACY_FILE_BYTES, RetainedStoreRoot, Store, StoreCorruption, StoreError, StoreSnapshot,
 };

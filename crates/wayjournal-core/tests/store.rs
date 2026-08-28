@@ -11,8 +11,8 @@ use std::{
 
 use support::{BATCH_ID, RECORD_A, RECORD_B, note_record, registry};
 use wayjournal_core::{
-    CommitOutcome, LegacyEntry, LegacyStoreAdapter, PathClass, Store, StoreCorruption, StoreError,
-    prepare_batch,
+    AppendPreview, CommitOutcome, ExclusiveStoreOperation, LegacyEntry, LegacyStoreAdapter,
+    PathClass, PreparedBatch, Store, StoreCorruption, StoreError, StoreRevisionRef, prepare_batch,
 };
 
 struct TestDir(PathBuf);
@@ -385,4 +385,68 @@ fn local_state_is_excluded_from_revision() {
     );
     let after = store.read().expect("read after local file").revision();
     assert_eq!(before, after);
+}
+
+#[allow(dead_code)]
+fn exclusive_operation_compile_contract<'store>(
+    store: &'store Store,
+    prepared: &PreparedBatch,
+    expected: StoreRevisionRef,
+) -> Result<(CommitOutcome, StoreRevisionRef), StoreError> {
+    let mut operation: ExclusiveStoreOperation<'store> = store.begin_exclusive_operation()?;
+    operation.recover_locked()?;
+    let _root = operation.retained_root().duplicate_descriptor()?;
+    let _snapshot: &wayjournal_core::StoreSnapshot = operation.snapshot_locked()?;
+    let _preview: AppendPreview = operation.preview_append_locked(prepared, expected)?;
+    let (outcome, snapshot) = operation.append_locked(prepared, expected)?;
+    Ok((outcome, snapshot.revision()))
+}
+
+#[test]
+fn locked_operation_previews_publishes_and_replays_without_reacquiring() {
+    let directory = TestDir::new("exclusive-operation");
+    let store = store(directory.path()).expect("open");
+    let prepared = prepare_batch(
+        &[note_record(
+            RECORD_A,
+            "123e4567-e89b-42d3-a456-426614174000",
+            "locked",
+        )],
+        "locked-key",
+        &registry(),
+    )
+    .expect("prepare");
+
+    let mut operation = store.begin_exclusive_operation().expect("begin operation");
+    operation.recover_locked().expect("recover");
+    let expected = operation.snapshot_locked().expect("snapshot").revision();
+    let AppendPreview::Publish {
+        revision: previewed,
+    } = operation
+        .preview_append_locked(&prepared, expected)
+        .expect("preview publish")
+    else {
+        panic!("new batch must preview publication");
+    };
+    assert_ne!(previewed, expected);
+
+    let (outcome, committed) = operation
+        .append_locked(&prepared, expected)
+        .expect("append under same operation");
+    assert!(matches!(
+        outcome,
+        CommitOutcome::Published { revision, .. } if revision == previewed
+    ));
+    assert_eq!(committed.revision(), previewed);
+
+    assert!(matches!(
+        operation
+            .preview_append_locked(&prepared, previewed)
+            .expect("preview replay"),
+        AppendPreview::Replay { revision, .. } if revision == previewed
+    ));
+    assert!(matches!(
+        operation.preview_append_locked(&prepared, expected),
+        Err(StoreError::RevisionMismatch { actual, .. }) if actual == previewed
+    ));
 }

@@ -311,12 +311,25 @@ pub enum StoreError {
     InvalidGitSyncState { message: String },
     #[error("Git synchronization pending state conflicts with ordinary transaction recovery")]
     ConflictingRecoveryState,
+    #[error("exclusive store operation requires successful recovery")]
+    RecoveryRequired,
     #[error("injected crash at {point}")]
     InjectedCrash { point: &'static str },
     #[error("batch operation failed: {0}")]
     Batch(#[from] BatchError),
     #[error("store corruption: {issue:?}")]
     Corrupt { issue: StoreCorruption },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppendPreview {
+    Publish {
+        revision: StoreRevisionRef,
+    },
+    Replay {
+        batch_id: BatchId,
+        revision: StoreRevisionRef,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -390,11 +403,50 @@ impl StoreSnapshot {
     }
 }
 
+/// Descriptor-only proof of the store root retained by a live exclusive operation.
+///
+/// The duplicate returned here is derived from the retained inode and does not carry the
+/// operation's independently opened flock, so callers cannot unlock the operation through it.
+pub struct RetainedStoreRoot<'operation> {
+    directory: &'operation Directory,
+}
+impl RetainedStoreRoot<'_> {
+    /// Duplicates the retained root descriptor without ambient path discovery.
+    /// # Errors
+    /// Returns a store I/O error when the descriptor cannot be duplicated.
+    pub fn duplicate_descriptor(&self) -> Result<File, StoreError> {
+        self.directory.file.try_clone().map_err(|source| {
+            io_error(
+                "duplicate retained store root",
+                &self.directory.path,
+                source,
+            )
+        })
+    }
+
+    /// Reports whether `descriptor` identifies this exact retained root inode.
+    /// # Errors
+    /// Returns a store I/O error when either descriptor cannot be inspected.
+    pub fn is_same_root(&self, descriptor: &File) -> Result<bool, StoreError> {
+        Directory::file_is_same(&self.directory.file, descriptor)
+    }
+}
+
+/// One operation continuously retaining process-local write exclusion and the root-inode flock.
+///
+/// Acquisition is deliberately not reentrant: beginning a nested operation on the same store
+/// blocks according to the underlying write-lock semantics. Call locked methods on this value
+/// instead of reacquiring through [`Store`].
+pub struct ExclusiveStoreOperation<'store> {
+    pub(super) guard: UnsnapshottedExclusive<'store>,
+    pub(super) snapshot: Option<StoreSnapshot>,
+    pub(super) recovered: bool,
+}
+
 /// A validated snapshot held under the retained root-directory inode lock.
-pub struct ExclusiveSnapshot<'a> {
+pub struct ExclusiveSnapshot<'store> {
     snapshot: StoreSnapshot,
-    _file_guard: File,
-    _local_guard: RwLockWriteGuard<'a, ()>,
+    _operation: ExclusiveStoreOperation<'store>,
 }
 impl ExclusiveSnapshot<'_> {
     #[must_use]
@@ -406,10 +458,10 @@ impl ExclusiveSnapshot<'_> {
 /// Exclusive retained-root lock acquired before any canonical filesystem scan.
 pub(super) struct UnsnapshottedExclusive<'a> {
     store: &'a Store,
-    file_guard: File,
-    local_guard: RwLockWriteGuard<'a, ()>,
+    _file_guard: File,
+    _local_guard: RwLockWriteGuard<'a, ()>,
 }
-impl<'a> UnsnapshottedExclusive<'a> {
+impl UnsnapshottedExclusive<'_> {
     pub(crate) const fn store(&self) -> &Store {
         self.store
     }
@@ -439,16 +491,6 @@ impl<'a> UnsnapshottedExclusive<'a> {
         StoreError,
     > {
         validate_visible_s4b_for_record(self.store, record_id)
-    }
-
-    pub(super) fn into_recovered_snapshot(self) -> Result<ExclusiveSnapshot<'a>, StoreError> {
-        self.recover_transactions()?;
-        let snapshot = self.scan_visible_locked()?;
-        Ok(ExclusiveSnapshot {
-            snapshot,
-            _file_guard: self.file_guard,
-            _local_guard: self.local_guard,
-        })
     }
 }
 
@@ -1116,9 +1158,8 @@ impl Store {
                 }
             };
             if needs_exclusive {
-                let guard = self.lock_exclusive_unsnapshotted()?;
-                crate::federation::pending::clean_disposable_locked(self)?;
-                guard.recover_transactions()?;
+                let mut operation = self.begin_exclusive_operation()?;
+                operation.recover_locked()?;
             }
         }
     }
@@ -1135,8 +1176,23 @@ impl Store {
             .map_err(|source| io_error("acquire exclusive root lock", &self.root, source))?;
         Ok(UnsnapshottedExclusive {
             store: self,
-            file_guard,
-            local_guard,
+            _file_guard: file_guard,
+            _local_guard: local_guard,
+        })
+    }
+
+    /// Begins an exclusive operation before recovery or canonical scanning.
+    ///
+    /// The operation continuously holds the process-local write guard and an independently
+    /// opened flock on the retained root inode. It is intentionally non-reentrant; use its
+    /// locked methods rather than calling another store entry point while it is live.
+    /// # Errors
+    /// Returns locking or retained-descriptor failures.
+    pub fn begin_exclusive_operation(&self) -> Result<ExclusiveStoreOperation<'_>, StoreError> {
+        Ok(ExclusiveStoreOperation {
+            guard: self.lock_exclusive_unsnapshotted()?,
+            snapshot: None,
+            recovered: false,
         })
     }
 

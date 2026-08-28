@@ -13,7 +13,12 @@ use std::{
 };
 
 #[cfg(target_os = "linux")]
-use std::os::unix::fs::symlink;
+use std::{
+    os::unix::fs::{MetadataExt, symlink},
+    process::Command,
+    thread,
+    time::{Duration, Instant},
+};
 
 use serde_json::{Value, json};
 use support::BoundedNoLegacy;
@@ -385,6 +390,120 @@ fn retained_root_ignores_a_replacement_directory_at_the_original_path() {
         fs::read_dir(&original).expect("read replacement").count(),
         0
     );
+}
+
+#[test]
+fn exclusive_operation_descriptor_proof_and_append_ignore_path_replacement() {
+    let directory = TestDir::new("operation-replaced");
+    let original = directory.path().join("store-root");
+    fs::create_dir(&original).expect("store root");
+    let store = retained_store(&original, Arc::new(NoLegacy)).expect("open retained store");
+    let registry = wayjournal_domain_registry().expect("registry");
+
+    let mut operation = store.begin_exclusive_operation().expect("begin operation");
+    operation.recover_locked().expect("recover");
+    let expected = operation.snapshot_locked().expect("snapshot").revision();
+    let root_descriptor = operation
+        .retained_root()
+        .duplicate_descriptor()
+        .expect("duplicate retained root");
+    assert!(
+        operation
+            .retained_root()
+            .is_same_root(&root_descriptor)
+            .expect("compare root")
+    );
+
+    let moved = directory.path().join("store-root-moved");
+    fs::rename(&original, &moved).expect("move retained root");
+    fs::create_dir(&original).expect("replacement root");
+    let prepared = prepare_batch(&[genesis()], "operation-genesis", &registry).expect("prepare");
+    let (_, snapshot) = operation
+        .append_locked(&prepared, expected)
+        .expect("append on retained inode");
+    assert_eq!(snapshot.records().len(), 1);
+    assert!(
+        moved
+            .join("journal/batches")
+            .read_dir()
+            .expect("retained batches")
+            .next()
+            .is_some()
+    );
+    assert_eq!(
+        fs::read_dir(&original)
+            .expect("replacement remains inert")
+            .count(),
+        0
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn exclusive_operation_lock_child() {
+    let Some(root) = std::env::var_os("WAYJOURNAL_LOCK_CHILD_ROOT") else {
+        return;
+    };
+    let marker =
+        PathBuf::from(std::env::var_os("WAYJOURNAL_LOCK_CHILD_MARKER").expect("child marker path"));
+    let store = Store::open_strict(
+        PathBuf::from(root),
+        wayjournal_domain_registry().expect("registry"),
+        Arc::new(NoLegacy),
+    )
+    .expect("child store");
+    let mut operation = store.begin_exclusive_operation().expect("child operation");
+    operation.recover_locked().expect("child recovery");
+    fs::write(marker, b"locked\n").expect("child marker");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn exclusive_operation_blocks_an_authenticated_process_on_the_root_inode() {
+    let directory = TestDir::new("operation-process-lock");
+    let root = directory.path().join("store-root");
+    fs::create_dir(&root).expect("store root");
+    let store = retained_store(&root, Arc::new(NoLegacy)).expect("open retained store");
+    let operation = store.begin_exclusive_operation().expect("parent operation");
+    let marker = directory.path().join("child-acquired");
+
+    let mut child = Command::new(std::env::current_exe().expect("test executable"))
+        .arg("--exact")
+        .arg("exclusive_operation_lock_child")
+        .arg("--nocapture")
+        .env("WAYJOURNAL_LOCK_CHILD_ROOT", &root)
+        .env("WAYJOURNAL_LOCK_CHILD_MARKER", &marker)
+        .spawn()
+        .expect("spawn lock child");
+
+    let root_metadata = fs::metadata(&root).expect("root metadata");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let authenticated = loop {
+        let fd_root = PathBuf::from(format!("/proc/{}/fd", child.id()));
+        let found = fs::read_dir(fd_root).is_ok_and(|entries| {
+            entries.flatten().any(|entry| {
+                fs::metadata(entry.path()).is_ok_and(|metadata| {
+                    metadata.dev() == root_metadata.dev() && metadata.ino() == root_metadata.ino()
+                })
+            })
+        });
+        if found || Instant::now() >= deadline {
+            break found;
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+    assert!(authenticated, "child did not retain the tested root inode");
+    thread::sleep(Duration::from_millis(100));
+    assert!(child.try_wait().expect("poll child").is_none());
+    assert!(
+        !marker.exists(),
+        "child acquired while parent operation lived"
+    );
+
+    drop(operation);
+    let status = child.wait().expect("wait child");
+    assert!(status.success(), "lock child failed: {status}");
+    assert_eq!(fs::read(marker).expect("child marker"), b"locked\n");
 }
 
 #[test]
