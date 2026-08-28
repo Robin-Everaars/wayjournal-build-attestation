@@ -7,9 +7,11 @@ use std::{
 };
 
 use wayjournal_core::{
-    ApprovalError, ApprovedRef, ApprovedRemote, ApprovedRemoteLocator, GitAdmissionError,
-    GitObjectFormat, GitOid, GitSyncRequest, LegacyEntry, LegacyStoreAdapter, LocalTrustBinding,
-    Store, wayjournal_domain_registry,
+    ADMISSION_CHECKPOINT_FILENAME, ApprovalError, ApprovedRef, ApprovedRemote,
+    ApprovedRemoteLocator, CheckpointError, GitAdmissionError, GitObjectFormat, GitOid,
+    GitSyncRequest, LegacyEntry, LegacyStoreAdapter, LocalTrustBinding,
+    MAX_ADMISSION_CHECKPOINT_BYTES, Store, decode_admission_checkpoint,
+    encode_admission_checkpoint, wayjournal_domain_registry,
 };
 
 #[derive(Debug)]
@@ -181,6 +183,70 @@ fn open_store(directory: &TestDir) -> Store {
 
 fn canonical_checkpoint() -> &'static [u8] {
     b"{\n  \"accepted_commit\": \"0123456789abcdef0123456789abcdef01234567\",\n  \"accepted_git_object_format\": \"sha1\",\n  \"accepted_revision_algorithm\": \"wayjournal.store/blake3-framed-v1\",\n  \"accepted_revision_digest\": \"3c4835897266c2b72f1ad9528309c6002f388071b0e9c780827bedbfaa35ce15\",\n  \"genesis_fingerprint\": \"7b9565665e24d18788f1a681d7cea3e2a07da23bea8f9861911f0e84023a9447\",\n  \"local_trust_binding\": \"3c4835897266c2b72f1ad9528309c6002f388071b0e9c780827bedbfaa35ce15\",\n  \"remote_locator\": \"file:///srv/git/store.git\",\n  \"remote_ref\": \"refs/heads/main\",\n  \"schema\": \"wayjournal.admission-checkpoint/v1\",\n  \"store_uuid\": \"01913f1d-8e2a-7c30-8f4a-426614174010\"\n}\n"
+}
+
+#[test]
+fn public_checkpoint_codec_has_the_stable_closed_wire_contract() {
+    assert_eq!(ADMISSION_CHECKPOINT_FILENAME, "admission-v1.json");
+    assert_eq!(MAX_ADMISSION_CHECKPOINT_BYTES, 8 * 1024);
+
+    let checkpoint = decode_admission_checkpoint(canonical_checkpoint()).expect("canonical");
+    assert_eq!(
+        encode_admission_checkpoint(&checkpoint).expect("encode"),
+        canonical_checkpoint()
+    );
+
+    let text = std::str::from_utf8(canonical_checkpoint()).expect("fixture text");
+    let invalid = [
+        (
+            "unknown field",
+            text.replacen(
+                "  \"store_uuid\":",
+                "  \"unknown\": true,\n  \"store_uuid\":",
+                1,
+            )
+            .into_bytes(),
+        ),
+        (
+            "noncanonical bytes",
+            serde_json::to_vec(
+                &serde_json::from_slice::<serde_json::Value>(canonical_checkpoint())
+                    .expect("fixture JSON"),
+            )
+            .expect("compact JSON"),
+        ),
+        (
+            "object format",
+            text.replacen(
+                "\"accepted_git_object_format\": \"sha1\"",
+                "\"accepted_git_object_format\": \"sha256\"",
+                1,
+            )
+            .into_bytes(),
+        ),
+        (
+            "revision algorithm",
+            text.replacen(
+                "wayjournal.store/blake3-framed-v1",
+                "wayjournal.store/unknown-v1",
+                1,
+            )
+            .into_bytes(),
+        ),
+    ];
+    for (label, bytes) in invalid {
+        assert!(
+            matches!(
+                decode_admission_checkpoint(&bytes),
+                Err(CheckpointError::Invalid(_))
+            ),
+            "{label}"
+        );
+    }
+    assert!(matches!(
+        decode_admission_checkpoint(&vec![b'x'; MAX_ADMISSION_CHECKPOINT_BYTES + 1]),
+        Err(CheckpointError::Oversized)
+    ));
 }
 
 #[test]

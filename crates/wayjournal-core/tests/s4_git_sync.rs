@@ -14,9 +14,10 @@ use std::{
 
 use serde_json::json;
 use wayjournal_core::{
-    ActorId, ApprovedRef, ApprovedRemote, ApprovedRemoteLocator, GitAdmissionError,
-    GitAdmissionOutcome, GitObjectFormat, GitSyncRequest, LegacyEntry, LegacyStoreAdapter,
-    LocalTrustBinding, Record, Store, prepare_batch, wayjournal_domain_registry,
+    ADMISSION_CHECKPOINT_FILENAME, ActorId, ApprovedRef, ApprovedRemote, ApprovedRemoteLocator,
+    GitAdmissionError, GitAdmissionOutcome, GitObjectFormat, GitSyncRequest, LegacyEntry,
+    LegacyStoreAdapter, LocalTrustBinding, Record, Store, decode_admission_checkpoint,
+    encode_admission_checkpoint, prepare_batch, wayjournal_domain_registry,
 };
 
 #[derive(Debug)]
@@ -393,6 +394,42 @@ fn main() {{
             "{line}"
         );
     }
+}
+
+#[test]
+fn authentic_admission_checkpoint_roundtrips_through_the_public_codec() {
+    let fixture = admission_fixture("public-checkpoint-codec");
+    let store = Store::open(
+        fixture.local.path(),
+        wayjournal_domain_registry().expect("registry"),
+        Arc::new(NoLegacy),
+    )
+    .expect("store");
+    assert!(matches!(
+        store.bootstrap_git_admission(&fixture.request),
+        Ok(GitAdmissionOutcome::GenesisValidated { .. })
+    ));
+
+    let checkpoint = store
+        .admission_checkpoint()
+        .expect("read checkpoint")
+        .expect("checkpoint present");
+    let bytes = fs::read(
+        fixture
+            .local
+            .path()
+            .join(".wayjournal-local/checkpoints")
+            .join(ADMISSION_CHECKPOINT_FILENAME),
+    )
+    .expect("checkpoint bytes");
+    assert_eq!(
+        encode_admission_checkpoint(&checkpoint).expect("encode checkpoint"),
+        bytes
+    );
+    assert_eq!(
+        decode_admission_checkpoint(&bytes).expect("decode checkpoint"),
+        checkpoint
+    );
 }
 
 #[test]

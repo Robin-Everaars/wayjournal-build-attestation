@@ -66,13 +66,14 @@ pub use domains::{
     fold_profile,
 };
 pub use federation::{
-    AdmissionCheckpoint, ApprovalError, ApprovedRef, ApprovedRemote, ApprovedRemoteLocator,
-    AuthorizedGitSyncError, CheckpointError, CheckpointObservationError, GitAdmissionError,
-    GitAdmissionOutcome, GitCommandError, GitCommandFailureKind, GitObjectFormat, GitOid,
-    GitOidError, GitQuarantineReason, GitSyncError, GitSyncOperationId, GitSyncOutcome,
-    GitSyncPendingPhase, GitSyncRequest, LocalTrustBinding, MAX_MULTI_SYNC_TARGETS,
-    MultiStoreSyncError, PerStoreSyncResult, QuarantineError, QuarantineIncidentId,
-    StoreSyncTarget, sync_stores,
+    ADMISSION_CHECKPOINT_FILENAME, AdmissionCheckpoint, ApprovalError, ApprovedRef, ApprovedRemote,
+    ApprovedRemoteLocator, AuthorizedGitSyncError, CheckpointError, CheckpointObservationError,
+    GitAdmissionError, GitAdmissionOutcome, GitCommandError, GitCommandFailureKind,
+    GitObjectFormat, GitOid, GitOidError, GitQuarantineReason, GitSyncError, GitSyncOperationId,
+    GitSyncOutcome, GitSyncPendingPhase, GitSyncRequest, LocalTrustBinding,
+    MAX_ADMISSION_CHECKPOINT_BYTES, MAX_MULTI_SYNC_TARGETS, MultiStoreSyncError,
+    PerStoreSyncResult, QuarantineError, QuarantineIncidentId, StoreSyncTarget,
+    decode_admission_checkpoint, encode_admission_checkpoint, sync_stores,
 };
 pub use hash::{Digest, DigestError};
 pub use identity::{

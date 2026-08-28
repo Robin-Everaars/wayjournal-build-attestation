@@ -25,7 +25,10 @@ mod history;
 mod multi;
 pub(crate) mod pending;
 mod quarantine;
-pub use checkpoint::CheckpointError;
+pub use checkpoint::{
+    ADMISSION_CHECKPOINT_FILENAME, CheckpointError, MAX_ADMISSION_CHECKPOINT_BYTES,
+    decode_admission_checkpoint, encode_admission_checkpoint,
+};
 pub use git::{GitCommandError, GitCommandFailureKind};
 pub use multi::{
     AuthorizedGitSyncError, CheckpointObservationError, MAX_MULTI_SYNC_TARGETS,

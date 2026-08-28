@@ -17,8 +17,10 @@ use super::{
     GitOid, LocalTrustBinding,
 };
 
-pub(super) const CHECKPOINT_NAME: &str = "admission-v1.json";
-pub(super) const MAX_CHECKPOINT_BYTES: u64 = 8 * 1024;
+/// Canonical filename for the local admission-checkpoint wire document.
+pub const ADMISSION_CHECKPOINT_FILENAME: &str = "admission-v1.json";
+/// Maximum accepted size of an admission-checkpoint wire document.
+pub const MAX_ADMISSION_CHECKPOINT_BYTES: usize = 8 * 1024;
 const CHECKPOINT_SCHEMA: &str = "wayjournal.admission-checkpoint/v1";
 
 #[derive(Debug, Error)]
@@ -55,7 +57,7 @@ struct RawCheckpoint {
 
 pub(super) fn read(store: &Store) -> Result<Option<AdmissionCheckpoint>, CheckpointError> {
     recover_residue(store)?;
-    let name = OsStr::new(CHECKPOINT_NAME);
+    let name = OsStr::new(ADMISSION_CHECKPOINT_FILENAME);
     let file = match store.checkpoints_dir.open_file(name) {
         Ok(file) => file,
         Err(crate::StoreError::Io { source, .. })
@@ -67,12 +69,12 @@ pub(super) fn read(store: &Store) -> Result<Option<AdmissionCheckpoint>, Checkpo
     };
     let size = store.checkpoints_dir.require_regular(&file, name)?;
     require_private_mode(&file)?;
-    if size > MAX_CHECKPOINT_BYTES {
+    if size > MAX_ADMISSION_CHECKPOINT_BYTES as u64 {
         return Err(CheckpointError::Oversized);
     }
     let mut bytes =
         Vec::with_capacity(usize::try_from(size).map_err(|_| CheckpointError::Oversized)?);
-    file.take(MAX_CHECKPOINT_BYTES + 1)
+    file.take(MAX_ADMISSION_CHECKPOINT_BYTES as u64 + 1)
         .read_to_end(&mut bytes)
         .map_err(|source| {
             crate::store::io_error(
@@ -81,18 +83,18 @@ pub(super) fn read(store: &Store) -> Result<Option<AdmissionCheckpoint>, Checkpo
                 source,
             )
         })?;
-    if bytes.len() as u64 > MAX_CHECKPOINT_BYTES {
+    if bytes.len() > MAX_ADMISSION_CHECKPOINT_BYTES {
         return Err(CheckpointError::Oversized);
     }
-    decode(&bytes).map(Some)
+    decode_admission_checkpoint(&bytes).map(Some)
 }
 
 fn recover_residue(store: &Store) -> Result<(), CheckpointError> {
     let names = store.checkpoints_dir.bounded_names(4)?;
-    let prefix = format!(".{CHECKPOINT_NAME}.tmp-");
+    let prefix = format!(".{ADMISSION_CHECKPOINT_FILENAME}.tmp-");
     let mut temporary = None;
     for name in names {
-        if name == CHECKPOINT_NAME.as_bytes() {
+        if name == ADMISSION_CHECKPOINT_FILENAME.as_bytes() {
             if store.checkpoints_dir.kind(OsStr::from_bytes(&name))?
                 != rustix::fs::FileType::RegularFile
             {
@@ -131,7 +133,9 @@ fn recover_residue(store: &Store) -> Result<(), CheckpointError> {
         }
         let file = store.checkpoints_dir.open_file(os_name)?;
         require_private_mode(&file)?;
-        if store.checkpoints_dir.require_regular(&file, os_name)? > MAX_CHECKPOINT_BYTES {
+        if store.checkpoints_dir.require_regular(&file, os_name)?
+            > MAX_ADMISSION_CHECKPOINT_BYTES as u64
+        {
             return Err(CheckpointError::Oversized);
         }
         temporary = Some(name);
@@ -157,7 +161,7 @@ fn require_private_mode(file: &std::fs::File) -> Result<(), CheckpointError> {
     Ok(())
 }
 
-pub(super) fn encode(checkpoint: &AdmissionCheckpoint) -> Result<Vec<u8>, CheckpointError> {
+fn encode_exact(checkpoint: &AdmissionCheckpoint) -> Result<Vec<u8>, CheckpointError> {
     let raw = RawCheckpoint {
         accepted_commit: checkpoint.accepted_commit.as_hex().to_owned(),
         accepted_git_object_format: checkpoint.accepted_commit.format(),
@@ -178,6 +182,23 @@ pub(super) fn encode(checkpoint: &AdmissionCheckpoint) -> Result<Vec<u8>, Checkp
     encode_pretty(&value).map_err(|error| CheckpointError::Invalid(error.to_string()))
 }
 
+/// Encodes checkpoint data as the closed canonical admission-checkpoint wire format.
+///
+/// The returned bytes are data only. Callers must separately authenticate the file, retained
+/// lock and current store state before treating them as fresh or trusted.
+///
+/// # Errors
+/// Returns [`CheckpointError`] if encoding fails or exceeds the wire-size bound.
+pub fn encode_admission_checkpoint(
+    checkpoint: &AdmissionCheckpoint,
+) -> Result<Vec<u8>, CheckpointError> {
+    let bytes = encode_exact(checkpoint)?;
+    if bytes.len() > MAX_ADMISSION_CHECKPOINT_BYTES {
+        return Err(CheckpointError::Oversized);
+    }
+    Ok(bytes)
+}
+
 pub(super) fn write(
     store: &Store,
     checkpoint: &AdmissionCheckpoint,
@@ -191,17 +212,20 @@ pub(super) fn replace_expected(
     expected: &AdmissionCheckpoint,
     candidate: &AdmissionCheckpoint,
 ) -> Result<(), CheckpointError> {
-    let expected_bytes = encode(expected)?;
-    let candidate_bytes = encode(candidate)?;
+    let expected_bytes = encode_admission_checkpoint(expected)?;
+    let candidate_bytes = encode_admission_checkpoint(candidate)?;
     let current = read_current_bytes(store)?;
     if current == candidate_bytes {
-        decode(&current)?;
+        decode_admission_checkpoint(&current)?;
         return Ok(());
     }
     if current != expected_bytes {
         return Err(CheckpointError::ExpectedOldMismatch);
     }
-    let temporary = format!(".{CHECKPOINT_NAME}.tmp-{}", uuid::Uuid::now_v7());
+    let temporary = format!(
+        ".{ADMISSION_CHECKPOINT_FILENAME}.tmp-{}",
+        uuid::Uuid::now_v7()
+    );
     let temporary_name = OsStr::new(&temporary);
     let mut file = store.checkpoints_dir.create_file(temporary_name)?;
     file.write_all(&candidate_bytes).map_err(|source| {
@@ -227,28 +251,28 @@ pub(super) fn replace_expected(
     }
     store
         .checkpoints_dir
-        .rename_file(temporary_name, OsStr::new(CHECKPOINT_NAME))?;
+        .rename_file(temporary_name, OsStr::new(ADMISSION_CHECKPOINT_FILENAME))?;
     super::fault::hit("checkpoint-renamed");
     store.checkpoints_dir.sync()?;
     super::fault::hit("checkpoint-parent-durable");
     let published = read_current_bytes(store)?;
-    if published != candidate_bytes || decode(&published)? != *candidate {
+    if published != candidate_bytes || decode_admission_checkpoint(&published)? != *candidate {
         return Err(CheckpointError::ReplacementMismatch);
     }
     Ok(())
 }
 
 fn read_current_bytes(store: &Store) -> Result<Vec<u8>, CheckpointError> {
-    let name = OsStr::new(CHECKPOINT_NAME);
+    let name = OsStr::new(ADMISSION_CHECKPOINT_FILENAME);
     let file = store.checkpoints_dir.open_file(name)?;
     let size = store.checkpoints_dir.require_regular(&file, name)?;
     require_private_mode(&file)?;
-    if size > MAX_CHECKPOINT_BYTES {
+    if size > MAX_ADMISSION_CHECKPOINT_BYTES as u64 {
         return Err(CheckpointError::Oversized);
     }
     let mut bytes =
         Vec::with_capacity(usize::try_from(size).map_err(|_| CheckpointError::Oversized)?);
-    file.take(MAX_CHECKPOINT_BYTES + 1)
+    file.take(MAX_ADMISSION_CHECKPOINT_BYTES as u64 + 1)
         .read_to_end(&mut bytes)
         .map_err(|source| {
             crate::store::io_error(
@@ -257,7 +281,7 @@ fn read_current_bytes(store: &Store) -> Result<Vec<u8>, CheckpointError> {
                 source,
             )
         })?;
-    if bytes.len() as u64 > MAX_CHECKPOINT_BYTES {
+    if bytes.len() > MAX_ADMISSION_CHECKPOINT_BYTES {
         return Err(CheckpointError::Oversized);
     }
     Ok(bytes)
@@ -268,11 +292,11 @@ fn write_impl(
     checkpoint: &AdmissionCheckpoint,
     mut barrier: impl FnMut(usize) -> Result<(), CheckpointError>,
 ) -> Result<(), CheckpointError> {
-    let bytes = encode(checkpoint)?;
-    if bytes.len() as u64 > MAX_CHECKPOINT_BYTES {
-        return Err(CheckpointError::Oversized);
-    }
-    let temporary = format!(".{CHECKPOINT_NAME}.tmp-{}", uuid::Uuid::now_v7());
+    let bytes = encode_admission_checkpoint(checkpoint)?;
+    let temporary = format!(
+        ".{ADMISSION_CHECKPOINT_FILENAME}.tmp-{}",
+        uuid::Uuid::now_v7()
+    );
     let temporary_name = OsStr::new(&temporary);
     let mut file = store.checkpoints_dir.create_file(temporary_name)?;
     rustix::fs::fchmod(&file, rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR).map_err(
@@ -303,7 +327,7 @@ fn write_impl(
     drop(file);
     store
         .checkpoints_dir
-        .rename_file(temporary_name, OsStr::new(CHECKPOINT_NAME))?;
+        .rename_file(temporary_name, OsStr::new(ADMISSION_CHECKPOINT_FILENAME))?;
     barrier(2)?;
     store.checkpoints_dir.sync()?;
     barrier(3)?;
@@ -325,7 +349,7 @@ fn write_with_barrier_for_test(
     })
 }
 
-pub(super) fn decode(bytes: &[u8]) -> Result<AdmissionCheckpoint, CheckpointError> {
+fn decode_exact(bytes: &[u8]) -> Result<AdmissionCheckpoint, CheckpointError> {
     let value =
         decode_strict(bytes).map_err(|error| CheckpointError::Invalid(error.to_string()))?;
     let raw: RawCheckpoint = serde_json::from_value(value.clone())
@@ -370,6 +394,21 @@ pub(super) fn decode(bytes: &[u8]) -> Result<AdmissionCheckpoint, CheckpointErro
         accepted_commit,
         accepted_revision,
     })
+}
+
+/// Decodes closed canonical admission-checkpoint wire bytes into data.
+///
+/// Successful decoding validates only the bounded wire representation and checked field values.
+/// It does not establish file authenticity, lock ownership, freshness, trust or correspondence
+/// with current store state. Callers must perform those checks separately.
+///
+/// # Errors
+/// Returns [`CheckpointError`] for oversized, malformed, noncanonical or unsupported input.
+pub fn decode_admission_checkpoint(bytes: &[u8]) -> Result<AdmissionCheckpoint, CheckpointError> {
+    if bytes.len() > MAX_ADMISSION_CHECKPOINT_BYTES {
+        return Err(CheckpointError::Oversized);
+    }
+    decode_exact(bytes)
 }
 
 #[cfg(test)]
