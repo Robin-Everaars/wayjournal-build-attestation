@@ -101,6 +101,24 @@ fn all_non_git_store_apis_block_for_every_durable_pending_phase() {
         fs::write(&pending, pending_document(phase)).expect("pending");
         fs::set_permissions(&pending, fs::Permissions::from_mode(0o600)).expect("mode");
 
+        let operation = store
+            .begin_exclusive_operation()
+            .expect("exclusive operation");
+        assert!(
+            matches!(
+                operation.observe_recovery_locked(),
+                Err(wayjournal_core::ExclusiveOperationError::Store(
+                    StoreError::GitSyncPending { .. }
+                ))
+            ),
+            "recovery observation {phase}"
+        );
+        drop(operation);
+        assert!(
+            pending.is_file(),
+            "observation must not clean pending {phase}"
+        );
+
         assert!(
             matches!(store.read(), Err(StoreError::GitSyncPending { .. })),
             "read {phase}"

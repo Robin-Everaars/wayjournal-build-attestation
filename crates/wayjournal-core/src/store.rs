@@ -454,6 +454,31 @@ pub struct ExclusiveStoreOperation<'store> {
     pub(super) invalidated: bool,
 }
 
+/// Bounded recovery residue observed under a live exclusive retained-root lock.
+///
+/// The private lifetime binding prevents this observation from outliving the operation whose
+/// retained descriptors and lock authority produced it.
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct ExclusiveRecoveryObservation<'operation> {
+    pub(super) batch_ids: Vec<BatchId>,
+    pub(super) git_cleanup_required: bool,
+    pub(super) _operation: std::marker::PhantomData<&'operation ()>,
+}
+impl ExclusiveRecoveryObservation<'_> {
+    /// Returns the sorted, unique ordinary transaction batch IDs.
+    #[must_use]
+    pub fn batch_ids(&self) -> &[BatchId] {
+        &self.batch_ids
+    }
+
+    /// Reports whether disposable Git synchronization residue requires cleanup by recovery.
+    #[must_use]
+    pub const fn git_cleanup_required(&self) -> bool {
+        self.git_cleanup_required
+    }
+}
+
 /// A validated snapshot held under the retained root-directory inode lock.
 pub struct ExclusiveSnapshot<'store> {
     operation: ExclusiveStoreOperation<'store>,

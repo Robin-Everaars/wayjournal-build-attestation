@@ -19,9 +19,10 @@ use crate::{
 };
 
 use super::{
-    AppendPreview, CommitOutcome, Directory, ExclusiveOperationError, ExclusiveSnapshot,
-    ExclusiveStoreOperation, RawFile, RetainedStoreRoot, Store, StoreError, StoreSnapshot,
-    enforce_limits, io_error, read_file_bounded, scan_collected, scan_visible, visible_inventory,
+    AppendPreview, CommitOutcome, Directory, ExclusiveOperationError, ExclusiveRecoveryObservation,
+    ExclusiveSnapshot, ExclusiveStoreOperation, RawFile, RetainedStoreRoot, Store, StoreError,
+    StoreSnapshot, enforce_limits, io_error, read_file_bounded, scan_collected, scan_visible,
+    visible_inventory,
 };
 #[cfg(test)]
 use super::{RacePoint, race};
@@ -177,6 +178,28 @@ impl ExclusiveStoreOperation<'_> {
         self.snapshot = None;
         self.recovered = false;
         self.invalidated = true;
+    }
+
+    /// Observes bounded ordinary transaction and disposable Git recovery residue without mutation.
+    ///
+    /// The returned value borrows this operation, keeping its retained-root lock authority live.
+    /// No canonical store path is scanned.
+    /// # Errors
+    /// Returns an invalidated-operation error or existing pending/recovery layout failures.
+    pub fn observe_recovery_locked(
+        &self,
+    ) -> Result<ExclusiveRecoveryObservation<'_>, ExclusiveOperationError> {
+        if self.invalidated {
+            return Err(self.state_error());
+        }
+        let git_cleanup_required = crate::federation::pending::gate_without_git(self.store())?
+            == crate::federation::pending::GateAction::CleanDisposable;
+        let batch_ids = observe_transaction_recovery(self.store())?;
+        Ok(ExclusiveRecoveryObservation {
+            batch_ids,
+            git_cleanup_required,
+            _operation: std::marker::PhantomData,
+        })
     }
 
     /// Recovers transaction residue without reacquiring either operation lock.
@@ -703,6 +726,25 @@ fn validate_recovery_base(
     Ok(())
 }
 
+fn observe_transaction_recovery(store: &Store) -> Result<Vec<BatchId>, StoreError> {
+    let journals = listed_journals(store)?;
+    let stages = listed_stages(store)?;
+    if journals
+        .iter()
+        .any(|batch_id| stages.binary_search(batch_id).is_err())
+    {
+        return Err(invalid_journal(
+            &store.recovery_dir.path,
+            "recovery journal has no matching stage directory",
+        ));
+    }
+    let mut ids = stages;
+    ids.extend(journals);
+    ids.sort_unstable();
+    ids.dedup();
+    Ok(ids)
+}
+
 fn listed_journals(store: &Store) -> Result<Vec<BatchId>, StoreError> {
     let names = store.recovery_dir.bounded_names(MAX_LOCAL_ENTRIES)?;
     let mut ids = Vec::new();
@@ -726,7 +768,39 @@ fn listed_journals(store: &Store) -> Result<Vec<BatchId>, StoreError> {
             invalid_journal(&store.recovery_dir.path, "journal filename is not UUIDv7")
         })?);
     }
-    ids.sort();
+    ids.sort_unstable();
+    if ids.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(invalid_journal(
+            &store.recovery_dir.path,
+            "duplicate recovery journal batch id",
+        ));
+    }
+    Ok(ids)
+}
+
+fn listed_stages(store: &Store) -> Result<Vec<BatchId>, StoreError> {
+    let names = store.stages_dir.bounded_names(MAX_LOCAL_ENTRIES)?;
+    let mut ids = Vec::new();
+    for bytes in names {
+        let name = std::str::from_utf8(&bytes)
+            .map_err(|_| invalid_journal(&store.stages_dir.path, "stage name is not UTF-8"))?;
+        if store.stages_dir.kind(OsStr::from_bytes(&bytes))? != FileType::Directory {
+            return Err(invalid_journal(
+                &store.stages_dir.path.join(OsStr::from_bytes(&bytes)),
+                "stage is not a directory",
+            ));
+        }
+        ids.push(name.parse().map_err(|_| {
+            invalid_journal(&store.stages_dir.path, "stage name is not canonical UUIDv7")
+        })?);
+    }
+    ids.sort_unstable();
+    if ids.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(invalid_journal(
+            &store.stages_dir.path,
+            "duplicate stage batch id",
+        ));
+    }
     Ok(ids)
 }
 fn clean_unprepared_stages(store: &Store) -> Result<(), StoreError> {
@@ -1291,6 +1365,194 @@ mod tests {
             ),
         ]
     }
+    #[test]
+    fn recovery_observation_is_repeatable_sorted_and_deduplicated() {
+        let (root, _, store) = fixture_store("observe-recovery-ids");
+        let first = "01913f1d-8e2a-7c30-8f4a-426614174097";
+        let second = "01913f1d-8e2a-7c30-8f4a-426614174099";
+        fs::create_dir(root.join(".wayjournal-local/stages").join(second)).unwrap();
+        fs::create_dir(root.join(".wayjournal-local/stages").join(first)).unwrap();
+        fs::write(
+            root.join(".wayjournal-local/recovery")
+                .join(format!("{second}.json")),
+            b"journal bytes are not read by observation",
+        )
+        .unwrap();
+        let operation = store.begin_exclusive_operation().unwrap();
+
+        for _ in 0..2 {
+            let observation = operation.observe_recovery_locked().unwrap();
+            assert_eq!(
+                observation.batch_ids(),
+                &[first.parse().unwrap(), second.parse().unwrap()]
+            );
+            assert!(!observation.git_cleanup_required());
+        }
+        drop(operation);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn recovery_observation_rejects_malformed_types_and_inconsistent_journals() {
+        for (label, setup) in [
+            ("bad-stage-name", 0_u8),
+            ("stage-file", 1),
+            ("bad-journal-name", 2),
+            ("journal-directory", 3),
+            ("journal-without-stage", 4),
+        ] {
+            let (root, _, store) = fixture_store(label);
+            let stages = root.join(".wayjournal-local/stages");
+            let recovery = root.join(".wayjournal-local/recovery");
+            let id = "01913f1d-8e2a-7c30-8f4a-426614174098";
+            match setup {
+                0 => fs::create_dir(stages.join("not-a-batch-id")).unwrap(),
+                1 => fs::write(stages.join(id), b"not a directory").unwrap(),
+                2 => fs::write(recovery.join(id), b"not canonical").unwrap(),
+                3 => fs::create_dir(recovery.join(format!("{id}.json"))).unwrap(),
+                4 => fs::write(recovery.join(format!("{id}.json")), b"journal").unwrap(),
+                _ => unreachable!(),
+            }
+            let operation = store.begin_exclusive_operation().unwrap();
+            assert!(matches!(
+                operation.observe_recovery_locked(),
+                Err(crate::ExclusiveOperationError::Store(
+                    StoreError::InvalidJournal { .. }
+                ))
+            ));
+            drop(operation);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn recovery_observation_reports_disposable_git_without_mutating_and_recovery_cleans() {
+        let (root, _, store) = fixture_store("observe-disposable");
+        let pending = root
+            .join(".wayjournal-local/sync-pending")
+            .join("01913f1d-8e2a-7c30-8f4a-426614174096");
+        fs::create_dir(&pending).unwrap();
+        fs::write(pending.join("unrooted"), b"unchanged").unwrap();
+        let before = fs::read(pending.join("unrooted")).unwrap();
+        let mut operation = store.begin_exclusive_operation().unwrap();
+
+        let observation = operation.observe_recovery_locked().unwrap();
+        assert!(observation.batch_ids().is_empty());
+        assert!(observation.git_cleanup_required());
+        drop(observation);
+        assert_eq!(fs::read(pending.join("unrooted")).unwrap(), before);
+
+        operation.recover_locked().unwrap();
+        assert!(!pending.exists());
+        let observation = operation.observe_recovery_locked().unwrap();
+        assert!(observation.batch_ids().is_empty());
+        assert!(!observation.git_cleanup_required());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn recovery_observation_does_not_publish_or_change_interrupted_append_residue() {
+        fn inventory(root: &std::path::Path) -> Vec<(String, Vec<u8>, u64, i64, i64)> {
+            use std::os::unix::fs::MetadataExt;
+
+            fn visit(
+                root: &std::path::Path,
+                path: &std::path::Path,
+                out: &mut Vec<(String, Vec<u8>, u64, i64, i64)>,
+            ) {
+                let mut entries = fs::read_dir(path)
+                    .unwrap()
+                    .map(|entry| entry.unwrap())
+                    .collect::<Vec<_>>();
+                entries.sort_by_key(std::fs::DirEntry::file_name);
+                for entry in entries {
+                    let path = entry.path();
+                    let metadata = fs::symlink_metadata(&path).unwrap();
+                    let relative = path
+                        .strip_prefix(root)
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned();
+                    let bytes = if metadata.is_file() {
+                        fs::read(&path).unwrap()
+                    } else {
+                        Vec::new()
+                    };
+                    out.push((
+                        relative,
+                        bytes,
+                        metadata.len(),
+                        metadata.mtime(),
+                        metadata.mtime_nsec(),
+                    ));
+                    if metadata.is_dir() {
+                        visit(root, &path, out);
+                    }
+                }
+            }
+
+            let mut result = Vec::new();
+            visit(root, root, &mut result);
+            result
+        }
+
+        let (root, _, store, batch) = interrupted("observe-interrupted");
+        let before = inventory(&root);
+        let mut operation = store.begin_exclusive_operation().unwrap();
+        let observation = operation.observe_recovery_locked().unwrap();
+        assert_eq!(observation.batch_ids(), &[batch.manifest().batch_id()]);
+        assert!(!observation.git_cleanup_required());
+        drop(observation);
+        assert_eq!(
+            inventory(&root),
+            before,
+            "observation changed filesystem state"
+        );
+        assert!(!root.join(batch.manifest_path()).exists());
+        assert!(matches!(
+            operation.snapshot_locked(),
+            Err(crate::ExclusiveOperationError::RecoveryRequired)
+        ));
+
+        operation.recover_locked().unwrap();
+        assert!(root.join(batch.manifest_path()).is_file());
+        assert_eq!(
+            operation.observe_recovery_locked().unwrap().batch_ids(),
+            &[]
+        );
+        drop(operation);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn recovery_observation_uses_retained_recovery_and_stage_directories() {
+        let (root, _, store) = fixture_store("observe-retained-paths");
+        let retained_stages = root.join("retained-stages");
+        let retained_recovery = root.join("retained-recovery");
+        fs::rename(root.join(".wayjournal-local/stages"), &retained_stages).unwrap();
+        fs::rename(root.join(".wayjournal-local/recovery"), &retained_recovery).unwrap();
+        let outside_stages = root.join("outside-stages");
+        let outside_recovery = root.join("outside-recovery");
+        fs::create_dir(&outside_stages).unwrap();
+        fs::create_dir(&outside_recovery).unwrap();
+        fs::create_dir(outside_stages.join("malformed")).unwrap();
+        fs::write(outside_recovery.join("malformed"), b"outside").unwrap();
+        symlink(&outside_stages, root.join(".wayjournal-local/stages")).unwrap();
+        symlink(&outside_recovery, root.join(".wayjournal-local/recovery")).unwrap();
+
+        let operation = store.begin_exclusive_operation().unwrap();
+        let observation = operation.observe_recovery_locked().unwrap();
+        assert!(observation.batch_ids().is_empty());
+        assert!(!observation.git_cleanup_required());
+        assert!(outside_stages.join("malformed").is_dir());
+        assert_eq!(
+            fs::read(outside_recovery.join("malformed")).unwrap(),
+            b"outside"
+        );
+        drop(operation);
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn preview_and_append_share_all_strict_builtin_fold_rejections() {
         for (label, records) in recovery_hostiles() {

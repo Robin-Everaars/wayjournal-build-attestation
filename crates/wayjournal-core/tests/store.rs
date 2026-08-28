@@ -15,9 +15,9 @@ use std::{
 
 use support::{BATCH_ID, RECORD_A, RECORD_B, note_record, registry};
 use wayjournal_core::{
-    AppendPreview, CommitOutcome, ExclusiveOperationError, ExclusiveStoreOperation, LegacyEntry,
-    LegacyStoreAdapter, PathClass, PreparedBatch, Store, StoreCorruption, StoreError,
-    StoreRevisionRef, prepare_batch,
+    AppendPreview, CommitOutcome, ExclusiveOperationError, ExclusiveRecoveryObservation,
+    ExclusiveStoreOperation, LegacyEntry, LegacyStoreAdapter, PathClass, PreparedBatch, Store,
+    StoreCorruption, StoreError, StoreRevisionRef, prepare_batch,
 };
 
 struct TestDir(PathBuf);
@@ -418,6 +418,10 @@ fn exclusive_operation_compile_contract<'store>(
     expected: StoreRevisionRef,
 ) -> Result<(CommitOutcome, StoreRevisionRef), ExclusiveOperationError> {
     let mut operation: ExclusiveStoreOperation<'store> = store.begin_exclusive_operation()?;
+    let observation: ExclusiveRecoveryObservation<'_> = operation.observe_recovery_locked()?;
+    let _: &[wayjournal_core::BatchId] = observation.batch_ids();
+    let _: bool = observation.git_cleanup_required();
+    drop(observation);
     operation.recover_locked()?;
     let _root = operation.retained_root().duplicate_descriptor()?;
     let _snapshot: &wayjournal_core::StoreSnapshot = operation.snapshot_locked()?;
@@ -475,6 +479,10 @@ fn locked_operation_requires_recovery_and_invalidates_after_failed_append() {
     ));
     assert!(matches!(
         operation.append_locked(&prepared, expected),
+        Err(ExclusiveOperationError::StateInvalidated)
+    ));
+    assert!(matches!(
+        operation.observe_recovery_locked(),
         Err(ExclusiveOperationError::StateInvalidated)
     ));
 
