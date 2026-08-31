@@ -110,9 +110,9 @@ pub(super) fn exclusive_snapshot(store: &Store) -> Result<ExclusiveSnapshot<'_>,
 }
 
 pub(super) fn recover_operation(
-    operation: &mut ExclusiveStoreOperation<'_>,
+    mut operation: ExclusiveStoreOperation<'_>,
 ) -> Result<(), StoreError> {
-    operation.recover_locked_with_barrier(&mut |_| Ok(()))
+    operation.recover_without_snapshot_locked_with_barrier(&mut |_| Ok(()))
 }
 
 pub(super) fn append(
@@ -155,7 +155,10 @@ impl ExclusiveStoreOperation<'_> {
         self.guard.store()
     }
 
-    fn recover_locked_with_barrier(&mut self, barrier: Barrier<'_>) -> Result<(), StoreError> {
+    fn recover_without_snapshot_locked_with_barrier(
+        &mut self,
+        barrier: Barrier<'_>,
+    ) -> Result<(), StoreError> {
         self.snapshot = None;
         self.recovered = false;
         self.invalidated = false;
@@ -168,8 +171,12 @@ impl ExclusiveStoreOperation<'_> {
                 message: "disposable pending cleanup did not converge".to_owned(),
             });
         }
-        recover_locked(store, barrier)?;
-        self.snapshot = Some(scan_visible(store)?);
+        recover_locked(store, barrier)
+    }
+
+    fn recover_locked_with_barrier(&mut self, barrier: Barrier<'_>) -> Result<(), StoreError> {
+        self.recover_without_snapshot_locked_with_barrier(barrier)?;
+        self.snapshot = Some(scan_visible(self.store())?);
         self.recovered = true;
         Ok(())
     }
@@ -233,6 +240,9 @@ impl ExclusiveStoreOperation<'_> {
     }
 
     /// Validates an append and predicts its exact canonical outcome without writing.
+    ///
+    /// [`Self::append_locked`] repeats this validation immediately before publication. Callers
+    /// should use preview for a decision that needs the predicted outcome, not as a free preflight.
     /// # Errors
     /// Returns operation-state, pending-state, revision, validation, or resource-limit failures.
     pub fn preview_append_locked(

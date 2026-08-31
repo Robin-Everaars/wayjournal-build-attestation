@@ -28,6 +28,7 @@ mod race_hooks {
         RecoveryRoot,
         RecoveryStage,
         PublicationTarget,
+        VisibleScan,
     }
     type Hook = Box<dyn FnMut(Point)>;
     thread_local! { static HOOK: RefCell<Option<Hook>> = const { RefCell::new(None) }; }
@@ -319,6 +320,10 @@ pub enum StoreError {
     Corrupt { issue: StoreCorruption },
 }
 
+/// Closed failure classes for one retained exclusive operation.
+///
+/// Adding another variant is an incompatible public API change under Wayjournal's pre-1.0
+/// versioning policy.
 #[derive(Debug, Error)]
 pub enum ExclusiveOperationError {
     #[error("exclusive store operation requires successful recovery")]
@@ -333,6 +338,10 @@ pub enum ExclusiveOperationError {
     Store(#[from] StoreError),
 }
 
+/// Closed prediction for one validated append.
+///
+/// Adding another variant is an incompatible public API change under Wayjournal's pre-1.0
+/// versioning policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppendPreview {
     Publish {
@@ -417,8 +426,10 @@ impl StoreSnapshot {
 
 /// Descriptor-only proof of the store root retained by a live exclusive operation.
 ///
-/// The duplicate returned here is derived from the retained inode and does not carry the
-/// operation's independently opened flock, so callers cannot unlock the operation through it.
+/// The duplicate returned here is a full directory descriptor derived from the retained inode.
+/// It does not carry the operation's independently opened flock, so callers cannot unlock the
+/// operation through it. Callers must keep the operation alive and preserve its lock discipline
+/// around any descriptor-relative access.
 pub struct RetainedStoreRoot<'operation> {
     directory: &'operation Directory,
 }
@@ -1217,8 +1228,8 @@ impl Store {
                 }
             };
             if needs_exclusive {
-                let mut operation = self.begin_exclusive_operation()?;
-                transaction::recover_operation(&mut operation)?;
+                let operation = self.begin_exclusive_operation()?;
+                transaction::recover_operation(operation)?;
             }
         }
     }
@@ -1798,6 +1809,8 @@ fn spool_visible_replay_directory(
 }
 
 pub(super) fn scan_visible(store: &Store) -> Result<StoreSnapshot, StoreError> {
+    #[cfg(test)]
+    race(RacePoint::VisibleScan);
     let (files, nonregular) = collect_visible(store)?;
     scan_collected(store, &files, nonregular)
 }
@@ -2096,7 +2109,7 @@ fn validate_collected_legacy(
 mod s4b_lock_tests {
     use super::*;
     use crate::{LegacyEntry, LegacyStoreAdapter, wayjournal_domain_registry};
-    use std::{fs, sync::Arc};
+    use std::{cell::Cell, fs, rc::Rc, sync::Arc};
 
     #[derive(Debug)]
     struct NoLegacy;
@@ -2213,6 +2226,44 @@ mod s4b_lock_tests {
             .expect("lock without scan");
         assert!(guard.scan_visible_locked().is_err());
         drop(guard);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn read_scans_once_after_cleaning_disposable_residue() {
+        let root = std::env::temp_dir().join(format!(
+            "wayjournal-s4b-read-recovery-scan-{}",
+            uuid::Uuid::now_v7()
+        ));
+        fs::create_dir(&root).expect("root");
+        let store = Store::open(
+            &root,
+            wayjournal_domain_registry().expect("registry"),
+            Arc::new(NoLegacy),
+        )
+        .expect("store");
+        fs::create_dir(
+            store
+                .sync_pending_dir
+                .path
+                .join("01913f1d-8e2a-7c30-8f4a-426614174076"),
+        )
+        .expect("disposable pending residue");
+
+        let scans = Rc::new(Cell::new(0));
+        let observed = Rc::clone(&scans);
+        let _hook = race_hooks::install(move |point| {
+            if point == race_hooks::Point::VisibleScan {
+                observed.set(observed.get() + 1);
+            }
+        });
+
+        store.read().expect("read after cleanup");
+        assert_eq!(
+            scans.get(),
+            1,
+            "recovery must not build a snapshot that read immediately discards"
+        );
         fs::remove_dir_all(root).expect("cleanup");
     }
 

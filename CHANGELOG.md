@@ -8,10 +8,15 @@ All notable user-visible changes to Wayjournal are recorded here. Wayjournal fol
 
 - `Store::open_strict_retained_root` opens a strict store from an already retained directory descriptor. Before creating the layout, it rejects descriptors that cannot be synchronized or cannot yield an independent read-only root-lock descriptor. The retained descriptor stays the root-lock authority, every reserved child is derived descriptor-relatively, and the diagnostic path is never an authority.
 - `GitCommandError` carries a stable `GitCommandFailureKind` (`Spawn`, `Io`, `Timeout`, `NonZeroExit`, `StdoutLimit`, `StderrLimit`, `ProcessControl`) behind a `kind()` accessor, so consumers can classify a failed Git invocation without matching its message text.
+- `StoreRevisionAccumulator` computes the canonical store revision from a sorted stream without retaining all entry bytes.
+- `Store::begin_exclusive_operation` returns an `ExclusiveStoreOperation` that continuously holds process-local write exclusion and the retained root lock across bounded `ExclusiveRecoveryObservation`, recovery, `ExclusiveSnapshot`, `AppendPreview`, and append operations. `ExclusiveOperationError` reports the closed operation-state failures, while `RetainedStoreRoot` exposes descriptor-bound root identity to the live caller.
+- `GitSyncRequest::from_retained_executable` accepts an already retained native Git executable descriptor without reopening its diagnostic path.
+- `ADMISSION_CHECKPOINT_FILENAME`, `MAX_ADMISSION_CHECKPOINT_BYTES`, `encode_admission_checkpoint`, and `decode_admission_checkpoint` expose the closed, bounded checkpoint byte format without granting filesystem, lock, freshness, or trust authority.
 
 ### Changed
 
 - Bounded output capture tracks stdout and stderr overflow separately, so a stderr budget breach is reported as `StderrLimit` instead of sharing one flag with stdout.
+- `Store::read` cleans ordinary and disposable synchronization residue without constructing a snapshot that the final read would immediately discard.
 
 ## 0.1.0 - 2026-08-15
 

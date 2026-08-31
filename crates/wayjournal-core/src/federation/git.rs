@@ -45,6 +45,8 @@ const GIT_TIMEOUT: Duration = Duration::from_mins(1);
 ///
 /// Downstream consumers map this kind plus [`GitCommandError::operation`] into
 /// typed evidence. The display message stays redacted and non-authoritative.
+/// The variants are intentionally closed; adding another is an incompatible public API change
+/// under Wayjournal's pre-1.0 versioning policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum GitCommandFailureKind {
     /// The child process could not be launched.
